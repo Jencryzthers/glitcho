@@ -78,12 +78,24 @@ class StreamlinkManager: ObservableObject {
 struct NativeVideoPlayer: NSViewRepresentable {
     let url: URL
     @Binding var isPlaying: Bool
+    let pipController: PictureInPictureController?
+
+    init(url: URL, isPlaying: Binding<Bool>, pipController: PictureInPictureController? = nil) {
+        self.url = url
+        self._isPlaying = isPlaying
+        self.pipController = pipController
+    }
     
     final class Coordinator {
         var endObserver: Any?
+        let pipController: PictureInPictureController?
+        
+        init(pipController: PictureInPictureController?) {
+            self.pipController = pipController
+        }
     }
     
-    func makeCoordinator() -> Coordinator { Coordinator() }
+    func makeCoordinator() -> Coordinator { Coordinator(pipController: pipController) }
     
     func makeNSView(context: Context) -> AVPlayerView {
         let playerView = AVPlayerView()
@@ -111,6 +123,7 @@ struct NativeVideoPlayer: NSViewRepresentable {
             }
         }
         
+        context.coordinator.pipController?.attach(playerView)
         return playerView
     }
     
@@ -123,6 +136,7 @@ struct NativeVideoPlayer: NSViewRepresentable {
         } else {
             playerView.player?.pause()
         }
+        context.coordinator.pipController?.attach(playerView)
     }
     
     static func dismantleNSView(_ playerView: AVPlayerView, coordinator: Coordinator) {
@@ -132,6 +146,7 @@ struct NativeVideoPlayer: NSViewRepresentable {
         }
         playerView.player?.pause()
         playerView.player = nil
+        coordinator.pipController?.detach(playerView)
     }
 }
 
@@ -139,6 +154,7 @@ struct NativeVideoPlayer: NSViewRepresentable {
 struct StreamlinkPlayerView: View {
     let channelName: String
     @StateObject private var streamlink = StreamlinkManager()
+    @StateObject private var pipController = PictureInPictureController()
     @State private var streamURL: URL?
     @State private var isPlaying = true
     @State private var showError = false
@@ -147,7 +163,7 @@ struct StreamlinkPlayerView: View {
         VStack(spacing: 0) {
             // Player vidéo natif
             if let url = streamURL {
-                NativeVideoPlayer(url: url, isPlaying: $isPlaying)
+                NativeVideoPlayer(url: url, isPlaying: $isPlaying, pipController: pipController)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if streamlink.isLoading {
                 VStack(spacing: 16) {
@@ -208,6 +224,16 @@ struct StreamlinkPlayerView: View {
                 
                 Spacer()
                 
+                if pipController.isAvailable {
+                    Button(action: { pipController.toggle() }) {
+                        Image(systemName: "pip.enter")
+                            .font(.system(size: 18, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.9))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Picture in Picture")
+                }
+
                 Button("Recharger") {
                     Task {
                         await loadStream()
@@ -274,14 +300,30 @@ struct HybridTwitchView: View {
     @Binding var playback: NativePlaybackRequest
     var onOpenSubscription: ((String) -> Void)?
     var onOpenGiftSub: ((String) -> Void)?
+    var notificationEnabled: Bool = true
+    var onNotificationToggle: ((Bool) -> Void)?
+    var onRecordRequest: (() -> Void)?
+    @Environment(\.openWindow) private var openWindow
     @StateObject private var streamlink = StreamlinkManager()
+    @StateObject private var pipController = PictureInPictureController()
     @State private var streamURL: URL?
     @State private var isPlaying = true
     @State private var showError = false
     @State private var showChat = true
+    @State private var isChatDetached = false
+    @State private var detachedChannelName: String?
+    @State private var programmaticChatCloseChannel: String?
     @AppStorage("hybridPlayerHeightRatio") private var playerHeightRatio: Double = 0.8
     @State private var dragStartRatio: Double?
     @State private var lastChannelName: String?
+
+    private enum ChatDisplayMode: String {
+        case inline
+        case hidden
+        case detached
+    }
+
+    private static let chatPreferencesKey = "glitcho.chatPreferencesByChannel"
     
     var body: some View {
         HStack(spacing: 0) {
@@ -298,7 +340,7 @@ struct HybridTwitchView: View {
                         ZStack(alignment: .bottom) {
                             Group {
                                 if let url = streamURL {
-                                    NativeVideoPlayer(url: url, isPlaying: $isPlaying)
+                                    NativeVideoPlayer(url: url, isPlaying: $isPlaying, pipController: pipController)
                                 } else if streamlink.isLoading {
                                     VStack(spacing: 12) {
                                         ProgressView()
@@ -344,14 +386,34 @@ struct HybridTwitchView: View {
 
                                 Spacer()
 
-                                if playback.kind == .liveChannel, playback.channelName != nil {
-                                    Button(action: { withAnimation(.easeOut(duration: 0.2)) { showChat.toggle() } }) {
-                                        Image(systemName: showChat ? "sidebar.right" : "sidebar.right")
+                                if playback.kind == .liveChannel, let channel = playback.channelName {
+                                    if !isChatDetached {
+                                        Button(action: { toggleChatVisibility(channel: channel) }) {
+                                            Image(systemName: "sidebar.right")
+                                                .font(.system(size: 12, weight: .medium))
+                                                .foregroundStyle(.white.opacity(showChat ? 0.8 : 0.4))
+                                        }
+                                        .buttonStyle(.plain)
+                                        .help(showChat ? "Hide chat" : "Show chat")
+                                    }
+
+                                    Button(action: { isChatDetached ? attachChat() : detachChat(channel) }) {
+                                        Image(systemName: isChatDetached ? "rectangle.on.rectangle" : "arrow.up.right.square")
                                             .font(.system(size: 12, weight: .medium))
-                                            .foregroundStyle(.white.opacity(showChat ? 0.8 : 0.4))
+                                            .foregroundStyle(.white.opacity(0.7))
                                     }
                                     .buttonStyle(.plain)
-                                    .help(showChat ? "Hide chat" : "Show chat")
+                                    .help(isChatDetached ? "Attach chat" : "Detach chat")
+                                }
+
+                                if pipController.isAvailable {
+                                    Button(action: { pipController.toggle() }) {
+                                        Image(systemName: "pip.enter")
+                                            .font(.system(size: 12, weight: .medium))
+                                            .foregroundStyle(.white.opacity(0.7))
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help("Picture in Picture")
                                 }
 
                                 Button(action: { Task { await loadStream() } }) {
@@ -404,6 +466,13 @@ struct HybridTwitchView: View {
                             onOpenGiftSub: { onOpenGiftSub?(channel) },
                             onSelectPlayback: { request in
                                 playback = request
+                            },
+                            notificationEnabled: notificationEnabled,
+                            onNotificationToggle: { enabled in
+                                onNotificationToggle?(enabled)
+                            },
+                            onRecordRequest: {
+                                onRecordRequest?()
                             }
                         )
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -414,7 +483,7 @@ struct HybridTwitchView: View {
             }
             
             // Chat
-            if playback.kind == .liveChannel, let channel = playback.channelName, showChat {
+            if playback.kind == .liveChannel, let channel = playback.channelName, showChat, !isChatDetached {
                 TwitchChatView(channelName: channel)
                     .frame(width: 320)
                     .transition(.move(edge: .trailing))
@@ -429,7 +498,11 @@ struct HybridTwitchView: View {
         }
         .onAppear {
             lastChannelName = playback.channelName
-            showChat = (playback.kind == .liveChannel && playback.channelName != nil)
+            if playback.kind == .liveChannel, let channel = playback.channelName {
+                applyChatPreference(for: channel)
+            } else {
+                showChat = false
+            }
         }
         .onChange(of: playback) { newValue in
             // Mettre à jour le player sans "ouvrir Twitch" en bas:
@@ -439,11 +512,17 @@ struct HybridTwitchView: View {
             // Si on change de chaîne, reset les onglets du bas.
             if newValue.channelName != lastChannelName {
                 lastChannelName = newValue.channelName
-                showChat = (newValue.kind == .liveChannel && newValue.channelName != nil)
+                if newValue.kind == .liveChannel, let channel = newValue.channelName {
+                    applyChatPreference(for: channel)
+                } else {
+                    showChat = false
+                    closeDetachedChat()
+                }
             } else {
                 // Si on passe clip/vod, on coupe le chat.
                 if newValue.kind != .liveChannel {
                     showChat = false
+                    closeDetachedChat()
                 }
             }
         }
@@ -454,6 +533,29 @@ struct HybridTwitchView: View {
             // Important: stopper le player natif quand on quitte la vue (navigation ailleurs)
             isPlaying = false
             streamURL = nil
+            closeDetachedChat()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .detachedChatAttachRequested)) { notification in
+            guard let channel = notification.userInfo?["channel"] as? String else { return }
+            guard channel == playback.channelName else { return }
+            isChatDetached = false
+            detachedChannelName = nil
+            showChat = true
+            setChatPreference(.inline, for: channel)
+            programmaticChatCloseChannel = channel
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .detachedChatDidClose)) { notification in
+            guard let channel = notification.userInfo?["channel"] as? String else { return }
+            if programmaticChatCloseChannel == channel {
+                programmaticChatCloseChannel = nil
+            } else {
+                setChatPreference(.hidden, for: channel)
+            }
+            if channel == detachedChannelName {
+                isChatDetached = false
+                detachedChannelName = nil
+                showChat = false
+            }
         }
     }
     
@@ -472,6 +574,86 @@ struct HybridTwitchView: View {
                 showError = true
             }
         }
+    }
+
+    private func detachChat(_ channel: String) {
+        if let current = detachedChannelName {
+            programmaticChatCloseChannel = current
+            NotificationCenter.default.post(name: .detachedChatShouldClose, object: nil, userInfo: ["channel": current])
+        } else {
+            NotificationCenter.default.post(name: .detachedChatShouldClose, object: nil)
+        }
+        detachedChannelName = channel
+        isChatDetached = true
+        showChat = false
+        setChatPreference(.detached, for: channel)
+        openWindow(id: "chat", value: ChatWindowContext(channelName: channel))
+    }
+
+    private func attachChat() {
+        isChatDetached = false
+        detachedChannelName = nil
+        showChat = true
+        if let channel = playback.channelName {
+            setChatPreference(.inline, for: channel)
+            programmaticChatCloseChannel = channel
+            NotificationCenter.default.post(name: .detachedChatShouldClose, object: nil, userInfo: ["channel": channel])
+        } else {
+            NotificationCenter.default.post(name: .detachedChatShouldClose, object: nil)
+        }
+    }
+
+    private func closeDetachedChat() {
+        guard isChatDetached else { return }
+        if let current = detachedChannelName {
+            programmaticChatCloseChannel = current
+            NotificationCenter.default.post(name: .detachedChatShouldClose, object: nil, userInfo: ["channel": current])
+        } else {
+            NotificationCenter.default.post(name: .detachedChatShouldClose, object: nil)
+        }
+        isChatDetached = false
+        detachedChannelName = nil
+    }
+
+    private func toggleChatVisibility(channel: String) {
+        withAnimation(.easeOut(duration: 0.2)) {
+            showChat.toggle()
+        }
+        setChatPreference(showChat ? .inline : .hidden, for: channel)
+    }
+
+    private func applyChatPreference(for channel: String) {
+        let mode = chatPreference(for: channel) ?? .inline
+        switch mode {
+        case .inline:
+            if isChatDetached {
+                closeDetachedChat()
+            }
+            showChat = true
+        case .hidden:
+            showChat = false
+            if isChatDetached {
+                closeDetachedChat()
+            }
+        case .detached:
+            if detachedChannelName != channel || !isChatDetached {
+                detachChat(channel)
+            }
+        }
+    }
+
+    private func chatPreference(for channel: String) -> ChatDisplayMode? {
+        let key = channel.lowercased()
+        let stored = UserDefaults.standard.dictionary(forKey: Self.chatPreferencesKey) as? [String: String] ?? [:]
+        guard let raw = stored[key] else { return nil }
+        return ChatDisplayMode(rawValue: raw)
+    }
+
+    private func setChatPreference(_ mode: ChatDisplayMode, for channel: String) {
+        let key = channel.lowercased()
+        var stored = UserDefaults.standard.dictionary(forKey: Self.chatPreferencesKey) as? [String: String] ?? [:]
+        stored[key] = mode.rawValue
+        UserDefaults.standard.set(stored, forKey: Self.chatPreferencesKey)
     }
     
 }
@@ -538,18 +720,25 @@ struct ChannelInfoView: NSViewRepresentable {
     let onOpenSubscription: () -> Void
     let onOpenGiftSub: () -> Void
     let onSelectPlayback: (NativePlaybackRequest) -> Void
+    let notificationEnabled: Bool
+    let onNotificationToggle: (Bool) -> Void
+    let onRecordRequest: () -> Void
 
     final class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
         let onOpenSubscription: () -> Void
         let onOpenGiftSub: () -> Void
         let channelName: String
         let onSelectPlayback: (NativePlaybackRequest) -> Void
+        let onNotificationToggle: (Bool) -> Void
+        let onRecordRequest: () -> Void
 
-        init(channelName: String, onOpenSubscription: @escaping () -> Void, onOpenGiftSub: @escaping () -> Void, onSelectPlayback: @escaping (NativePlaybackRequest) -> Void) {
+        init(channelName: String, onOpenSubscription: @escaping () -> Void, onOpenGiftSub: @escaping () -> Void, onSelectPlayback: @escaping (NativePlaybackRequest) -> Void, onNotificationToggle: @escaping (Bool) -> Void, onRecordRequest: @escaping () -> Void) {
             self.channelName = channelName
             self.onOpenSubscription = onOpenSubscription
             self.onOpenGiftSub = onOpenGiftSub
             self.onSelectPlayback = onSelectPlayback
+            self.onNotificationToggle = onNotificationToggle
+            self.onRecordRequest = onRecordRequest
         }
 
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
@@ -558,6 +747,19 @@ struct ChannelInfoView: NSViewRepresentable {
                 DispatchQueue.main.async { self.onOpenSubscription() }
             case "openGiftSub":
                 DispatchQueue.main.async { self.onOpenGiftSub() }
+            case "channelNotification":
+                if let dict = message.body as? [String: Any],
+                   let enabledValue = dict["enabled"] {
+                    let enabled: Bool
+                    if let boolVal = enabledValue as? Bool {
+                        enabled = boolVal
+                    } else if let strVal = enabledValue as? String {
+                        enabled = strVal.lowercased() == "true"
+                    } else {
+                        enabled = true
+                    }
+                    DispatchQueue.main.async { self.onNotificationToggle(enabled) }
+                }
             default:
                 return
             }
@@ -612,7 +814,14 @@ struct ChannelInfoView: NSViewRepresentable {
     }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(channelName: channelName, onOpenSubscription: onOpenSubscription, onOpenGiftSub: onOpenGiftSub, onSelectPlayback: onSelectPlayback)
+        Coordinator(
+            channelName: channelName,
+            onOpenSubscription: onOpenSubscription,
+            onOpenGiftSub: onOpenGiftSub,
+            onSelectPlayback: onSelectPlayback,
+            onNotificationToggle: onNotificationToggle,
+            onRecordRequest: onRecordRequest
+        )
     }
     
     func makeNSView(context: Context) -> WKWebView {
@@ -625,6 +834,7 @@ struct ChannelInfoView: NSViewRepresentable {
         config.mediaTypesRequiringUserActionForPlayback = [.audio, .video]
         contentController.add(context.coordinator, name: "openSubscription")
         contentController.add(context.coordinator, name: "openGiftSub")
+        contentController.add(context.coordinator, name: "channelNotification")
         
         let blockMediaScript = WKUserScript(
             source: """
@@ -860,11 +1070,66 @@ struct ChannelInfoView: NSViewRepresentable {
                     const container = pickAboutContainer(marker, main);
                     if (!container) { return false; }
 
+
                     // Si le container est trop petit, la page n'est peut-être pas encore hydratée.
                     try {
                         const rect = container.getBoundingClientRect();
-                        if (rect && rect.height && rect.height < 80) { return false; }
+                        if (rect && rect.height && rect.height < 40) { return false; }
                     } catch (_) {}
+
+                    function closestButton(el) {
+                        if (!el) { return null; }
+                        return el.closest('button,[role="button"],a') || el;
+                    }
+
+                    function findFollowButton(root) {
+                        const scope = root || document;
+                        const direct = scope.querySelector('[data-a-target*="follow"], button[aria-label*="Follow"], button[aria-label*="Suivre"], button[aria-label*="Following"], button[aria-label*="Abonné"], button[aria-label*="Abonne"]');
+                        if (direct) { return closestButton(direct); }
+                        const list = Array.from(scope.querySelectorAll('button,[role="button"],a')).slice(0, 240);
+                        for (const el of list) {
+                            const t = normalizeText(el.getAttribute('aria-label') || el.textContent || '');
+                            if (t === 'follow' || t === 'suivre' || t === 'following' || t === 'abonne' || t === 'abonné') {
+                                return closestButton(el);
+                            }
+                        }
+                        return null;
+                    }
+
+                    function findBellButton(root) {
+                        const scope = root || document;
+                        const direct = scope.querySelector('[data-a-target="notifications-button"], [data-a-target="notification-button"], button[aria-label*="Notification"], button[aria-label*="Notifications"], button[aria-label*="Notific"]');
+                        return closestButton(direct);
+                    }
+
+                    function cloneActions() {
+                        const selectors = [
+                          '[data-a-target="channel-actions"]',
+                          '[data-a-target*="channel-actions"]',
+                          '[data-test-selector*="channel-actions"]',
+                          '[data-test-selector="channel-info-bar-actions"]',
+                          '[data-test-selector*="channel-info-bar"] [data-a-target*="actions"]'
+                        ];
+                        for (const sel of selectors) {
+                          const node = document.querySelector(sel);
+                          if (node) { return node.cloneNode(true); }
+                        }
+                        const follow = findFollowButton(document);
+                        const bell = findBellButton(document);
+                        if (!follow && !bell) { return null; }
+                        const wrapper = document.createElement('div');
+                        wrapper.setAttribute('data-glitcho-actions', '1');
+                        wrapper.style.display = 'flex';
+                        wrapper.style.flexWrap = 'wrap';
+                        wrapper.style.alignItems = 'center';
+                        wrapper.style.gap = '10px';
+                        if (follow) { wrapper.appendChild(follow.cloneNode(true)); }
+                        if (bell) { wrapper.appendChild(bell.cloneNode(true)); }
+                        return wrapper;
+                    }
+
+                    const actionsClone = cloneActions();
+                    if (!actionsClone) { return false; }
 
                     // Version "propre" : extraire UNIQUEMENT le bloc About pour éviter de remettre tout le layout Twitch.
                     try {
@@ -872,6 +1137,9 @@ struct ChannelInfoView: NSViewRepresentable {
                         root.id = 'glitcho-about-root';
                         const shell = document.createElement('div');
                         shell.setAttribute('data-glitcho-about-block', '1');
+                        actionsClone.setAttribute('data-glitcho-actions', '1');
+                        actionsClone.style.marginBottom = '14px';
+                        shell.appendChild(actionsClone);
                         shell.appendChild(container);
                         root.appendChild(shell);
                         document.body.innerHTML = '';
@@ -885,7 +1153,14 @@ struct ChannelInfoView: NSViewRepresentable {
                           '[data-test-selector="channel-info-bar"]'
                         ];
                         killSelectors.forEach(sel => {
-                          try { root.querySelectorAll(sel).forEach(el => el.remove()); } catch (_) {}
+                          try {
+                            root.querySelectorAll(sel).forEach(el => {
+                              if (el.matches('[data-glitcho-actions="1"]') || el.querySelector('[data-glitcho-actions="1"]')) {
+                                return;
+                              }
+                              el.remove();
+                            });
+                          } catch (_) {}
                         });
 
                         const norm = (s) => {
@@ -897,7 +1172,8 @@ struct ChannelInfoView: NSViewRepresentable {
                           if (!t) { return; }
                           const hit =
                             t === 'home' ||
-                            t === 'chat';
+                            t === 'chat' ||
+                            t === 'following';
                           if (hit) {
                             // Pour les tabs, on cache le <li> mais on garde la barre (About/Videos)
                             const li = el.closest('li');
@@ -918,6 +1194,10 @@ struct ChannelInfoView: NSViewRepresentable {
                             const li = a.closest('li');
                             if (li) li.remove(); else (a.closest('div') || a).remove();
                           }
+                          if (href.endsWith('/following') || href.includes('/following?') || href.includes('/following/')) {
+                            const li = a.closest('li');
+                            if (li) li.remove(); else (a.closest('div') || a).remove();
+                          }
                           if (href.endsWith('/home') || href.includes('/home?') || href.includes('/home/')) {
                             const li = a.closest('li');
                             if (li) li.remove(); else (a.closest('div') || a).remove();
@@ -931,7 +1211,7 @@ struct ChannelInfoView: NSViewRepresentable {
                           tabs.forEach(el => {
                             const t = norm(el.textContent);
                             if (!t) { return; }
-                            if (t === 'home' || t === 'chat') { return; }
+                            if (t === 'home' || t === 'chat' || t === 'following') { return; }
                             // si ça ressemble à un tab label mais pas About/Videos, on le retire
                             const isTabby = el.getAttribute('role') === 'tab' || (el.closest('[role="tablist"]') != null);
                             if (isTabby) {
@@ -966,6 +1246,12 @@ struct ChannelInfoView: NSViewRepresentable {
                           }
                         } catch (_) {}
                     } catch (_) { return false; }
+
+                    try {
+                      if (window.__glitcho_decorateChannelActions) {
+                        window.__glitcho_decorateChannelActions();
+                      }
+                    } catch (_) {}
 
                     try { window.scrollTo(0, 0); } catch (_) {}
                     return true;
@@ -1106,12 +1392,119 @@ struct ChannelInfoView: NSViewRepresentable {
             forMainFrameOnly: true
         )
 
+        let channelActionsScript = WKUserScript(
+            source: """
+            (function() {
+              if (window.__glitcho_channel_actions) { return; }
+              window.__glitcho_channel_actions = true;
+
+              const login = "\(channelName)".toLowerCase();
+
+              function ensureStyle() {
+                if (document.getElementById('glitcho-channel-actions-style')) { return; }
+                const style = document.createElement('style');
+                style.id = 'glitcho-channel-actions-style';
+                style.textContent = `
+                  [data-glitcho-bell-state="off"] svg {
+                    opacity: 0.35 !important;
+                    filter: grayscale(1) !important;
+                  }
+                  [data-glitcho-bell-state="on"] svg {
+                    opacity: 1 !important;
+                    color: #f6c357 !important;
+                  }
+                `;
+                (document.head || document.documentElement).appendChild(style);
+              }
+
+              function rootNode() {
+                return document.querySelector('[data-glitcho-about-block="1"]');
+              }
+
+              function closestButton(el) {
+                if (!el) { return null; }
+                return el.closest('button,[role="button"],a') || el;
+              }
+
+              function findBellButton(root) {
+                if (!root) { return null; }
+                const el = root.querySelector(
+                  '[data-a-target="notifications-button"], [data-a-target="notification-button"], [aria-label*="Notification"], [aria-label*="Notifications"], [aria-label*="Notific"]'
+                );
+                return closestButton(el);
+              }
+
+              function setBellState(button, enabled) {
+                button.dataset.glitchoBellState = enabled ? 'on' : 'off';
+              }
+
+              function purgeRecordButtons() {
+                document.querySelectorAll('[data-glitcho-record="1"]').forEach(el => {
+                  try { el.remove(); } catch (_) {}
+                });
+                document.querySelectorAll('[data-glitcho-hidden-follow="1"]').forEach(el => {
+                  try { el.removeAttribute('data-glitcho-hidden-follow'); } catch (_) {}
+                });
+              }
+
+              function decorateBellButton() {
+                if (!login) { return; }
+                const root = rootNode();
+                if (!root) { return; }
+                const button = findBellButton(root);
+                if (!button) { return; }
+                if (button.dataset.glitchoBell === '1') { return; }
+                button.dataset.glitchoBell = '1';
+                button.setAttribute('data-glitcho-bell', '1');
+                setBellState(button, true);
+                button.addEventListener('click', function(e) {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  const enabled = button.dataset.glitchoBellState !== 'on';
+                  setBellState(button, enabled);
+                  try {
+                    window.webkit.messageHandlers.channelNotification.postMessage({ login: login, enabled: enabled });
+                  } catch (_) {}
+                }, true);
+              }
+
+              function decorate() {
+                if (!rootNode()) { return; }
+                ensureStyle();
+                purgeRecordButtons();
+                decorateBellButton();
+              }
+
+              window.__glitcho_decorateChannelActions = function() {
+                decorate();
+              };
+
+              decorate();
+              const observer = new MutationObserver(() => { decorate(); });
+              observer.observe(document.documentElement, { childList: true, subtree: true });
+              setInterval(decorate, 2000);
+
+              window.__glitcho_setBellState = function(loginValue, enabled) {
+                const normalized = (loginValue || '').toLowerCase();
+                if (!normalized || normalized !== login) { return; }
+                const root = rootNode();
+                if (!root) { return; }
+                const button = root.querySelector('[data-glitcho-bell="1"]');
+                if (button) { setBellState(button, !!enabled); }
+              };
+            })();
+            """,
+            injectionTime: .atDocumentEnd,
+            forMainFrameOnly: true
+        )
+
         contentController.addUserScript(initialHideScript)
         contentController.addUserScript(blockMediaScript)
         contentController.addUserScript(aboutOnlyScript)
         contentController.addUserScript(subscriptionInterceptScript)
         contentController.addUserScript(giftInterceptScript)
         contentController.addUserScript(blockChannelLinksScript)
+        contentController.addUserScript(channelActionsScript)
         
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
@@ -1135,6 +1528,9 @@ struct ChannelInfoView: NSViewRepresentable {
         if !currentPath.lowercased().hasPrefix("/\(channelName.lowercased())") {
             nsView.load(URLRequest(url: url))
         }
+        let normalized = channelName.lowercased()
+        let js = "window.__glitcho_setBellState && window.__glitcho_setBellState('\(normalized)', \(notificationEnabled ? "true" : "false"));"
+        nsView.evaluateJavaScript(js, completionHandler: nil)
     }
 }
 

@@ -2,10 +2,15 @@ import SwiftUI
 
 @main
 struct TwitchGlassApp: App {
+    @StateObject private var updateChecker = UpdateChecker()
+    @StateObject private var notificationManager = NotificationManager()
+
     var body: some Scene {
         WindowGroup {
             ContentView()
                 .background(WindowConfigurator())
+                .environmentObject(updateChecker)
+                .environment(\.notificationManager, notificationManager)
         }
         .windowStyle(.hiddenTitleBar)
         .windowToolbarStyle(.unifiedCompact)
@@ -13,6 +18,14 @@ struct TwitchGlassApp: App {
         .commands {
             CommandGroup(replacing: .appInfo) {
                 AboutCommand()
+            }
+            CommandGroup(after: .appInfo) {
+                Button("Check for Updates...") {
+                    Task {
+                        await updateChecker.checkForUpdates(force: true)
+                    }
+                }
+                .keyboardShortcut("u", modifiers: [.command, .shift])
             }
         }
 
@@ -22,6 +35,26 @@ struct TwitchGlassApp: App {
         .windowStyle(.hiddenTitleBar)
         .windowResizability(.contentSize)
         .defaultPosition(.center)
+
+        Window("Settings", id: "settings") {
+            SettingsView()
+                .environment(\.notificationManager, notificationManager)
+        }
+        .windowStyle(.hiddenTitleBar)
+        .windowResizability(.contentSize)
+        .defaultPosition(.center)
+
+        WindowGroup("Chat", id: "chat", for: ChatWindowContext.self) { context in
+            if let value = context.wrappedValue {
+                DetachedChatView(channelName: value.channelName)
+            } else {
+                DetachedChatView(channelName: "twitch")
+            }
+        }
+        .windowStyle(.hiddenTitleBar)
+        .windowResizability(.contentSize)
+        .defaultSize(width: 360, height: 560)
+        .defaultPosition(.trailing)
     }
 }
 

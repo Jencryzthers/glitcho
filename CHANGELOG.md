@@ -1,5 +1,14 @@
 # Changelog - Glitcho
 
+## Version 1.0.3
+
+- Added pinned channels (pin/unpin) with per-channel notification toggles.
+- Added Settings window and improved sidebar UX around channel management.
+- Added in-app update checking (GitHub releases) with prompts and status messaging.
+- Added detached chat window support and Picture-in-Picture groundwork for native playback.
+
+---
+
 ## Version 1.0.2
 
 - Bump version to **1.0.2** (bundle version now set by `Scripts/make_app.sh`).

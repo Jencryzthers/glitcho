@@ -29,7 +29,12 @@ struct TwitchProfile {
     let isLoggedIn: Bool
 }
 
-final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WKNavigationDelegate {
+struct ChannelNotificationToggle: Equatable {
+    let login: String
+    let enabled: Bool
+}
+
+final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WKNavigationDelegate, WKUIDelegate {
     let webView: WKWebView
     let homeURL: URL
 
@@ -45,12 +50,17 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
     @Published var profileAvatarURL: URL?
     @Published var isLoggedIn = false
     @Published var shouldSwitchToNativePlayback: NativePlaybackRequest? = nil
+    @Published var channelNotificationToggle: ChannelNotificationToggle? = nil
 
     private var observations: [NSKeyValueObservation] = []
     private var backgroundWebView: WKWebView?
     private var followedRefreshTimer: Timer?
     private var wasLoggedIn = false
     private var lastNonChannelURL: URL?
+    private var followedWarmupAttempts = 0
+
+    private static let sharedProcessPool = WKProcessPool()
+
 
     init(url: URL) {
         self.homeURL = url
@@ -75,15 +85,18 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
 
         contentController.add(self, name: "followedLive")
         contentController.add(self, name: "profile")
+        contentController.add(self, name: "channelNotification")
         contentController.addUserScript(Self.initialHideScript)
         contentController.addUserScript(Self.adBlockScript)
         contentController.addUserScript(Self.codecWorkaroundScript)
         contentController.addUserScript(Self.hideChromeScript)
+        contentController.addUserScript(Self.channelActionsScript)
         contentController.addUserScript(Self.ensureLiveStreamScript)
         contentController.addUserScript(Self.followedLiveScript)
         contentController.addUserScript(Self.profileScript)
         contentController.addUserScript(Self.autoPlayScript)
         webView.navigationDelegate = self
+        webView.uiDelegate = self
         webView.load(URLRequest(url: normalizedTwitchURL(url)))
         backgroundWebView = makeBackgroundWebView()
         loadFollowedLiveInBackground()
@@ -217,6 +230,19 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
         return components.url ?? url
     }
 
+    private func shouldOpenExternally(_ url: URL) -> Bool {
+        guard let scheme = url.scheme?.lowercased() else { return false }
+        switch scheme {
+        case "http", "https":
+            let host = url.host?.lowercased() ?? ""
+            return !host.hasSuffix("twitch.tv")
+        case "mailto", "tel":
+            return true
+        default:
+            return false
+        }
+    }
+
     private func nativePlaybackRequestIfNeeded(url: URL) -> NativePlaybackRequest? {
         guard let host = url.host?.lowercased() else { return nil }
 
@@ -283,13 +309,25 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
             guard let dict = message.body as? [String: String] else { return }
             let name = (dict["displayName"] ?? dict["name"])?.trimmingCharacters(in: .whitespacesAndNewlines)
             let login = dict["login"]?.trimmingCharacters(in: .whitespacesAndNewlines)
-            let avatar = dict["avatar"].flatMap { URL(string: $0) }
+            let avatarString = dict["avatar"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let avatar = (avatarString?.isEmpty == false) ? URL(string: avatarString!) : nil
             let loggedIn = dict["loggedIn"] == "true"
             DispatchQueue.main.async {
                 if loggedIn {
-                    self.profileName = name?.isEmpty == false ? name : nil
-                    self.profileLogin = login?.isEmpty == false ? login : nil
-                    self.profileAvatarURL = avatar
+                    if !self.wasLoggedIn {
+                        self.profileName = nil
+                        self.profileLogin = nil
+                        self.profileAvatarURL = nil
+                    }
+                    if let name, !name.isEmpty {
+                        self.profileName = name
+                    }
+                    if let login, !login.isEmpty {
+                        self.profileLogin = login
+                    }
+                    if let avatar {
+                        self.profileAvatarURL = avatar
+                    }
                 } else {
                     self.profileName = nil
                     self.profileLogin = nil
@@ -301,9 +339,32 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
                 }
                 self.wasLoggedIn = loggedIn
             }
+        case "channelNotification":
+            guard let dict = message.body as? [String: Any] else { return }
+            guard let loginValue = dict["login"] as? String else { return }
+            let enabled: Bool
+            if let boolVal = dict["enabled"] as? Bool {
+                enabled = boolVal
+            } else if let strVal = dict["enabled"] as? String {
+                enabled = strVal.lowercased() == "true"
+            } else {
+                enabled = true
+            }
+            let login = loginValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !login.isEmpty else { return }
+            DispatchQueue.main.async {
+                self.channelNotificationToggle = ChannelNotificationToggle(login: login, enabled: enabled)
+            }
         default:
             return
         }
+    }
+
+    func setChannelNotificationState(login: String, enabled: Bool) {
+        let normalized = login.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty else { return }
+        let js = "window.__glitcho_setBellState && window.__glitcho_setBellState('\(normalized)', \(enabled ? "true" : "false"));"
+        webView.evaluateJavaScript(js, completionHandler: nil)
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -317,6 +378,13 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
         }
         guard let url = navigationAction.request.url else {
             decisionHandler(.allow)
+            return
+        }
+        if shouldOpenExternally(url) {
+            if navigationAction.navigationType == .linkActivated || navigationAction.targetFrame == nil {
+                NSWorkspace.shared.open(url)
+            }
+            decisionHandler(.cancel)
             return
         }
 
@@ -340,9 +408,22 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
         decisionHandler(.allow)
     }
 
+    func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+        guard let url = navigationAction.request.url else { return nil }
+        if shouldOpenExternally(url) {
+            NSWorkspace.shared.open(url)
+            return nil
+        }
+        if navigationAction.targetFrame == nil {
+            webView.load(navigationAction.request)
+        }
+        return nil
+    }
+
     private func makeBackgroundWebView() -> WKWebView {
         let config = WKWebViewConfiguration()
         let contentController = WKUserContentController()
+        config.processPool = Self.sharedProcessPool
         config.userContentController = contentController
         config.websiteDataStore = .default()
         config.defaultWebpagePreferences.allowsContentJavaScript = true
@@ -363,17 +444,36 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
         }
         webView.customUserAgent = Self.safariUserAgent
         webView.navigationDelegate = self
+        webView.uiDelegate = self
         return webView
     }
 
     private func loadFollowedLiveInBackground() {
         guard let backgroundWebView else { return }
+        followedWarmupAttempts = 0
         let url = URL(string: "https://www.twitch.tv/following")!
         backgroundWebView.load(URLRequest(url: url))
 
         followedRefreshTimer?.invalidate()
         followedRefreshTimer = Timer.scheduledTimer(withTimeInterval: 120, repeats: true) { [weak self] _ in
             self?.backgroundWebView?.reload()
+        }
+
+        scheduleFollowedWarmupReload()
+    }
+
+    private func scheduleFollowedWarmupReload() {
+        guard isLoggedIn else { return }
+        guard followedWarmupAttempts < 3 else { return }
+        followedWarmupAttempts += 1
+        let delay = followedWarmupAttempts == 1 ? 2.0 : (followedWarmupAttempts == 2 ? 6.0 : 12.0)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            guard self.isLoggedIn else { return }
+            if self.followedLive.isEmpty {
+                self.backgroundWebView?.reload()
+                self.scheduleFollowedWarmupReload()
+            }
         }
     }
 
@@ -596,6 +696,119 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
 
     private static let hideChromeScript = WKUserScript(
         source: hideChromeScriptSource,
+        injectionTime: .atDocumentEnd,
+        forMainFrameOnly: true
+    )
+
+    private static let channelActionsScript = WKUserScript(
+        source: """
+        (function() {
+          if (window.__glitcho_channel_actions) { return; }
+          window.__glitcho_channel_actions = true;
+
+          const reserved = new Set(['directory','downloads','login','logout','search','settings','signup','p','following','browse','drops','subs','inventory','videos','clip']);
+
+          function channelLogin() {
+            const parts = (location.pathname || '').split('/').filter(Boolean);
+            if (!parts.length) { return null; }
+            const login = (parts[0] || '').toLowerCase();
+            if (!login || reserved.has(login)) { return null; }
+            if (parts.length > 1) {
+              const allowed = new Set(['about','schedule','videos','home']);
+              const next = (parts[1] || '').toLowerCase();
+              if (!allowed.has(next)) { return null; }
+            }
+            return login;
+          }
+
+          function ensureStyle() {
+            if (document.getElementById('glitcho-channel-actions-style')) { return; }
+            const style = document.createElement('style');
+            style.id = 'glitcho-channel-actions-style';
+            style.textContent = `
+              [data-glitcho-bell-state="off"] svg {
+                opacity: 0.35 !important;
+                filter: grayscale(1) !important;
+              }
+              [data-glitcho-bell-state="on"] svg {
+                opacity: 1 !important;
+                color: #f6c357 !important;
+              }
+            `;
+            (document.head || document.documentElement).appendChild(style);
+          }
+
+          function findActionRoot() {
+            const explicit = document.querySelector('[data-a-target="channel-actions"], [data-a-target*="channel-actions"]');
+            if (explicit) { return explicit; }
+            const bell = document.querySelector('[data-a-target="notifications-button"], [data-a-target="notification-button"], button[aria-label*="Notification"], button[aria-label*="Notifications"], button[aria-label*="Notific"]');
+            if (bell) { return bell.closest('div') || bell.parentElement; }
+            const sub = Array.from(document.querySelectorAll('button,a,[role="button"]')).find(el => {
+              const t = (el.getAttribute('aria-label') || el.textContent || '').toLowerCase();
+              return t.includes('subscribe') || t.includes('sub') || t.includes("s'abonner") || t.includes('sabonner');
+            });
+            if (sub) { return sub.closest('div') || sub.parentElement; }
+            return document.body;
+          }
+
+          function setBellState(button, enabled) {
+            button.dataset.glitchoBellState = enabled ? 'on' : 'off';
+          }
+
+          function purgeRecordButtons() {
+            document.querySelectorAll('[data-glitcho-record="1"]').forEach(el => {
+              try { el.remove(); } catch (_) {}
+            });
+            document.querySelectorAll('[data-glitcho-hidden-follow="1"]').forEach(el => {
+              try { el.removeAttribute('data-glitcho-hidden-follow'); } catch (_) {}
+            });
+          }
+
+          function decorateBellButton() {
+            const login = channelLogin();
+            if (!login) { return; }
+            const root = findActionRoot();
+            const button = root.querySelector('[data-a-target="notifications-button"], [data-a-target="notification-button"], button[aria-label*="Notification"], button[aria-label*="Notifications"], button[aria-label*="Notific"]');
+            if (!button) { return; }
+            if (button.dataset.glitchoBell === '1') { return; }
+            button.dataset.glitchoBell = '1';
+            button.setAttribute('data-glitcho-bell', '1');
+            setBellState(button, true);
+            button.addEventListener('click', function(e) {
+              e.preventDefault();
+              e.stopPropagation();
+              const enabled = button.dataset.glitchoBellState !== 'on';
+              setBellState(button, enabled);
+              try {
+                window.webkit.messageHandlers.channelNotification.postMessage({ login: login, enabled: enabled });
+              } catch (_) {}
+            }, true);
+          }
+
+          function decorate() {
+            if (!channelLogin()) { return; }
+            ensureStyle();
+            purgeRecordButtons();
+            decorateBellButton();
+          }
+
+          window.__glitcho_decorateChannelActions = function() {
+            decorate();
+          };
+
+          decorate();
+          const observer = new MutationObserver(() => { decorate(); });
+          observer.observe(document.documentElement, { childList: true, subtree: true });
+          setInterval(decorate, 2000);
+
+          window.__glitcho_setBellState = function(login, enabled) {
+            const current = channelLogin();
+            if (!current || current !== (login || '').toLowerCase()) { return; }
+            const button = document.querySelector('[data-glitcho-bell="1"]');
+            if (button) { setBellState(button, !!enabled); }
+          };
+        })();
+        """,
         injectionTime: .atDocumentEnd,
         forMainFrameOnly: true
     )
