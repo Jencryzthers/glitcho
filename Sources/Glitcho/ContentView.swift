@@ -15,7 +15,8 @@ struct ContentView: View {
 
     var body: some View {
         ZStack {
-            GlassBackground()
+            Color(red: 0.05, green: 0.05, blue: 0.07)
+                .ignoresSafeArea()
 
             NavigationSplitView(columnVisibility: $columnVisibility) {
                 Sidebar(
@@ -23,7 +24,6 @@ struct ContentView: View {
                     store: store,
                     showSettingsPopup: $showSettingsPopup,
                     onNavigate: { url in
-                        // Si on est en player natif, revenir au WebView quand l'utilisateur navigue ailleurs
                         useNativePlayer = false
                         store.navigate(to: url)
                     },
@@ -32,9 +32,9 @@ struct ContentView: View {
                         useNativePlayer = true
                     }
                 )
-                .navigationSplitViewColumnWidth(350)
+                .navigationSplitViewColumnWidth(320)
             } detail: {
-                GlassCard {
+                Group {
                     if useNativePlayer {
                         HybridTwitchView(
                             playback: $playbackRequest,
@@ -51,8 +51,8 @@ struct ContentView: View {
                         WebViewContainer(webView: store.webView)
                     }
                 }
-                .shadow(color: Color.black.opacity(0.28), radius: 30, x: 0, y: 16)
-                .padding(20)
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .padding(12)
             }
             .navigationSplitViewStyle(.prominentDetail)
             .onChange(of: store.shouldSwitchToNativePlayback) { request in
@@ -63,17 +63,15 @@ struct ContentView: View {
                         }
                         return
                     }
-                    // Important: tuer toute lecture web pour éviter double playback.
                     store.prepareWebViewForNativePlayer()
                     playbackRequest = request
                     useNativePlayer = true
-                    // Réinitialiser le flag
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                         store.shouldSwitchToNativePlayback = nil
                     }
                 }
             }
-            .navigationSplitViewColumnWidth(min: 325, ideal: 325, max: 325)
+            .navigationSplitViewColumnWidth(min: 300, ideal: 320, max: 340)
 
             if showSettingsPopup {
                 PopupPanel(
@@ -269,234 +267,158 @@ struct Sidebar: View {
     ]
 
     var body: some View {
-        VStack(spacing: 12) {
-            GlassCard {
-                VStack(spacing: 12) {
-                    LogoHeader()
-
-                    AccountSection(
-                        store: store,
-                        showSettingsPopup: $showSettingsPopup,
-                        onNavigate: onNavigate
-                    )
-
-                    SearchBar(text: $searchText) {
-                        let query = searchText.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
-                        let url = URL(string: "https://www.twitch.tv/search?term=\(query)")!
-                        if let onNavigate {
-                            onNavigate(url)
-                        } else {
-                            store.navigate(to: url)
-                        }
-                    }
-
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 20) {
-                            SidebarSection(title: "EXPLORE") {
-                                VStack(spacing: 2) {
-                                    ForEach(sections) { destination in
-                                        SidebarRow(
-                                            title: destination.title,
-                                            systemImage: destination.icon
-                                        ) {
-                                            if let onNavigate {
-                                                onNavigate(destination.url)
-                                            } else {
-                                                store.navigate(to: destination.url)
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            SidebarSection(title: "FOLLOWING") {
-                                if store.followedLive.isEmpty {
-                                    HStack(spacing: 8) {
-                                        Image(systemName: "heart")
-                                            .font(.system(size: 11, weight: .medium))
-                                            .foregroundStyle(.white.opacity(0.4))
-                                        Text("No live channels")
-                                            .font(.system(size: 12, weight: .medium))
-                                            .foregroundStyle(.white.opacity(0.5))
-                                    }
-                                    .padding(.horizontal, 10)
-                                    .padding(.vertical, 8)
-                                } else {
-                                    VStack(spacing: 2) {
-                                    ForEach(store.followedLive) { channel in
-                                        FollowingRow(channel: channel) {
-                                            // Extraire le nom de la chaîne depuis l'URL
-                                            let channelName = channel.url.lastPathComponent
-                                            onChannelSelected?(channelName)
-                                        }
-                                    }
-                                    }
-                                }
-                            }
-                        }
-                        .padding(.vertical, 4)
-                    }
-                    .scrollIndicators(.visible)
-                }
-                .padding(14)
-            }
-            .shadow(color: Color.black.opacity(0.25), radius: 20, x: 0, y: 10)
-        }
-        .padding(20)
-    }
-}
-
-struct LogoHeader: View {
-    var body: some View {
-        HStack(spacing: 0) {
-            if let image = NSImage(contentsOfFile: "/Users/Repository/twitchapp/Resources/sidebar_logo.png") {
-                Image(nsImage: image)
-                    .resizable()
-                    .scaledToFit()
-                    .frame(height: 28)
-            } else {
-                // Fallback avec texte si l'image n'existe pas
-                Text("twitch")
-                    .font(.system(size: 22, weight: .bold))
-                    .foregroundStyle(
-                        LinearGradient(
-                            colors: [
-                                Color(red: 0.58, green: 0.25, blue: 0.82),
-                                Color(red: 0.48, green: 0.18, blue: 0.72)
-                            ],
-                            startPoint: .leading,
-                            endPoint: .trailing
-                        )
-                    )
-            }
-            Spacer()
-        }
-        .padding(.bottom, 8)
-    }
-}
-
-struct AccountSection: View {
-    @ObservedObject var store: WebViewStore
-    @Binding var showSettingsPopup: Bool
-    var onNavigate: ((URL) -> Void)?
-
-    var body: some View {
-        let displayName = normalized(store.profileName) ?? normalized(store.profileLogin) ?? (store.isLoggedIn ? "Profile" : "Not signed in")
-        let subtitle: String = {
-            guard store.isLoggedIn else { return "Sign in to continue" }
-            if let login = normalized(store.profileLogin) {
-                return "@\(login)"
-            }
-            return "Account"
-        }()
-
-        VStack(spacing: 12) {
+        VStack(spacing: 0) {
+            // Header with logo and account
             HStack(spacing: 12) {
-                AvatarView(url: store.profileAvatarURL, isLoggedIn: store.isLoggedIn)
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(displayName)
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(.primary)
+                AvatarView(url: store.profileAvatarURL, isLoggedIn: store.isLoggedIn, size: 36)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(store.isLoggedIn ? (normalized(store.profileName) ?? normalized(store.profileLogin) ?? "Profile") : "Glitcho")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(.white)
                         .lineLimit(1)
-                    Text(subtitle)
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(.secondary)
+                    if store.isLoggedIn, let login = normalized(store.profileLogin) {
+                        Text("@\(login)")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.5))
+                    }
                 }
-                Spacer(minLength: 0)
-            }
-            
-            HStack(spacing: 8) {
+
+                Spacer()
+
                 if store.isLoggedIn {
                     Button {
                         showSettingsPopup = true
                     } label: {
-                        HStack(spacing: 6) {
-                            Image(systemName: "gearshape.fill")
-                                .font(.system(size: 11, weight: .semibold))
-                            Text("Settings")
-                                .font(.system(size: 12, weight: .semibold))
-                        }
-                        .foregroundStyle(.white)
-                        .frame(maxWidth: .infinity)
-                        .frame(height: 32)
-                        .background(
-                            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                .fill(Color.white.opacity(0.12))
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                        .stroke(Color.white.opacity(0.16), lineWidth: 0.5)
-                                )
-                        )
+                        Image(systemName: "gearshape")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.5))
                     }
                     .buttonStyle(.plain)
+                    .help("Settings")
 
                     Button {
                         store.logout()
                     } label: {
                         Image(systemName: "rectangle.portrait.and.arrow.right")
-                            .font(.system(size: 13, weight: .semibold))
-                            .foregroundStyle(.white.opacity(0.85))
-                            .frame(width: 32, height: 32)
-                            .background(
-                                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                    .fill(Color.white.opacity(0.1))
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                            .stroke(Color.white.opacity(0.14), lineWidth: 0.5)
-                                    )
-                            )
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.5))
                     }
                     .buttonStyle(.plain)
                     .help("Log out")
                 } else {
                     Button {
                         let url = URL(string: "https://www.twitch.tv/login")!
-                        if let onNavigate {
-                            onNavigate(url)
-                        } else {
-                            store.navigate(to: url)
-                        }
+                        onNavigate?(url) ?? store.navigate(to: url)
                     } label: {
-                        HStack(spacing: 6) {
-                            Image(systemName: "person.fill")
-                                .font(.system(size: 11, weight: .semibold))
-                            Text("Log in")
-                                .font(.system(size: 12, weight: .semibold))
-                        }
-                        .foregroundStyle(.white)
-                        .frame(maxWidth: .infinity)
-                        .frame(height: 32)
-                        .background(
-                            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                .fill(
-                                    LinearGradient(
-                                        colors: [
-                                            Color(red: 0.58, green: 0.25, blue: 0.82),
-                                            Color(red: 0.48, green: 0.18, blue: 0.72)
-                                        ],
-                                        startPoint: .topLeading,
-                                        endPoint: .bottomTrailing
-                                    )
-                                )
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                        .stroke(Color.white.opacity(0.2), lineWidth: 0.5)
-                                )
-                                .shadow(color: Color(red: 0.58, green: 0.25, blue: 0.82).opacity(0.4), radius: 8, x: 0, y: 4)
-                        )
+                        Text("Log in")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 6)
+                            .background(
+                                Capsule()
+                                    .fill(Color.purple.opacity(0.8))
+                            )
                     }
                     .buttonStyle(.plain)
                 }
             }
+            .padding(.horizontal, 16)
+            .padding(.top, 16)
+            .padding(.bottom, 12)
+
+            // Search
+            HStack(spacing: 10) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.4))
+
+                TextField("Search", text: $searchText)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 13))
+                    .foregroundStyle(.white)
+                    .onSubmit {
+                        let query = searchText.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
+                        let url = URL(string: "https://www.twitch.tv/search?term=\(query)")!
+                        onNavigate?(url) ?? store.navigate(to: url)
+                    }
+
+                if !searchText.isEmpty {
+                    Button {
+                        searchText = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.white.opacity(0.3))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(Color.white.opacity(0.06))
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .padding(.horizontal, 12)
+            .padding(.bottom, 16)
+
+            // Navigation
+            ScrollView {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(sections) { destination in
+                        SidebarRow(
+                            title: destination.title,
+                            systemImage: destination.icon
+                        ) {
+                            onNavigate?(destination.url) ?? store.navigate(to: destination.url)
+                        }
+                    }
+
+                    // Divider
+                    Rectangle()
+                        .fill(Color.white.opacity(0.08))
+                        .frame(height: 1)
+                        .padding(.vertical, 12)
+                        .padding(.horizontal, 12)
+
+                    // Following section
+                    Text("LIVE")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(.white.opacity(0.35))
+                        .tracking(1)
+                        .padding(.horizontal, 12)
+                        .padding(.bottom, 8)
+
+                    if store.followedLive.isEmpty {
+                        HStack(spacing: 8) {
+                            Image(systemName: "heart")
+                                .font(.system(size: 11))
+                                .foregroundStyle(.white.opacity(0.3))
+                            Text("No live channels")
+                                .font(.system(size: 12))
+                                .foregroundStyle(.white.opacity(0.4))
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                    } else {
+                        ForEach(store.followedLive) { channel in
+                            FollowingRow(channel: channel) {
+                                let channelName = channel.url.lastPathComponent
+                                onChannelSelected?(channelName)
+                            }
+                        }
+                    }
+                }
+                .padding(.bottom, 16)
+            }
+            .scrollIndicators(.automatic)
         }
-        .padding(12)
         .background(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(Color.white.opacity(0.08))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .stroke(Color.white.opacity(0.15), lineWidth: 0.5)
-                )
+            ZStack {
+                Color(red: 0.08, green: 0.08, blue: 0.10)
+                VisualEffectView(material: .sidebar, blendingMode: .behindWindow)
+                    .opacity(0.5)
+            }
         )
     }
 
@@ -515,6 +437,7 @@ struct AccountSection: View {
 struct AvatarView: View {
     let url: URL?
     let isLoggedIn: Bool
+    var size: CGFloat = 40
 
     var body: some View {
         Group {
@@ -525,53 +448,31 @@ struct AvatarView: View {
                         image.resizable().scaledToFill()
                     case .failure:
                         ZStack {
-                            Color.white.opacity(0.12)
+                            Color.white.opacity(0.1)
                             Image(systemName: "person.fill")
-                                .font(.system(size: 14, weight: .medium))
+                                .font(.system(size: size * 0.4, weight: .medium))
                                 .foregroundStyle(.white.opacity(0.5))
                         }
                     default:
                         ZStack {
                             Color.white.opacity(0.08)
                             ProgressView()
-                                .scaleEffect(0.6)
-                                .tint(.white.opacity(0.5))
+                                .scaleEffect(0.5)
+                                .tint(.white.opacity(0.4))
                         }
                     }
                 }
             } else {
                 ZStack {
-                    LinearGradient(
-                        colors: [
-                            Color.white.opacity(0.14),
-                            Color.white.opacity(0.08)
-                        ],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                    Image(systemName: isLoggedIn ? "person.fill" : "person")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(.white.opacity(0.65))
+                    Color.purple.opacity(0.3)
+                    Image(systemName: isLoggedIn ? "person.fill" : "play.tv.fill")
+                        .font(.system(size: size * 0.4, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.8))
                 }
             }
         }
-        .frame(width: 40, height: 40)
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(
-                    LinearGradient(
-                        colors: [
-                            Color.white.opacity(0.2),
-                            Color.white.opacity(0.08)
-                        ],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    ),
-                    lineWidth: 1
-                )
-        )
-        .shadow(color: Color.black.opacity(0.15), radius: 4, x: 0, y: 2)
+        .frame(width: size, height: size)
+        .clipShape(RoundedRectangle(cornerRadius: size * 0.25, style: .continuous))
     }
 }
 
@@ -601,126 +502,16 @@ struct GlassCard<Content: View>: View {
         content
             .background(
                 ZStack {
-                    // Fond moins transparent
-                    Color(red: 0.08, green: 0.08, blue: 0.12)
-                        .opacity(0.75)
-                    
-                    // Effet de verre subtil
+                    Color(red: 0.06, green: 0.06, blue: 0.08)
                     VisualEffectView(material: .hudWindow, blendingMode: .withinWindow)
-                        .opacity(0.3)
+                        .opacity(0.4)
                 }
             )
-            .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
             .overlay(
-                RoundedRectangle(cornerRadius: 22, style: .continuous)
-                    .stroke(Color.white.opacity(0.12), lineWidth: 1)
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(Color.white.opacity(0.08), lineWidth: 1)
             )
-            .overlay(
-                RoundedRectangle(cornerRadius: 22, style: .continuous)
-                    .stroke(
-                        LinearGradient(
-                            colors: [
-                                Color.white.opacity(0.08),
-                                Color.clear
-                            ],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        ),
-                        lineWidth: 1
-                    )
-                    .blur(radius: 2)
-            )
-    }
-}
-
-struct SearchBar: View {
-    @Binding var text: String
-    let onSubmit: () -> Void
-    @FocusState private var isFocused: Bool
-
-    var body: some View {
-        func submit() {
-            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { return }
-            if trimmed != text { text = trimmed }
-            onSubmit()
-            isFocused = false
-        }
-
-        return HStack(spacing: 12) {
-            Button(action: submit) {
-                Image(systemName: "magnifyingglass")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(isFocused ? Color.white.opacity(0.9) : Color.white.opacity(0.5))
-            }
-            .buttonStyle(.plain)
-
-            TextField("Search Twitch", text: $text)
-                .textFieldStyle(.plain)
-                .font(.system(size: 13, weight: .medium))
-                .foregroundStyle(.primary)
-                .focused($isFocused)
-                .onSubmit(submit)
-
-            if !text.isEmpty {
-                HStack(spacing: 8) {
-                    Button(action: submit) {
-                        Image(systemName: "arrow.turn.down.left")
-                            .font(.system(size: 13, weight: .semibold))
-                            .foregroundStyle(Color.white.opacity(0.55))
-                    }
-                    .buttonStyle(.plain)
-                    .help("Search")
-
-                    Button {
-                        text = ""
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 14, weight: .medium))
-                            .foregroundStyle(Color.white.opacity(0.4))
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 11)
-        .background(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(Color.white.opacity(isFocused ? 0.14 : 0.10))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .stroke(
-                            isFocused 
-                                ? Color.white.opacity(0.3)
-                                : Color.white.opacity(0.18),
-                            lineWidth: isFocused ? 1 : 0.5
-                        )
-                )
-        )
-        .animation(.easeInOut(duration: 0.15), value: isFocused)
-    }
-}
-
-struct SidebarSection<Content: View>: View {
-    let title: String
-    let content: Content
-
-    init(title: String, @ViewBuilder content: () -> Content) {
-        self.title = title
-        self.content = content()
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text(title)
-                .font(.system(size: 10, weight: .bold))
-                .foregroundStyle(Color.white.opacity(0.4))
-                .tracking(0.5)
-                .padding(.horizontal, 10)
-            content
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -732,27 +523,27 @@ struct SidebarRow: View {
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 10) {
+            HStack(spacing: 12) {
                 Image(systemName: systemImage)
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(isHovered ? Color.white.opacity(0.9) : Color.white.opacity(0.6))
-                    .frame(width: 18)
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(isHovered ? .white : .white.opacity(0.5))
+                    .frame(width: 20)
                 Text(title)
                     .font(.system(size: 13, weight: .medium))
-                    .foregroundColor(isHovered ? .primary : Color.white.opacity(0.85))
-                Spacer(minLength: 0)
+                    .foregroundColor(isHovered ? .white : .white.opacity(0.7))
+                Spacer()
             }
-            .padding(.horizontal, 10)
+            .padding(.horizontal, 12)
             .padding(.vertical, 8)
             .background(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
                     .fill(isHovered ? Color.white.opacity(0.08) : Color.clear)
             )
         }
         .buttonStyle(.plain)
         .contentShape(Rectangle())
         .onHover { hovering in
-            withAnimation(.easeInOut(duration: 0.15)) {
+            withAnimation(.easeOut(duration: 0.12)) {
                 isHovered = hovering
             }
         }
@@ -767,97 +558,49 @@ struct FollowingRow: View {
     var body: some View {
         Button(action: action) {
             HStack(spacing: 10) {
-                ChannelThumbnail(url: channel.thumbnailURL)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(channel.name)
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundColor(isHovered ? .primary : Color.white.opacity(0.85))
-                        .lineLimit(1)
+                // Avatar
+                Group {
+                    if let url = channel.thumbnailURL {
+                        AsyncImage(url: url) { phase in
+                            switch phase {
+                            case .success(let image):
+                                image.resizable().scaledToFill()
+                            default:
+                                Color.white.opacity(0.1)
+                            }
+                        }
+                    } else {
+                        Color.white.opacity(0.1)
+                    }
                 }
-                Spacer(minLength: 0)
-                HStack(spacing: 4) {
-                    Circle()
-                        .fill(Color.red)
-                        .frame(width: 6, height: 6)
-                    Text("LIVE")
-                        .font(.system(size: 9, weight: .bold))
-                        .foregroundStyle(.red)
-                }
-                .padding(.horizontal, 6)
-                .padding(.vertical, 3)
-                .background(
-                    Capsule()
-                        .fill(Color.red.opacity(0.15))
-                )
+                .frame(width: 28, height: 28)
+                .clipShape(Circle())
+
+                Text(channel.name)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(isHovered ? .white : .white.opacity(0.7))
+                    .lineLimit(1)
+
+                Spacer()
+
+                Circle()
+                    .fill(Color.red)
+                    .frame(width: 8, height: 8)
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
             .background(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
                     .fill(isHovered ? Color.white.opacity(0.08) : Color.clear)
             )
         }
         .buttonStyle(.plain)
         .contentShape(Rectangle())
         .onHover { hovering in
-            withAnimation(.easeInOut(duration: 0.15)) {
+            withAnimation(.easeOut(duration: 0.12)) {
                 isHovered = hovering
             }
         }
-    }
-}
-
-struct ChannelThumbnail: View {
-    let url: URL?
-
-    var body: some View {
-        Group {
-            if let url = url {
-                AsyncImage(url: url) { phase in
-                    switch phase {
-                    case .success(let image):
-                        image.resizable().scaledToFill()
-                    case .failure:
-                        ZStack {
-                            Color.white.opacity(0.1)
-                            Image(systemName: "person.fill")
-                                .font(.system(size: 10, weight: .medium))
-                                .foregroundStyle(Color.white.opacity(0.4))
-                        }
-                    default:
-                        ZStack {
-                            Color.white.opacity(0.08)
-                            ProgressView()
-                                .scaleEffect(0.5)
-                                .tint(Color.white.opacity(0.4))
-                        }
-                    }
-                }
-            } else {
-                ZStack {
-                    Color.white.opacity(0.1)
-                    Image(systemName: "person.fill")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(Color.white.opacity(0.4))
-                }
-            }
-        }
-        .frame(width: 36, height: 36)
-        .clipShape(Circle())
-        .overlay(
-            Circle()
-                .stroke(
-                    LinearGradient(
-                        colors: [
-                            Color.white.opacity(0.2),
-                            Color.white.opacity(0.08)
-                        ],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    ),
-                    lineWidth: 1
-                )
-        )
     }
 }
 
@@ -929,68 +672,41 @@ struct PopupPanel: View {
 
     var body: some View {
         ZStack {
-            Color.black.opacity(0.35)
+            Color.black.opacity(0.5)
                 .ignoresSafeArea()
                 .onTapGesture(perform: onClose)
 
-            GlassCard {
-                VStack(spacing: 12) {
-                    HStack {
-                        Text(title)
-                            .font(.system(size: 14, weight: .semibold))
-                            .foregroundStyle(.primary)
-                        Spacer()
-                        Button(action: onClose) {
-                            Image(systemName: "xmark")
-                                .font(.system(size: 12, weight: .semibold))
-                                .foregroundStyle(.secondary)
-                        }
-                        .buttonStyle(.plain)
+            VStack(spacing: 0) {
+                HStack {
+                    Text(title)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.white)
+                    Spacer()
+                    Button(action: onClose) {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundStyle(.white.opacity(0.5))
+                            .frame(width: 24, height: 24)
+                            .background(Color.white.opacity(0.1))
+                            .clipShape(Circle())
                     }
-                    .padding(.horizontal, 14)
-                    .padding(.top, 12)
-
-                    PopupWebViewContainer(url: url, onLoadScript: onLoadScript)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-                        .padding(.horizontal, 12)
-                        .padding(.bottom, 12)
+                    .buttonStyle(.plain)
                 }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
+
+                PopupWebViewContainer(url: url, onLoadScript: onLoadScript)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
+            .background(Color(red: 0.08, green: 0.08, blue: 0.10))
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(Color.white.opacity(0.1), lineWidth: 1)
+            )
             .frame(width: width, height: height)
-            .shadow(color: Color.black.opacity(0.3), radius: 26, x: 0, y: 16)
+            .shadow(color: Color.black.opacity(0.4), radius: 30, x: 0, y: 10)
         }
-    }
-}
-
-struct GlassBackground: View {
-    var body: some View {
-        ZStack {
-            LinearGradient(
-                colors: [
-                    Color(red: 0.08, green: 0.12, blue: 0.18),
-                    Color(red: 0.14, green: 0.08, blue: 0.2),
-                    Color(red: 0.06, green: 0.18, blue: 0.16)
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-
-            RadialGradient(
-                colors: [
-                    Color.white.opacity(0.25),
-                    Color.white.opacity(0.02)
-                ],
-                center: .topLeading,
-                startRadius: 20,
-                endRadius: 500
-            )
-            .blendMode(.screen)
-
-            VisualEffectView(material: .underWindowBackground, blendingMode: .behindWindow)
-                .opacity(0.9)
-        }
-        .ignoresSafeArea()
     }
 }
 

@@ -4,6 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="$ROOT_DIR/Build"
 APP_NAME="Glitcho"
+APP_VERSION="1.0.2"
+APP_BUILD="102"
 APP_DIR="$BUILD_DIR/${APP_NAME}.app"
 
 swift build -c release --package-path "$ROOT_DIR"
@@ -37,9 +39,9 @@ cat <<PLIST > "$APP_DIR/Contents/Info.plist"
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
+    <string>$APP_VERSION</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>$APP_BUILD</string>
     <key>LSMinimumSystemVersion</key>
     <string>26.0</string>
 </dict>

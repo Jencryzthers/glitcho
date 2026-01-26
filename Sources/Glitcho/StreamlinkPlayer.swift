@@ -300,65 +300,77 @@ struct HybridTwitchView: View {
                                 if let url = streamURL {
                                     NativeVideoPlayer(url: url, isPlaying: $isPlaying)
                                 } else if streamlink.isLoading {
-                                    VStack {
+                                    VStack(spacing: 12) {
                                         ProgressView()
-                                            .scaleEffect(1.5)
-                                        Text("Chargement du stream...")
-                                            .font(.headline)
-                                            .foregroundColor(.white)
-                                            .padding(.top)
+                                            .scaleEffect(0.8)
+                                            .tint(.white.opacity(0.6))
+                                        Text("Loading stream...")
+                                            .font(.system(size: 12, weight: .medium))
+                                            .foregroundColor(.white.opacity(0.5))
                                     }
                                 } else {
-                                    VStack {
-                                        Image(systemName: "play.tv")
-                                            .font(.system(size: 60))
-                                            .foregroundColor(.white.opacity(0.5))
-                                        Text("Cliquez pour charger le stream")
-                                            .font(.headline)
-                                            .foregroundColor(.white.opacity(0.7))
-                                        Button("Charger") {
-                                            Task { await loadStream() }
+                                    VStack(spacing: 16) {
+                                        Image(systemName: "play.circle")
+                                            .font(.system(size: 48, weight: .thin))
+                                            .foregroundColor(.white.opacity(0.3))
+                                        Button(action: { Task { await loadStream() } }) {
+                                            Text("Load Stream")
+                                                .font(.system(size: 12, weight: .medium))
+                                                .foregroundStyle(.white)
+                                                .padding(.horizontal, 16)
+                                                .padding(.vertical, 8)
+                                                .background(Color.white.opacity(0.15))
+                                                .clipShape(Capsule())
                                         }
-                                        .buttonStyle(.borderedProminent)
-                                        .padding(.top)
+                                        .buttonStyle(.plain)
                                     }
                                 }
                             }
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
-                            .background(Color.black)
+                            .background(Color(red: 0.04, green: 0.04, blue: 0.05))
 
                             // Contrôles
-                            HStack {
+                            HStack(spacing: 16) {
                                 Button(action: { isPlaying.toggle() }) {
                                     Image(systemName: isPlaying ? "pause.fill" : "play.fill")
-                                        .font(.system(size: 14, weight: .medium))
+                                        .font(.system(size: 12, weight: .semibold))
+                                        .foregroundStyle(.white.opacity(0.8))
                                 }
-                                .buttonStyle(.borderless)
+                                .buttonStyle(.plain)
 
-                                Text(playback.channelName ?? "Twitch")
-                                    .font(.system(size: 14, weight: .semibold))
-                                    .foregroundColor(.white)
+                                Text(playback.channelName ?? "Stream")
+                                    .font(.system(size: 12, weight: .medium))
+                                    .foregroundColor(.white.opacity(0.7))
 
                                 Spacer()
 
                                 if playback.kind == .liveChannel, playback.channelName != nil {
-                                    Button(action: { withAnimation { showChat.toggle() } }) {
-                                        Image(systemName: showChat ? "bubble.left.and.bubble.right.fill" : "bubble.left.and.bubble.right")
-                                            .font(.system(size: 14, weight: .medium))
+                                    Button(action: { withAnimation(.easeOut(duration: 0.2)) { showChat.toggle() } }) {
+                                        Image(systemName: showChat ? "sidebar.right" : "sidebar.right")
+                                            .font(.system(size: 12, weight: .medium))
+                                            .foregroundStyle(.white.opacity(showChat ? 0.8 : 0.4))
                                     }
-                                    .buttonStyle(.borderless)
-                                    .help(showChat ? "Masquer le chat" : "Afficher le chat")
+                                    .buttonStyle(.plain)
+                                    .help(showChat ? "Hide chat" : "Show chat")
                                 }
 
-                                Button("Recharger") {
-                                    Task { await loadStream() }
+                                Button(action: { Task { await loadStream() } }) {
+                                    Image(systemName: "arrow.clockwise")
+                                        .font(.system(size: 11, weight: .semibold))
+                                        .foregroundStyle(.white.opacity(0.5))
                                 }
-                                .font(.system(size: 12, weight: .medium))
-                                .buttonStyle(.borderless)
+                                .buttonStyle(.plain)
+                                .help("Reload stream")
                             }
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 12)
-                            .background(Color.black.opacity(0.85))
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 10)
+                            .background(
+                                LinearGradient(
+                                    colors: [Color.black.opacity(0), Color.black.opacity(0.8)],
+                                    startPoint: .top,
+                                    endPoint: .bottom
+                                )
+                            )
                         }
                         .frame(height: playerHeight)
                         .layoutPriority(2)
@@ -401,13 +413,15 @@ struct HybridTwitchView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             }
             
-            // Chat à droite (optionnel)
+            // Chat
             if playback.kind == .liveChannel, let channel = playback.channelName, showChat {
                 TwitchChatView(channelName: channel)
-                    .frame(width: 350)
+                    .frame(width: 320)
                     .transition(.move(edge: .trailing))
             }
         }
+        .background(Color(red: 0.04, green: 0.04, blue: 0.05))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         .alert("Erreur", isPresented: $showError) {
             Button("OK") { showError = false }
         } message: {
@@ -464,30 +478,27 @@ struct HybridTwitchView: View {
 
 private struct ResizeHandle: View {
     @State private var cursorPushed = false
+    @State private var isHovered = false
 
     var body: some View {
-        ZStack {
-            Rectangle()
-                .fill(Color.white.opacity(0.06))
-                .frame(height: 10)
-            Capsule()
-                .fill(Color.white.opacity(0.22))
-                .frame(width: 42, height: 4)
-        }
-        .overlay(
-            Rectangle()
-                .stroke(Color.white.opacity(0.08), lineWidth: 1)
-        )
-        .background(Color.black.opacity(0.08))
-        .onHover { hovering in
-            if hovering && !cursorPushed {
-                NSCursor.resizeUpDown.push()
-                cursorPushed = true
-            } else if !hovering && cursorPushed {
-                NSCursor.pop()
-                cursorPushed = false
+        Rectangle()
+            .fill(Color.white.opacity(isHovered ? 0.08 : 0.04))
+            .frame(height: 6)
+            .overlay(
+                Capsule()
+                    .fill(Color.white.opacity(isHovered ? 0.3 : 0.15))
+                    .frame(width: 32, height: 3)
+            )
+            .onHover { hovering in
+                withAnimation(.easeOut(duration: 0.1)) { isHovered = hovering }
+                if hovering && !cursorPushed {
+                    NSCursor.resizeUpDown.push()
+                    cursorPushed = true
+                } else if !hovering && cursorPushed {
+                    NSCursor.pop()
+                    cursorPushed = false
+                }
             }
-        }
     }
 }
 
@@ -512,7 +523,13 @@ struct TwitchChatView: NSViewRepresentable {
         return webView
     }
     
-    func updateNSView(_ nsView: WKWebView, context: Context) {}
+    func updateNSView(_ nsView: WKWebView, context: Context) {
+        // Reload if channel changed
+        let chatURL = URL(string: "https://www.twitch.tv/embed/\(channelName)/chat?parent=localhost&darkpopout")!
+        if nsView.url?.host != chatURL.host || !(nsView.url?.absoluteString.contains("/embed/\(channelName)/chat") ?? false) {
+            nsView.load(URLRequest(url: chatURL))
+        }
+    }
 }
 
 // Infos de la chaîne (About, panels, etc.) via page Twitch
@@ -648,6 +665,21 @@ struct ChannelInfoView: NSViewRepresentable {
             forMainFrameOnly: true
         )
 
+        // Hide page initially until customization is done
+        let initialHideScript = WKUserScript(
+            source: """
+            (function() {
+              if (document.getElementById('glitcho-channel-hide')) { return; }
+              const style = document.createElement('style');
+              style.id = 'glitcho-channel-hide';
+              style.textContent = 'html { background: transparent !important; } body { opacity: 0 !important; transition: opacity 0.12s ease-out !important; } body.glitcho-ready { opacity: 1 !important; }';
+              document.documentElement.appendChild(style);
+            })();
+            """,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: true
+        )
+
         // Script pour n'afficher que le contenu "About" et le placer au top.
         let aboutOnlyScript = WKUserScript(
             source: """
@@ -739,6 +771,16 @@ struct ChannelInfoView: NSViewRepresentable {
                         height: 0 !important;
                         margin: 0 !important;
                         padding: 0 !important;
+                    }
+                    /* Disable channel name links that navigate to streamer page */
+                    a[href^="/"]:not([href*="/videos"]):not([href*="/clip"]):not([href*="/schedule"]):not([href*="/about"]):not([href*="http"]) {
+                        pointer-events: none !important;
+                        cursor: default !important;
+                    }
+                    /* Re-enable external links and specific action links */
+                    a[href^="http"], a[href*="/videos"], a[href*="/clip"] {
+                        pointer-events: auto !important;
+                        cursor: pointer !important;
                     }
                 `;
 
@@ -938,6 +980,8 @@ struct ChannelInfoView: NSViewRepresentable {
                     tries++;
                     if (ok || tries >= maxTries) {
                         clearInterval(timer);
+                        // Reveal page after customization
+                        document.body.classList.add('glitcho-ready');
                     }
                 }, 200);
             })();
@@ -1031,11 +1075,43 @@ struct ChannelInfoView: NSViewRepresentable {
             injectionTime: .atDocumentEnd,
             forMainFrameOnly: true
         )
-        
+
+        // Block clicks on channel name links that would navigate away
+        let blockChannelLinksScript = WKUserScript(
+            source: """
+            (function() {
+              if (window.__glitcho_block_channel_links) { return; }
+              window.__glitcho_block_channel_links = true;
+
+              document.addEventListener('click', function(e) {
+                const link = e.target.closest('a[href]');
+                if (!link) { return; }
+                const href = link.getAttribute('href') || '';
+                // Block links to channel root (e.g., /channelname or /channelname/home)
+                if (href.match(/^\\/[^\\/]+\\/?$/) || href.match(/^\\/[^\\/]+\\/home\\/?$/)) {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  return;
+                }
+                // Block links to the current channel root
+                if (href === '/\(channelName)' || href === '/\(channelName)/' || href === '/\(channelName)/home') {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  return;
+                }
+              }, true);
+            })();
+            """,
+            injectionTime: .atDocumentEnd,
+            forMainFrameOnly: true
+        )
+
+        contentController.addUserScript(initialHideScript)
         contentController.addUserScript(blockMediaScript)
         contentController.addUserScript(aboutOnlyScript)
         contentController.addUserScript(subscriptionInterceptScript)
         contentController.addUserScript(giftInterceptScript)
+        contentController.addUserScript(blockChannelLinksScript)
         
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
@@ -1052,7 +1128,14 @@ struct ChannelInfoView: NSViewRepresentable {
         return webView
     }
     
-    func updateNSView(_ nsView: WKWebView, context: Context) {}
+    func updateNSView(_ nsView: WKWebView, context: Context) {
+        // Reload if channel changed
+        let url = URL(string: "https://www.twitch.tv/\(channelName)/about")!
+        let currentPath = nsView.url?.path ?? ""
+        if !currentPath.lowercased().hasPrefix("/\(channelName.lowercased())") {
+            nsView.load(URLRequest(url: url))
+        }
+    }
 }
 
 // WebView pour afficher la page complète de la chaîne
@@ -1202,6 +1285,11 @@ struct ChannelPageWebView: NSViewRepresentable {
     }
     
     func updateNSView(_ nsView: WKWebView, context: Context) {
-        // Mise à jour si nécessaire
+        // Reload if channel changed
+        let url = URL(string: "https://www.twitch.tv/\(channelName)")!
+        let currentPath = nsView.url?.path ?? ""
+        if !currentPath.lowercased().hasPrefix("/\(channelName.lowercased())") {
+            nsView.load(URLRequest(url: url))
+        }
     }
 }

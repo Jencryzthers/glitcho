@@ -75,6 +75,7 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
 
         contentController.add(self, name: "followedLive")
         contentController.add(self, name: "profile")
+        contentController.addUserScript(Self.initialHideScript)
         contentController.addUserScript(Self.adBlockScript)
         contentController.addUserScript(Self.codecWorkaroundScript)
         contentController.addUserScript(Self.hideChromeScript)
@@ -376,6 +377,25 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
         }
     }
 
+    // Script injected at document start to hide page until customization is done
+    private static let initialHideScript = WKUserScript(
+        source: """
+        (function() {
+          if (document.getElementById('glitcho-initial-hide')) { return; }
+          const style = document.createElement('style');
+          style.id = 'glitcho-initial-hide';
+          style.textContent = `
+            html { background: #0d0d0f !important; }
+            body { opacity: 0 !important; transition: opacity 0.15s ease-out !important; }
+            body.glitcho-ready { opacity: 1 !important; }
+          `;
+          document.documentElement.appendChild(style);
+        })();
+        """,
+        injectionTime: .atDocumentStart,
+        forMainFrameOnly: true
+    )
+
     private static let hideChromeScriptSource = """
         (function() {
           document.documentElement.setAttribute('data-twitchglass', '1');
@@ -549,12 +569,17 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
 
           hideNavigation();
           updatePageType();
-          
+
+          // Reveal page after customization
+          requestAnimationFrame(() => {
+            document.body.classList.add('glitcho-ready');
+          });
+
           const observer = new MutationObserver(() => {
             hideNavigation();
           });
           observer.observe(document.documentElement, { childList: true, subtree: true });
-          
+
           // Détecter les changements d'URL (navigation SPA)
           let lastUrl = location.href;
           new MutationObserver(() => {
@@ -562,6 +587,8 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
             if (url !== lastUrl) {
               lastUrl = url;
               updatePageType();
+              // Re-reveal after SPA navigation
+              document.body.classList.add('glitcho-ready');
             }
           }).observe(document, { subtree: true, childList: true });
         })();
@@ -657,9 +684,116 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
                 href = href.replace(/\\/home\\/?$/, '');
               }
               const url = 'https://www.twitch.tv' + href;
-              const name = link.getAttribute('title') || link.getAttribute('aria-label') || link.textContent || '';
+              let name = link.getAttribute('title') || link.getAttribute('aria-label') || link.textContent || '';
+              // Clean up the name - remove badges, streaming info, etc.
+              name = name
+                .replace(/\\(Verified\\)/gi, '')
+                .replace(/\\(Partner\\)/gi, '')
+                .replace(/streaming\\s+.*/i, '')
+                .replace(/diffuse\\s+.*/i, '')
+                .replace(/en\\s+direct.*/i, '')
+                .replace(/live\\s*:.*/i, '')
+                .replace(/→/g, '')
+                .replace(/›/g, '')
+                .replace(/\\s+/g, ' ')
+                .trim();
               let thumb = '';
               const img = card.querySelector('img');
+              if (img && img.getAttribute('src')) {
+                thumb = img.getAttribute('src');
+              }
+              if (!map.has(url) && name) {
+                map.set(url, { name: name, url, thumbnail: thumb });
+              }
+            });
+          }
+
+          function extractFromSideNav(map) {
+            // Find the Followed Channels section in the sidebar
+            // This section ONLY contains live channels - offline followed channels don't appear here
+            const sideNav = document.querySelector('[data-a-target*="side-nav"], [data-test-selector="side-nav"], nav[aria-label="Primary Navigation"]');
+            if (!sideNav) { return; }
+
+            // Find the "Followed Channels" or "FOLLOWED CHANNELS" header
+            let followedSection = null;
+            const allText = sideNav.querySelectorAll('p, span, div, h1, h2, h3, h4, h5, h6');
+            for (const el of allText) {
+              const text = (el.textContent || '').trim().toLowerCase();
+              // Match "followed channels", "chaînes suivies" (French), etc.
+              if (text === 'followed channels' || text === 'chaînes suivies' || text === 'followed' || text === 'suivi') {
+                // Found the header - get its parent container that contains the channel list
+                followedSection = el.closest('[class*="side-nav-section"], [class*="SideNavSection"], div');
+                break;
+              }
+            }
+
+            if (!followedSection) {
+              // Fallback: try to find by data attribute
+              followedSection = sideNav.querySelector('[aria-label*="Followed" i], [aria-label*="Suivi" i]');
+            }
+
+            if (!followedSection) { return; }
+
+            // Get all channel links within the followed section only
+            const links = Array.from(followedSection.querySelectorAll('a[href^="/"]'));
+
+            // Stop if we hit "Recommended" or "Show More"
+            let hitEnd = false;
+
+            links.forEach(link => {
+              if (hitEnd) { return; }
+
+              const href = link.getAttribute('href');
+              if (!href || !href.startsWith('/') || href.startsWith('/directory') || href.startsWith('/videos') || href.startsWith('/settings')) { return; }
+
+              // Check if this link is for "Show More" or similar
+              const linkText = (link.textContent || '').toLowerCase().trim();
+              if (linkText.includes('show more') || linkText.includes('afficher plus') || linkText.includes('recommended')) {
+                hitEnd = true;
+                return;
+              }
+
+              // Must have exactly one path segment (channel name only)
+              const pathParts = href.split('/').filter(Boolean);
+              if (pathParts.length > 1 && pathParts[1] !== 'home') { return; }
+
+              let cleanedHref = href;
+              if (/^\\/[^/]+\\/home\\/?$/.test(cleanedHref)) {
+                cleanedHref = cleanedHref.replace(/\\/home\\/?$/, '');
+              }
+              const url = 'https://www.twitch.tv' + cleanedHref;
+              let name = link.getAttribute('aria-label') || link.getAttribute('title') || '';
+
+              // If aria-label has extra info, try to get just the channel name from a child element
+              if (!name || name.includes('streaming') || name.includes('diffuse')) {
+                const nameEl = link.querySelector('[class*="CoreText"], [class*="channel-name"], p, span');
+                if (nameEl) {
+                  name = nameEl.textContent || '';
+                }
+              }
+
+              // Clean up the name
+              name = name
+                .replace(/\\(Verified\\)/gi, '')
+                .replace(/\\(Partner\\)/gi, '')
+                .replace(/streaming\\s+.*/i, '')
+                .replace(/diffuse\\s+.*/i, '')
+                .replace(/en\\s+direct.*/i, '')
+                .replace(/live\\s*:.*/i, '')
+                .replace(/\\d+[\\s,]*\\d*\\s*(viewer|spectateur|watching).*/i, '')
+                .replace(/→/g, '')
+                .replace(/›/g, '')
+                .replace(/\\s+/g, ' ')
+                .trim();
+
+              if (!name) {
+                const parts = cleanedHref.split('/').filter(Boolean);
+                name = parts.length ? parts[0] : '';
+              }
+              if (!name.trim()) { return; }
+
+              let thumb = '';
+              const img = link.querySelector('img');
               if (img && img.getAttribute('src')) {
                 thumb = img.getAttribute('src');
               }
@@ -669,45 +803,12 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
             });
           }
 
-          function extractFromSideNav(map) {
-            const containers = document.querySelectorAll(
-              '[data-a-target*="side-nav"], [data-test-selector="side-nav"], nav[aria-label="Primary Navigation"]'
-            );
-            containers.forEach(container => {
-              const links = Array.from(container.querySelectorAll('a[href^="/"]'));
-              links.forEach(link => {
-                const href = link.getAttribute('href');
-                if (!href || !href.startsWith('/') || href.startsWith('/directory') || href.startsWith('/videos')) { return; }
-                let cleanedHref = href;
-                if (/^\\/[^/]+\\/home\\/?$/.test(cleanedHref)) {
-                  cleanedHref = cleanedHref.replace(/\\/home\\/?$/, '');
-                }
-                const url = 'https://www.twitch.tv' + cleanedHref;
-                let name = link.getAttribute('aria-label') || link.getAttribute('title') || link.textContent || '';
-                name = name.replace('→', '').replace('›', '').trim();
-                if (name.toLowerCase().includes('use the right')) {
-                  name = '';
-                }
-                if (!name || name.toLowerCase() === 'show more') {
-                  const parts = cleanedHref.split('/').filter(Boolean);
-                  name = parts.length ? parts[0] : '';
-                }
-                if (!name.trim()) { return; }
-                let thumb = '';
-                const img = link.querySelector('img');
-                if (img && img.getAttribute('src')) {
-                  thumb = img.getAttribute('src');
-                }
-                if (!map.has(url)) {
-                  map.set(url, { name: name.trim(), url, thumbnail: thumb });
-                }
-              });
-            });
-          }
-
           function extract() {
             const map = new Map();
+            // Extract from /following page (background webview)
             extractFromFollowing(map);
+            // Also extract from sidebar "Followed Channels" section (main webview)
+            // This section only shows LIVE followed channels
             extractFromSideNav(map);
             if (map.size > 0) {
               window.webkit.messageHandlers.followedLive.postMessage(Array.from(map.values()));
@@ -1445,6 +1546,20 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
           function extractFromApollo() {
             const apollo = window.__APOLLO_STATE__;
             if (!apollo || typeof apollo !== 'object') { return {}; }
+
+            // Try to find user data in Apollo cache
+            for (const key of Object.keys(apollo)) {
+              if (key.startsWith('User:') || key.includes('currentUser') || key.includes('viewer')) {
+                const obj = apollo[key];
+                if (obj && (obj.displayName || obj.login)) {
+                  const picked = pickFromObject(obj);
+                  if (picked.displayName || picked.login) {
+                    return picked;
+                  }
+                }
+              }
+            }
+
             const root = apollo['Query:ROOT'];
             if (root) {
               const pointer = root.currentUser || root.viewer || root.user || root.loggedInUser;
@@ -1460,6 +1575,43 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
                 }
               }
             }
+            return {};
+          }
+
+          function extractFromCookies() {
+            try {
+              const cookies = document.cookie.split(';').reduce((acc, c) => {
+                const [key, val] = c.trim().split('=');
+                acc[key] = val;
+                return acc;
+              }, {});
+
+              // Twitch stores login name in 'login' or 'name' cookie
+              const login = cookies['login'] || cookies['name'] || '';
+              if (login && !isPlaceholder(login)) {
+                return { login: decodeURIComponent(login), displayName: '' };
+              }
+            } catch (_) {}
+            return {};
+          }
+
+          function extractFromLocalStorage() {
+            try {
+              // Check various localStorage keys Twitch might use
+              const keys = ['twilight-user', 'user', 'currentUser', 'auth-token'];
+              for (const key of keys) {
+                const data = localStorage.getItem(key);
+                if (data) {
+                  try {
+                    const parsed = JSON.parse(data);
+                    const picked = pickFromObject(parsed);
+                    if (picked.displayName || picked.login) {
+                      return picked;
+                    }
+                  } catch (_) {}
+                }
+              }
+            } catch (_) {}
             return {};
           }
 
@@ -1495,11 +1647,18 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
             }
 
             let merged = { displayName: displayName, login: login };
+            merged = mergeProfile(merged, extractFromCookies());
+            merged = mergeProfile(merged, extractFromLocalStorage());
             merged = mergeProfile(merged, extractFromConfig());
             merged = mergeProfile(merged, extractFromState(window.__INITIAL_STATE__));
             merged = mergeProfile(merged, extractFromState(window.__TWITCH_STATE__));
             merged = mergeProfile(merged, extractFromState(window.__STATE__));
             merged = mergeProfile(merged, extractFromApollo());
+
+            // If we have login but no displayName, use login as displayName
+            if (!merged.displayName && merged.login) {
+              merged.displayName = merged.login;
+            }
 
             window.webkit.messageHandlers.profile.postMessage({
               displayName: (merged.displayName || '').trim(),

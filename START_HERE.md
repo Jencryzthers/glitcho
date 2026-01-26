@@ -8,13 +8,13 @@
 ## 🎮 Lancer l'application MAINTENANT
 
 ```bash
-open /Users/Repository/twitchapp/Build/Glitcho.app
+open Build/Glitcho.app
 ```
 
 ## 📖 Comment utiliser
 
 ### 1. Lancer l'app
-Double-cliquez sur `Twitch.app` ou utilisez la commande ci-dessus
+Double-cliquez sur `Glitcho.app` ou utilisez la commande ci-dessus
 
 ### 2. Cliquer sur une chaîne
 - Dans la sidebar, cliquez sur une **chaîne LIVE** dans la section "FOLLOWING"

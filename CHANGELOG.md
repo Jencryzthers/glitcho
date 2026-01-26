@@ -1,5 +1,13 @@
 # Changelog - Glitcho
 
+## Version 1.0.2
+
+- Bump version to **1.0.2** (bundle version now set by `Scripts/make_app.sh`).
+- About window now reads the version from the app bundle, so it always stays in sync.
+- Repo hygiene: stop tracking build outputs (`.build/`, `Build/`) and macOS metadata files.
+
+---
+
 ## Version 3.0 - Enhanced Ad Blocking + Rename to Glitcho
 
 ### 🎉 Nouvelles fonctionnalités

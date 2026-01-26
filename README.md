@@ -47,6 +47,7 @@ swift build
 
 ## 📝 Notes
 
+- **Version**: Update `APP_VERSION` (and optionally `APP_BUILD`) in `Scripts/make_app.sh`
 - **Minimum macOS version**: To change, edit `LSMinimumSystemVersion` in `Scripts/make_app.sh`
 - **Ad blocking**: Client-side implementation with multi-layer filtering
 - **UI customization**: All glass effects and colors can be modified in `ContentView.swift`
