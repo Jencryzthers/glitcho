@@ -1,3 +1,4 @@
+#if canImport(SwiftUI)
 import AppKit
 import SwiftUI
 
@@ -21,3 +22,4 @@ struct WindowConfigurator: NSViewRepresentable {
     }
 }
 
+#endif

@@ -1,3 +1,4 @@
+#if canImport(SwiftUI)
 import SwiftUI
 import WebKit
 
@@ -15,6 +16,7 @@ struct ContentView: View {
     @State private var searchText = ""
     @State private var playbackRequest = NativePlaybackRequest(kind: .liveChannel, streamlinkTarget: "twitch.tv", channelName: nil)
     @State private var useNativePlayer = false
+    @StateObject private var recordingManager = RecordingManager()
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @State private var showSubscriptionPopup = false
     @State private var subscriptionChannel: String?
@@ -65,6 +67,7 @@ struct ContentView: View {
                     if useNativePlayer {
                         HybridTwitchView(
                             playback: $playbackRequest,
+                            recordingManager: recordingManager,
                             onOpenSubscription: { channel in
                                 subscriptionChannel = channel
                                 showSubscriptionPopup = true
@@ -79,7 +82,11 @@ struct ContentView: View {
                                 handleChannelNotificationToggle(ChannelNotificationToggle(login: login, enabled: enabled))
                             },
                             onRecordRequest: {
-                                // TODO: hook into recording pipeline
+                                guard playbackRequest.kind == .liveChannel else { return }
+                                recordingManager.toggleRecording(
+                                    target: playbackRequest.streamlinkTarget,
+                                    channelName: playbackRequest.channelName
+                                )
                             }
                         )
                     } else {
@@ -150,7 +157,8 @@ struct ContentView: View {
 
             if showSettings {
                 SettingsModal(
-                    onClose: { showSettings = false }
+                    onClose: { showSettings = false },
+                    recordingManager: recordingManager
                 )
                 .environment(\.notificationManager, notificationManager)
                 .zIndex(10)
@@ -1133,3 +1141,5 @@ struct VisualEffectView: NSViewRepresentable {
         nsView.blendingMode = blendingMode
     }
 }
+
+#endif

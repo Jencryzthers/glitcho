@@ -1,5 +1,12 @@
 # Changelog - Glitcho
 
+## Version 1.0.4
+
+- Added live stream recording with Streamlink and in-player controls.
+- Added Recording settings to choose the output folder and download Streamlink in-app.
+
+---
+
 ## Version 1.0.3
 
 - Added pinned channels (pin/unpin) with per-channel notification toggles.

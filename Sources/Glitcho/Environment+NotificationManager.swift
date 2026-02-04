@@ -1,3 +1,4 @@
+#if canImport(SwiftUI)
 import SwiftUI
 
 private struct NotificationManagerKey: EnvironmentKey {
@@ -10,3 +11,5 @@ extension EnvironmentValues {
         set { self[NotificationManagerKey.self] = newValue }
     }
 }
+
+#endif

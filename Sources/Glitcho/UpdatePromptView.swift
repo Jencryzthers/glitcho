@@ -1,3 +1,4 @@
+#if canImport(SwiftUI)
 import SwiftUI
 
 struct UpdatePromptView: View {
@@ -160,3 +161,5 @@ struct UpdatePromptView: View {
         return trimmed
     }
 }
+
+#endif

@@ -1,3 +1,4 @@
+#if canImport(SwiftUI)
 import Foundation
 import AppKit
 import WebKit
@@ -1917,3 +1918,5 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
         forMainFrameOnly: true
     )
 }
+
+#endif

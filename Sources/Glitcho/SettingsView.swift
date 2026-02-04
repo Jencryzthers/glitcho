@@ -1,8 +1,10 @@
+#if canImport(SwiftUI)
 import AppKit
 import SwiftUI
 
 struct SettingsModal: View {
     let onClose: () -> Void
+    let recordingManager: RecordingManager
     var onOpenTwitchSettings: (() -> Void)?
 
     var body: some View {
@@ -13,7 +15,7 @@ struct SettingsModal: View {
                 .onTapGesture { }  // Absorb taps, don't close
 
             // Centered settings panel
-            SettingsView(onClose: onClose, onOpenTwitchSettings: onOpenTwitchSettings)
+            SettingsView(onClose: onClose, recordingManager: recordingManager, onOpenTwitchSettings: onOpenTwitchSettings)
                 .shadow(color: .black.opacity(0.5), radius: 40, x: 0, y: 20)
         }
     }
@@ -22,12 +24,15 @@ struct SettingsModal: View {
 struct SettingsView: View {
     @AppStorage("liveAlertsEnabled") private var liveAlertsEnabled = true
     @AppStorage("liveAlertsPinnedOnly") private var liveAlertsPinnedOnly = false
+    @AppStorage("recordingsDirectory") private var recordingsDirectory = ""
+    @AppStorage("streamlinkPath") private var streamlinkPath = ""
     @Environment(\.notificationManager) private var notificationManager
     @Environment(\.dismiss) private var dismiss
     @Environment(\.openURL) private var openURL
     @State private var testStatus: NotificationTestStatus?
     @State private var clearTask: Task<Void, Never>?
 
+    @ObservedObject var recordingManager: RecordingManager
     var onClose: (() -> Void)?
     var onOpenTwitchSettings: (() -> Void)?
 
@@ -45,6 +50,11 @@ struct SettingsView: View {
                     openTwitchSettings()
                 }
             },
+            recordingsDirectory: $recordingsDirectory,
+            streamlinkPath: $streamlinkPath,
+            selectRecordingsFolder: selectRecordingsFolder,
+            selectStreamlinkBinary: selectStreamlinkBinary,
+            recordingManager: recordingManager,
             isNotificationManagerAvailable: notificationManager != nil,
             onClose: { (onClose ?? { dismiss() })() }
         )
@@ -102,6 +112,29 @@ struct SettingsView: View {
     private func openTwitchSettings() {
         openURL(URL(string: "https://www.twitch.tv/settings")!)
     }
+
+    private func selectRecordingsFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Choose"
+        if panel.runModal() == .OK, let url = panel.url {
+            recordingsDirectory = url.path
+        }
+    }
+
+    private func selectStreamlinkBinary() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Choose"
+        if panel.runModal() == .OK, let url = panel.url {
+            streamlinkPath = url.path
+        }
+    }
 }
 
 enum NotificationTestStatus {
@@ -139,6 +172,11 @@ struct SettingsViewContent: View {
     let testAction: () -> Void
     let openSettingsAction: () -> Void
     let openTwitchSettingsAction: () -> Void
+    @Binding var recordingsDirectory: String
+    @Binding var streamlinkPath: String
+    let selectRecordingsFolder: () -> Void
+    let selectStreamlinkBinary: () -> Void
+    @ObservedObject var recordingManager: RecordingManager
     let isNotificationManagerAvailable: Bool
     let onClose: () -> Void
 
@@ -249,6 +287,76 @@ struct SettingsViewContent: View {
                             )
                         }
                     }
+
+                    SettingsCard(
+                        icon: "record.circle",
+                        iconColor: .red,
+                        title: "Recording",
+                        subtitle: "Capture live streams with Streamlink"
+                    ) {
+                        VStack(alignment: .leading, spacing: 10) {
+                            if recordingManager.isInstalling {
+                                HStack(spacing: 8) {
+                                    ProgressView()
+                                        .scaleEffect(0.7)
+                                    Text(recordingManager.installStatus ?? "Installing Streamlink…")
+                                        .font(.system(size: 10))
+                                        .foregroundStyle(.white.opacity(0.7))
+                                    Spacer()
+                                }
+                            }
+
+                            settingsValueRow(
+                                title: "Recordings folder",
+                                value: recordingsDirectory.isEmpty ? "Default (Downloads/Glitcho Recordings)" : recordingsDirectory
+                            )
+
+                            HStack {
+                                SettingsButton(
+                                    title: "Choose Folder",
+                                    systemImage: "folder",
+                                    style: .secondary,
+                                    action: selectRecordingsFolder
+                                )
+                                Spacer()
+                            }
+
+                            settingsValueRow(
+                                title: "Streamlink binary",
+                                value: streamlinkPath.isEmpty ? "Auto-detect (download or Homebrew)" : streamlinkPath
+                            )
+
+                            HStack {
+                                SettingsButton(
+                                    title: "Choose Streamlink",
+                                    systemImage: "terminal",
+                                    style: .secondary,
+                                    action: selectStreamlinkBinary
+                                )
+                                Spacer()
+                            }
+
+                            HStack {
+                                SettingsButton(
+                                    title: recordingManager.isInstalling ? "Downloading…" : "Download Streamlink",
+                                    systemImage: "arrow.down.circle",
+                                    style: .primary,
+                                    action: {
+                                        Task { await recordingManager.installStreamlink() }
+                                    }
+                                )
+                                .disabled(recordingManager.isInstalling)
+                                Spacer()
+                            }
+
+                            if let installError = recordingManager.installError {
+                                Text(installError)
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(Color.orange.opacity(0.85))
+                                    .lineLimit(2)
+                            }
+                        }
+                    }
                 }
                 .padding(16)
             }
@@ -304,6 +412,18 @@ struct SettingsViewContent: View {
                     .font(.system(size: 10))
                     .foregroundStyle(.white.opacity(0.45))
             }
+        }
+    }
+
+    private func settingsValueRow(title: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.white.opacity(0.9))
+            Text(value)
+                .font(.system(size: 10))
+                .foregroundStyle(.white.opacity(0.5))
+                .lineLimit(2)
         }
     }
 }
@@ -432,3 +552,5 @@ private struct SettingsToggleRow: View {
         .padding(.vertical, 4)
     }
 }
+
+#endif
