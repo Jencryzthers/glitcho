@@ -548,6 +548,22 @@ struct Sidebar: View {
             // Navigation
             ScrollView {
                 VStack(alignment: .leading, spacing: 4) {
+                    ForEach(sections) { destination in
+                        SidebarRow(
+                            title: destination.title,
+                            systemImage: destination.icon
+                        ) {
+                            onNavigate?(destination.url) ?? store.navigate(to: destination.url)
+                        }
+                    }
+
+                    // Divider
+                    Rectangle()
+                        .fill(Color.white.opacity(0.08))
+                        .frame(height: 1)
+                        .padding(.vertical, 12)
+                        .padding(.horizontal, 12)
+
                     // Pinned section
                     HStack {
                         Text("PINNED")
@@ -630,22 +646,6 @@ struct Sidebar: View {
                                 onRemove: { onRemovePin?(pin) },
                                 onToggleNotifications: { onTogglePinNotifications?(pin) }
                             )
-                        }
-                    }
-
-                    // Divider
-                    Rectangle()
-                        .fill(Color.white.opacity(0.08))
-                        .frame(height: 1)
-                        .padding(.vertical, 12)
-                        .padding(.horizontal, 12)
-
-                    ForEach(sections) { destination in
-                        SidebarRow(
-                            title: destination.title,
-                            systemImage: destination.icon
-                        ) {
-                            onNavigate?(destination.url) ?? store.navigate(to: destination.url)
                         }
                     }
 
