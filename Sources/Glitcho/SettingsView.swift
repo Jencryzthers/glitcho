@@ -23,6 +23,7 @@ struct SettingsModal: View {
 struct SettingsView: View {
     @AppStorage("liveAlertsEnabled") private var liveAlertsEnabled = true
     @AppStorage("liveAlertsPinnedOnly") private var liveAlertsPinnedOnly = false
+    @AppStorage(SidebarTint.storageKey) private var sidebarTintHex = SidebarTint.defaultHex
     @AppStorage("recordingsDirectory") private var recordingsDirectory = ""
     @AppStorage("streamlinkPath") private var streamlinkPath = ""
     @Environment(\.notificationManager) private var notificationManager
@@ -38,6 +39,7 @@ struct SettingsView: View {
         SettingsViewContent(
             liveAlertsEnabled: $liveAlertsEnabled,
             liveAlertsPinnedOnly: $liveAlertsPinnedOnly,
+            sidebarTintHex: $sidebarTintHex,
             testStatus: $testStatus,
             testAction: testNotification,
             openSettingsAction: openNotificationSettings,
@@ -165,6 +167,7 @@ enum NotificationTestStatus {
 struct SettingsViewContent: View {
     @Binding var liveAlertsEnabled: Bool
     @Binding var liveAlertsPinnedOnly: Bool
+    @Binding var sidebarTintHex: String
     @Binding var testStatus: NotificationTestStatus?
     let testAction: () -> Void
     let openSettingsAction: () -> Void
@@ -182,6 +185,37 @@ struct SettingsViewContent: View {
 
             ScrollView {
                 VStack(spacing: 14) {
+                    SettingsCard(
+                        icon: "paintpalette.fill",
+                        iconColor: Color(red: 0.53, green: 0.42, blue: 0.95),
+                        title: "Appearance",
+                        subtitle: "Customize the sidebar tint"
+                    ) {
+                        HStack(spacing: 12) {
+                            ColorPicker("Sidebar tint", selection: sidebarTintBinding, supportsOpacity: false)
+                                .labelsHidden()
+
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Sidebar tint")
+                                    .font(.system(size: 12, weight: .medium))
+                                    .foregroundStyle(.white)
+                                Text(sidebarTintHex.uppercased())
+                                    .font(.system(size: 10, weight: .medium))
+                                    .foregroundStyle(.white.opacity(0.5))
+                            }
+
+                            Spacer()
+
+                            SettingsButton(
+                                title: "Reset",
+                                systemImage: "arrow.counterclockwise",
+                                style: .secondary,
+                                action: { sidebarTintHex = SidebarTint.defaultHex }
+                            )
+                        }
+                        .padding(.vertical, 4)
+                    }
+
                     // Notifications Card
                     SettingsCard(
                         icon: "bell.badge.fill",
@@ -360,6 +394,15 @@ struct SettingsViewContent: View {
             .padding(.top, 20)
             .padding(.bottom, 12)
         }
+    }
+
+    private var sidebarTintBinding: Binding<Color> {
+        Binding(
+            get: { SidebarTint.color(from: sidebarTintHex) },
+            set: { newValue in
+                sidebarTintHex = newValue.toHex() ?? SidebarTint.defaultHex
+            }
+        )
     }
 
     private func permissionRow(icon: String, title: String, detail: String) -> some View {

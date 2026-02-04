@@ -437,6 +437,7 @@ struct Sidebar: View {
     @Binding var pinnedChannels: [PinnedChannel]
     let pinnedLimit: Int
     @Binding var liveAlertsEnabled: Bool
+    @AppStorage(SidebarTint.storageKey) private var sidebarTintHex = SidebarTint.defaultHex
     var onTogglePin: ((TwitchChannel) -> Void)?
     var onTogglePinNotifications: ((PinnedChannel) -> Void)?
     var onAddPin: ((String) -> Bool)?
@@ -455,6 +456,9 @@ struct Sidebar: View {
         .music,
         .drops
     ]
+    private var sidebarTint: Color {
+        SidebarTint.color(from: sidebarTintHex)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -706,6 +710,7 @@ struct Sidebar: View {
                 Color(red: 0.08, green: 0.08, blue: 0.10)
                 VisualEffectView(material: .sidebar, blendingMode: .behindWindow)
                     .opacity(0.5)
+                sidebarTint.opacity(0.25)
             }
         )
     }
