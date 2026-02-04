@@ -4,6 +4,7 @@ import WebKit
 
 struct ContentView: View {
     @StateObject private var store = WebViewStore(url: URL(string: "https://www.twitch.tv")!)
+    @StateObject private var recordingManager = RecordingManager()
     @EnvironmentObject private var updateChecker: UpdateChecker
     @Environment(\.notificationManager) private var notificationManager
     @AppStorage("pinnedChannels") private var pinnedChannelsJSON: String = "[]"
@@ -16,7 +17,6 @@ struct ContentView: View {
     @State private var searchText = ""
     @State private var playbackRequest = NativePlaybackRequest(kind: .liveChannel, streamlinkTarget: "twitch.tv", channelName: nil)
     @State private var useNativePlayer = false
-    @StateObject private var recordingManager = RecordingManager()
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @State private var showSubscriptionPopup = false
     @State private var subscriptionChannel: String?

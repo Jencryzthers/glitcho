@@ -620,7 +620,7 @@ struct HybridTwitchView: View {
         .task {
             await loadStream()
         }
-        .onDisappear {
+.onDisappear {
             // Important: stopper le player natif quand on quitte la vue (navigation ailleurs)
             isPlaying = false
             streamURL = nil
