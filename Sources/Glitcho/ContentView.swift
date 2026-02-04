@@ -2,6 +2,12 @@
 import SwiftUI
 import WebKit
 
+private enum DetailMode {
+    case web
+    case native
+    case recordings
+}
+
 struct ContentView: View {
     @StateObject private var store = WebViewStore(url: URL(string: "https://www.twitch.tv")!)
     @StateObject private var recordingManager = RecordingManager()
@@ -19,7 +25,7 @@ struct ContentView: View {
     @State private var lastAutoRecordLogin: String?
     @State private var searchText = ""
     @State private var playbackRequest = NativePlaybackRequest(kind: .liveChannel, streamlinkTarget: "twitch.tv", channelName: nil)
-    @State private var useNativePlayer = false
+    @State private var detailMode: DetailMode = .web
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @State private var showSubscriptionPopup = false
     @State private var subscriptionChannel: String?
@@ -54,12 +60,15 @@ struct ContentView: View {
                         removePinned(pin: pin)
                     },
                     onNavigate: { url in
-                        useNativePlayer = false
+                        detailMode = .web
                         store.navigate(to: url)
                     },
                     onChannelSelected: { channelName in
                         playbackRequest = NativePlaybackRequest(kind: .liveChannel, streamlinkTarget: "twitch.tv/\(channelName)", channelName: channelName)
-                        useNativePlayer = true
+                        detailMode = .native
+                    },
+                    onShowRecordings: {
+                        detailMode = .recordings
                     },
                     onShowSettings: {
                         showSettings = true
@@ -68,7 +77,8 @@ struct ContentView: View {
         .navigationSplitViewColumnWidth(295)
             } detail: {
                 Group {
-                    if useNativePlayer {
+                    switch detailMode {
+                    case .native:
                         HybridTwitchView(
                             playback: $playbackRequest,
                             recordingManager: recordingManager,
@@ -93,7 +103,9 @@ struct ContentView: View {
                                 )
                             }
                         )
-                    } else {
+                    case .recordings:
+                        RecordingsLibraryView(recordingManager: recordingManager)
+                    case .web:
                         WebViewContainer(webView: store.webView)
                     }
                 }
@@ -103,7 +115,7 @@ struct ContentView: View {
             .navigationSplitViewStyle(.prominentDetail)
             .onChange(of: store.shouldSwitchToNativePlayback) { request in
                 if let request {
-                    if useNativePlayer, playbackRequest == request {
+                    if detailMode == .native, playbackRequest == request {
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                             store.shouldSwitchToNativePlayback = nil
                         }
@@ -111,7 +123,7 @@ struct ContentView: View {
                     }
                     store.prepareWebViewForNativePlayer()
                     playbackRequest = request
-                    useNativePlayer = true
+                    detailMode = .native
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                         store.shouldSwitchToNativePlayback = nil
                     }
@@ -505,6 +517,7 @@ struct Sidebar: View {
     var onRemovePin: ((PinnedChannel) -> Void)?
     var onNavigate: ((URL) -> Void)?
     var onChannelSelected: ((String) -> Void)?
+    var onShowRecordings: (() -> Void)?
     var onShowSettings: (() -> Void)?
     @State private var isAddingPin = false
     @State private var newPinText = ""
@@ -627,6 +640,13 @@ struct Sidebar: View {
                         ) {
                             onNavigate?(destination.url) ?? store.navigate(to: destination.url)
                         }
+                    }
+
+                    SidebarRow(
+                        title: "Recordings",
+                        systemImage: "record.circle"
+                    ) {
+                        onShowRecordings?()
                     }
 
                     // Divider

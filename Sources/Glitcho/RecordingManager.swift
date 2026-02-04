@@ -12,6 +12,12 @@ final class RecordingManager: ObservableObject {
 
     private var process: Process?
     private var userInitiatedStop = false
+    private let filenameDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        return formatter
+    }()
 
     deinit {
         stopRecording()
@@ -26,6 +32,48 @@ final class RecordingManager: ObservableObject {
         let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
         return (downloads ?? FileManager.default.homeDirectoryForCurrentUser)
             .appendingPathComponent("Glitcho Recordings", isDirectory: true)
+    }
+
+    func listRecordings() -> [RecordingEntry] {
+        let directory = recordingsDirectory()
+        guard let urls = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+
+        let recordings = urls.compactMap { url -> RecordingEntry? in
+            guard url.pathExtension.lowercased() == "mp4" else { return nil }
+            let filename = url.deletingPathExtension().lastPathComponent
+            let parts = filename.split(separator: "_")
+            guard parts.count >= 3 else {
+                return RecordingEntry(url: url, channelName: filename, recordedAt: nil)
+            }
+
+            let channelName = parts.dropLast(2).joined(separator: "_")
+            let dateString = "\(parts[parts.count - 2])_\(parts[parts.count - 1])"
+            let recordedAt = filenameDateFormatter.date(from: dateString)
+            return RecordingEntry(url: url, channelName: channelName, recordedAt: recordedAt)
+        }
+
+        return recordings.sorted { left, right in
+            let nameCompare = left.channelName.localizedCaseInsensitiveCompare(right.channelName)
+            if nameCompare != .orderedSame {
+                return nameCompare == .orderedAscending
+            }
+            switch (left.recordedAt, right.recordedAt) {
+            case let (lhs?, rhs?):
+                return lhs > rhs
+            case (.some, .none):
+                return true
+            case (.none, .some):
+                return false
+            case (.none, .none):
+                return left.url.lastPathComponent < right.url.lastPathComponent
+            }
+        }
     }
 
     func toggleRecording(target: String, channelName: String?, quality: String = "best") {
@@ -56,9 +104,7 @@ final class RecordingManager: ObservableObject {
 
         let resolvedChannelLogin = channelLogin(from: target)
         let normalizedName = channelName?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
-        let timestamp = formatter.string(from: Date())
+        let timestamp = filenameDateFormatter.string(from: Date())
         let safeChannel = (normalizedName?.isEmpty == false ? normalizedName : resolvedChannelLogin ?? "twitch")
             .replacingOccurrences(of: " ", with: "_")
         let filename = "\(safeChannel)_\(timestamp).mp4"
