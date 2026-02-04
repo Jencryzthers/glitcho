@@ -17,7 +17,7 @@ Twitch retired its native macOS application. In my use case, the Electron client
 ## Requirements
 
 - macOS 13 or later
-- Streamlink CLI available at `/opt/homebrew/bin/streamlink` (default Homebrew path on Apple Silicon)
+- Streamlink is downloaded from Settings > Recording (no external scripts required)
 
 ## Installation
 
@@ -49,7 +49,7 @@ The app bundle is created at `Build/Glitcho.app`.
 - Version: update `APP_VERSION` and `APP_BUILD` in `Scripts/make_app.sh`
 - Minimum macOS version: update `LSMinimumSystemVersion` in `Scripts/make_app.sh`
 - UI customization: `Sources/Glitcho/ContentView.swift`
-- Streamlink path: update `process.executableURL` in `Sources/Glitcho/StreamlinkPlayer.swift` if needed
+- Streamlink install: manage via Settings > Recording (download or choose a custom binary path)
 - About window content: `Sources/Glitcho/App.swift`
 
 ## Known limitations
@@ -57,7 +57,7 @@ The app bundle is created at `Build/Glitcho.app`.
 - Twitch DOM changes can break layout tweaks and Following list scraping.
 - Following may appear empty until you visit the Twitch “Following” page once.
 - Some channels require authentication to play.
-- Streamlink must be installed and reachable at the configured path.
+- Streamlink download requires network access on first install.
 
 ## Privacy
 
@@ -69,7 +69,7 @@ The app does not add additional analytics or telemetry. Twitch web content may c
 - **Gatekeeper warning**: right‑click and choose **Open**, or run the `xattr` command above.
 - **Stream does not load**: confirm the channel is live, then reload (Cmd+R).
 - **Following list is empty**: sign in, visit the Twitch “Following” page once, then wait a few seconds.
-- **Streamlink not found**: ensure Streamlink is installed and adjust the path in `StreamlinkPlayer.swift`.
+- **Streamlink not found**: open Settings > Recording and download Streamlink or select a custom binary path.
 - **UI layout issues**: Twitch DOM changes can require selector updates in `Sources/Glitcho/WebViewStore.swift`.
 
 ## Development and contributing

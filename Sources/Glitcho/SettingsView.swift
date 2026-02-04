@@ -4,6 +4,7 @@ import SwiftUI
 
 struct SettingsModal: View {
     let onClose: () -> Void
+    let recordingManager: RecordingManager
     var onOpenTwitchSettings: (() -> Void)?
 
     var body: some View {
@@ -14,7 +15,7 @@ struct SettingsModal: View {
                 .onTapGesture { }  // Absorb taps, don't close
 
             // Centered settings panel
-            SettingsView(onClose: onClose, onOpenTwitchSettings: onOpenTwitchSettings)
+            SettingsView(onClose: onClose, recordingManager: recordingManager, onOpenTwitchSettings: onOpenTwitchSettings)
                 .shadow(color: .black.opacity(0.5), radius: 40, x: 0, y: 20)
         }
     }
@@ -35,6 +36,7 @@ struct SettingsView: View {
     @State private var testStatus: NotificationTestStatus?
     @State private var clearTask: Task<Void, Never>?
 
+    @ObservedObject var recordingManager: RecordingManager = RecordingManager()
     var onClose: (() -> Void)?
     var onOpenTwitchSettings: (() -> Void)?
 
@@ -61,6 +63,7 @@ struct SettingsView: View {
             selectRecordingsFolder: selectRecordingsFolder,
             selectStreamlinkBinary: selectStreamlinkBinary,
             selectFFmpegBinary: selectFFmpegBinary,
+            recordingManager: recordingManager,
             isNotificationManagerAvailable: notificationManager != nil,
             onClose: { (onClose ?? { dismiss() })() }
         )
@@ -198,6 +201,7 @@ struct SettingsViewContent: View {
     let selectRecordingsFolder: () -> Void
     let selectStreamlinkBinary: () -> Void
     let selectFFmpegBinary: () -> Void
+    @ObservedObject var recordingManager: RecordingManager
     let isNotificationManagerAvailable: Bool
     let onClose: () -> Void
 
@@ -378,7 +382,7 @@ struct SettingsViewContent: View {
 
                             settingsValueRow(
                                 title: "Streamlink binary",
-                                value: streamlinkPath.isEmpty ? "Auto-detect (/opt/homebrew/bin/streamlink)" : streamlinkPath
+                                value: streamlinkPath.isEmpty ? "Auto-detect (Homebrew or downloaded)" : streamlinkPath
                             )
 
                             HStack {
@@ -389,6 +393,37 @@ struct SettingsViewContent: View {
                                     action: selectStreamlinkBinary
                                 )
                                 Spacer()
+                            }
+
+                            if recordingManager.isInstalling {
+                                HStack(spacing: 8) {
+                                    ProgressView()
+                                        .scaleEffect(0.7)
+                                    Text(recordingManager.installStatus ?? "Installing Streamlink…")
+                                        .font(.system(size: 10))
+                                        .foregroundStyle(.white.opacity(0.7))
+                                    Spacer()
+                                }
+                            }
+
+                            HStack {
+                                SettingsButton(
+                                    title: recordingManager.isInstalling ? "Downloading…" : "Download Streamlink",
+                                    systemImage: "arrow.down.circle",
+                                    style: .primary,
+                                    action: {
+                                        Task { await recordingManager.installStreamlink() }
+                                    }
+                                )
+                                .disabled(recordingManager.isInstalling)
+                                Spacer()
+                            }
+
+                            if let installError = recordingManager.installError {
+                                Text(installError)
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(Color.orange.opacity(0.85))
+                                    .lineLimit(2)
                             }
 
                             settingsValueRow(
@@ -640,5 +675,4 @@ private struct SettingsTextFieldRow: View {
         .padding(.vertical, 4)
     }
 }
-
 #endif

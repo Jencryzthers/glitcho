@@ -3,7 +3,7 @@
 ## Version 1.0.4
 
 - Added live stream recording with Streamlink and in-player controls.
-- Added Recording settings to choose the output folder and Streamlink binary path.
+- Added Recording settings to choose the output folder and manage Streamlink (custom path or in-app download).
 
 ---
 

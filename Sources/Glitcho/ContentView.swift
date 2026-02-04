@@ -173,7 +173,8 @@ struct ContentView: View {
 
             if showSettings {
                 SettingsModal(
-                    onClose: { showSettings = false }
+                    onClose: { showSettings = false },
+                    recordingManager: recordingManager
                 )
                 .environment(\.notificationManager, notificationManager)
                 .zIndex(10)
