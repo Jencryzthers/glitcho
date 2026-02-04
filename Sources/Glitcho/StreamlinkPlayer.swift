@@ -490,18 +490,10 @@ struct HybridTwitchView: View {
 
                                 if playback.kind == .liveChannel, playback.channelName != nil {
                                     Button(action: { onRecordRequest?() }) {
-                                        HStack(spacing: 6) {
-                                            Circle()
-                                                .fill(recordingManager.isRecording ? Color.red : Color.white.opacity(0.35))
-                                                .frame(width: 8, height: 8)
-                                            Text(recordingManager.isRecording ? "Recording" : "Record")
-                                                .font(.system(size: 11, weight: .semibold))
-                                                .foregroundStyle(.white.opacity(recordingManager.isRecording ? 0.95 : 0.65))
-                                        }
-                                        .padding(.horizontal, 10)
-                                        .padding(.vertical, 5)
-                                        .background(Color.white.opacity(recordingManager.isRecording ? 0.2 : 0.08))
-                                        .clipShape(Capsule())
+                                        RecordingControlBadge(
+                                            isRecording: recordingManager.isRecording,
+                                            label: recordingManager.isRecording ? "Stop" : "Record"
+                                        )
                                     }
                                     .buttonStyle(.plain)
                                     .help(recordingManager.isRecording ? "Stop recording" : "Start recording")
@@ -763,6 +755,28 @@ struct HybridTwitchView: View {
         UserDefaults.standard.set(stored, forKey: Self.chatPreferencesKey)
     }
     
+}
+
+private struct RecordingControlBadge: View {
+    let isRecording: Bool
+    let label: String
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(isRecording ? Color.red : Color.white.opacity(0.4))
+                .frame(width: 6, height: 6)
+            Text(label)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.white.opacity(isRecording ? 0.9 : 0.6))
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.white.opacity(isRecording ? 0.15 : 0.08))
+        )
+    }
 }
 
 private struct ResizeHandle: View {

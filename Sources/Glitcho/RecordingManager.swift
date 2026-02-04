@@ -4,6 +4,7 @@ import Foundation
 
 final class RecordingManager: ObservableObject {
     @Published var isRecording = false
+    @Published var activeChannel: String?
     @Published var lastOutputURL: URL?
     @Published var errorMessage: String?
 
@@ -76,6 +77,7 @@ final class RecordingManager: ObservableObject {
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.isRecording = false
+                self.activeChannel = nil
                 let didUserStop = self.userInitiatedStop
                 self.userInitiatedStop = false
                 if proc.terminationStatus != 0 && !didUserStop {
@@ -91,6 +93,7 @@ final class RecordingManager: ObservableObject {
             try process.run()
             self.process = process
             lastOutputURL = outputURL
+            activeChannel = channelName
             isRecording = true
         } catch {
             errorMessage = "Failed to start recording: \(error.localizedDescription)"
@@ -102,6 +105,7 @@ final class RecordingManager: ObservableObject {
         process?.terminate()
         process = nil
         isRecording = false
+        activeChannel = nil
     }
 
     private func resolvedTarget(from target: String) -> String {

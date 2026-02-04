@@ -162,6 +162,13 @@ struct ContentView: View {
                 .environment(\.notificationManager, notificationManager)
                 .zIndex(10)
             }
+
+            if recordingManager.isRecording {
+                RecordingStatusBadge(channel: recordingManager.activeChannel)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                    .padding(16)
+                    .zIndex(2)
+            }
         }
         .task {
             await updateChecker.checkForUpdates()
@@ -368,6 +375,31 @@ struct ContentView: View {
         }
 
         return value.isEmpty ? nil : value
+    }
+}
+
+private struct RecordingStatusBadge: View {
+    let channel: String?
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Circle()
+                .fill(Color.red)
+                .frame(width: 8, height: 8)
+            Text("Recording\(channel.map { " • \($0)" } ?? "")")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.9))
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.black.opacity(0.6))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(Color.white.opacity(0.15), lineWidth: 1)
+        )
     }
 }
 
