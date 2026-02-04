@@ -26,6 +26,7 @@ struct SettingsView: View {
     @AppStorage(SidebarTint.storageKey) private var sidebarTintHex = SidebarTint.defaultHex
     @AppStorage("recordingsDirectory") private var recordingsDirectory = ""
     @AppStorage("streamlinkPath") private var streamlinkPath = ""
+    @AppStorage("ffmpegPath") private var ffmpegPath = ""
     @Environment(\.notificationManager) private var notificationManager
     @Environment(\.dismiss) private var dismiss
     @Environment(\.openURL) private var openURL
@@ -52,8 +53,10 @@ struct SettingsView: View {
             },
             recordingsDirectory: $recordingsDirectory,
             streamlinkPath: $streamlinkPath,
+            ffmpegPath: $ffmpegPath,
             selectRecordingsFolder: selectRecordingsFolder,
             selectStreamlinkBinary: selectStreamlinkBinary,
+            selectFFmpegBinary: selectFFmpegBinary,
             isNotificationManagerAvailable: notificationManager != nil,
             onClose: { (onClose ?? { dismiss() })() }
         )
@@ -134,6 +137,17 @@ struct SettingsView: View {
             streamlinkPath = url.path
         }
     }
+
+    private func selectFFmpegBinary() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Choose"
+        if panel.runModal() == .OK, let url = panel.url {
+            ffmpegPath = url.path
+        }
+    }
 }
 
 enum NotificationTestStatus {
@@ -174,8 +188,10 @@ struct SettingsViewContent: View {
     let openTwitchSettingsAction: () -> Void
     @Binding var recordingsDirectory: String
     @Binding var streamlinkPath: String
+    @Binding var ffmpegPath: String
     let selectRecordingsFolder: () -> Void
     let selectStreamlinkBinary: () -> Void
+    let selectFFmpegBinary: () -> Void
     let isNotificationManagerAvailable: Bool
     let onClose: () -> Void
 
@@ -351,6 +367,21 @@ struct SettingsViewContent: View {
                                     systemImage: "terminal",
                                     style: .secondary,
                                     action: selectStreamlinkBinary
+                                )
+                                Spacer()
+                            }
+
+                            settingsValueRow(
+                                title: "FFmpeg binary (optional)",
+                                value: ffmpegPath.isEmpty ? "Auto-detect (ffmpeg in PATH)" : ffmpegPath
+                            )
+
+                            HStack {
+                                SettingsButton(
+                                    title: "Choose FFmpeg",
+                                    systemImage: "terminal",
+                                    style: .secondary,
+                                    action: selectFFmpegBinary
                                 )
                                 Spacer()
                             }
@@ -556,6 +587,35 @@ private struct SettingsToggleRow: View {
                 .labelsHidden()
                 .scaleEffect(0.8)
                 .tint(Color.purple)
+        }
+        .padding(.vertical, 4)
+    }
+}
+
+private struct SettingsTextFieldRow: View {
+    let title: String
+    let detail: String
+    let placeholder: String
+    @Binding var text: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.white)
+            Text(detail)
+                .font(.system(size: 10))
+                .foregroundStyle(.white.opacity(0.5))
+            TextField(placeholder, text: $text)
+                .textFieldStyle(.plain)
+                .font(.system(size: 11))
+                .padding(8)
+                .background(Color.white.opacity(0.06))
+                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                )
         }
         .padding(.vertical, 4)
     }
