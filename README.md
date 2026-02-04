@@ -1,4 +1,4 @@
-# Glitcho
+# glitcho
 
 Glitcho is a native macOS SwiftUI app for Twitch with a clean, focused interface, a custom sidebar, and a native playback pipeline.
 
