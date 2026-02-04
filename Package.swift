@@ -16,6 +16,10 @@ let package = Package(
         .executableTarget(
             name: "Glitcho",
             resources: []
+        ),
+        .testTarget(
+            name: "GlitchoTests",
+            dependencies: ["Glitcho"]
         )
     ]
 )
