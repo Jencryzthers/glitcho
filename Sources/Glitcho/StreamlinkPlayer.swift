@@ -373,6 +373,7 @@ struct HybridTwitchView: View {
     var onOpenGiftSub: ((String) -> Void)?
     var notificationEnabled: Bool = true
     var onNotificationToggle: ((Bool) -> Void)?
+    var isRecording: Bool = false
     var onRecordRequest: (() -> Void)?
     @Environment(\.openWindow) private var openWindow
     @StateObject private var streamlink = StreamlinkManager()
@@ -881,6 +882,8 @@ struct ChannelInfoView: NSViewRepresentable {
                     }
                     DispatchQueue.main.async { self.onNotificationToggle(enabled) }
                 }
+            case "recordStream":
+                DispatchQueue.main.async { self.onRecordRequest() }
             default:
                 return
             }
@@ -956,6 +959,7 @@ struct ChannelInfoView: NSViewRepresentable {
         contentController.add(context.coordinator, name: "openSubscription")
         contentController.add(context.coordinator, name: "openGiftSub")
         contentController.add(context.coordinator, name: "channelNotification")
+        contentController.add(context.coordinator, name: "recordStream")
         
         let blockMediaScript = WKUserScript(
             source: """
@@ -1555,6 +1559,11 @@ struct ChannelInfoView: NSViewRepresentable {
                 return closestButton(el);
               }
 
+              function findActionsContainer(root) {
+                if (!root) { return null; }
+                return root.querySelector('[data-glitcho-actions="1"]') || root;
+              }
+
               function setBellState(button, enabled) {
                 button.dataset.glitchoBellState = enabled ? 'on' : 'off';
               }
@@ -1589,11 +1598,42 @@ struct ChannelInfoView: NSViewRepresentable {
                 }, true);
               }
 
+              function insertRecordButton() {
+                const root = rootNode();
+                if (!root) { return; }
+                if (root.querySelector('[data-glitcho-record="1"]')) { return; }
+                const container = findActionsContainer(root);
+                if (!container) { return; }
+                const button = document.createElement('button');
+                button.type = 'button';
+                button.setAttribute('data-glitcho-record', '1');
+                button.style.display = 'inline-flex';
+                button.style.alignItems = 'center';
+                button.style.gap = '6px';
+                const dot = document.createElement('span');
+                dot.textContent = '●';
+                dot.style.color = '#ff4d4d';
+                dot.style.fontSize = '12px';
+                const label = document.createElement('span');
+                label.textContent = 'Record';
+                button.appendChild(dot);
+                button.appendChild(label);
+                button.addEventListener('click', function(e) {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  try {
+                    window.webkit.messageHandlers.recordStream.postMessage({ login: login });
+                  } catch (_) {}
+                }, true);
+                container.appendChild(button);
+              }
+
               function decorate() {
                 if (!rootNode()) { return; }
                 ensureStyle();
                 purgeRecordButtons();
                 decorateBellButton();
+                insertRecordButton();
               }
 
               window.__glitcho_decorateChannelActions = function() {
