@@ -298,6 +298,7 @@ struct StreamlinkPlayerView: View {
 /// Vue hybride : Player natif + Chat + Infos de la chaîne
 struct HybridTwitchView: View {
     @Binding var playback: NativePlaybackRequest
+    @ObservedObject var recordingManager: RecordingManager
     var onOpenSubscription: ((String) -> Void)?
     var onOpenGiftSub: ((String) -> Void)?
     var notificationEnabled: Bool = true
@@ -316,6 +317,7 @@ struct HybridTwitchView: View {
     @AppStorage("hybridPlayerHeightRatio") private var playerHeightRatio: Double = 0.8
     @State private var dragStartRatio: Double?
     @State private var lastChannelName: String?
+    @State private var recordingError: String?
 
     private enum ChatDisplayMode: String {
         case inline
@@ -416,6 +418,25 @@ struct HybridTwitchView: View {
                                     .help("Picture in Picture")
                                 }
 
+                                if playback.kind == .liveChannel, playback.channelName != nil {
+                                    Button(action: { onRecordRequest?() }) {
+                                        HStack(spacing: 6) {
+                                            Circle()
+                                                .fill(recordingManager.isRecording ? Color.red : Color.white.opacity(0.35))
+                                                .frame(width: 8, height: 8)
+                                            Text(recordingManager.isRecording ? "Recording" : "Record")
+                                                .font(.system(size: 11, weight: .semibold))
+                                                .foregroundStyle(.white.opacity(recordingManager.isRecording ? 0.95 : 0.65))
+                                        }
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 5)
+                                        .background(Color.white.opacity(recordingManager.isRecording ? 0.2 : 0.08))
+                                        .clipShape(Capsule())
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help(recordingManager.isRecording ? "Stop recording" : "Start recording")
+                                }
+
                                 Button(action: { Task { await loadStream() } }) {
                                     Image(systemName: "arrow.clockwise")
                                         .font(.system(size: 11, weight: .semibold))
@@ -496,6 +517,14 @@ struct HybridTwitchView: View {
         } message: {
             Text(streamlink.error ?? "Erreur inconnue")
         }
+        .alert("Recording Error", isPresented: Binding<Bool>(
+            get: { recordingError != nil },
+            set: { if !$0 { recordingError = nil } }
+        )) {
+            Button("OK") { recordingError = nil }
+        } message: {
+            Text(recordingError ?? "Recording failed.")
+        }
         .onAppear {
             lastChannelName = playback.channelName
             if playback.kind == .liveChannel, let channel = playback.channelName {
@@ -534,6 +563,14 @@ struct HybridTwitchView: View {
             isPlaying = false
             streamURL = nil
             closeDetachedChat()
+            if recordingManager.isRecording {
+                recordingManager.stopRecording()
+            }
+        }
+        .onReceive(recordingManager.$errorMessage) { error in
+            if let error {
+                recordingError = error
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: .detachedChatAttachRequested)) { notification in
             guard let channel = notification.userInfo?["channel"] as? String else { return }
