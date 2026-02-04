@@ -3,11 +3,13 @@ import WebKit
 
 struct ContentView: View {
     @StateObject private var store = WebViewStore(url: URL(string: "https://www.twitch.tv")!)
+    @StateObject private var recorder = StreamlinkRecorder()
     @EnvironmentObject private var updateChecker: UpdateChecker
     @Environment(\.notificationManager) private var notificationManager
     @AppStorage("pinnedChannels") private var pinnedChannelsJSON: String = "[]"
     @AppStorage("liveAlertsEnabled") private var liveAlertsEnabled = true
     @AppStorage("liveAlertsPinnedOnly") private var liveAlertsPinnedOnly = false
+    @AppStorage("recordingsFolderPath") private var recordingsFolderPath = ""
     @State private var pinnedChannels: [PinnedChannel] = []
     @State private var hasLoadedPins = false
     @State private var lastLiveLogins: Set<String> = []
@@ -21,6 +23,7 @@ struct ContentView: View {
     @State private var showGiftPopup = false
     @State private var giftChannel: String?
     @State private var showSettings = false
+    @State private var recordingError: String?
     private let pinnedLimit = 8
 
     var body: some View {
@@ -65,6 +68,8 @@ struct ContentView: View {
                     if useNativePlayer {
                         HybridTwitchView(
                             playback: $playbackRequest,
+                            isRecording: recorder.isRecording,
+                            recordingChannel: recorder.activeChannel,
                             onOpenSubscription: { channel in
                                 subscriptionChannel = channel
                                 showSubscriptionPopup = true
@@ -79,7 +84,7 @@ struct ContentView: View {
                                 handleChannelNotificationToggle(ChannelNotificationToggle(login: login, enabled: enabled))
                             },
                             onRecordRequest: {
-                                // TODO: hook into recording pipeline
+                                handleRecordingToggle()
                             }
                         )
                     } else {
@@ -155,6 +160,13 @@ struct ContentView: View {
                 .environment(\.notificationManager, notificationManager)
                 .zIndex(10)
             }
+
+            if recorder.isRecording {
+                RecordingStatusBadge(channel: recorder.activeChannel)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                    .padding(16)
+                    .zIndex(2)
+            }
         }
         .task {
             await updateChecker.checkForUpdates()
@@ -181,6 +193,24 @@ struct ContentView: View {
         }
         .onChange(of: playbackRequest) { _ in
             updateChannelBellStateIfNeeded()
+        }
+        .onReceive(recorder.$errorMessage) { message in
+            if let message {
+                recordingError = message
+            }
+        }
+        .alert("Recording Error", isPresented: Binding(
+            get: { recordingError != nil },
+            set: { isPresented in
+                if !isPresented {
+                    recordingError = nil
+                    recorder.errorMessage = nil
+                }
+            })
+        ) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text(recordingError ?? "Recording failed.")
         }
     }
 
@@ -218,6 +248,20 @@ struct ContentView: View {
         var updated = pinnedChannels
         updated[index].notifyEnabled.toggle()
         pinnedChannels = updated
+    }
+
+    private func handleRecordingToggle() {
+        if recorder.isRecording {
+            recorder.stopRecording()
+            return
+        }
+
+        guard playbackRequest.kind == .liveChannel, let channel = playbackRequest.channelName else {
+            recorder.errorMessage = "Recording is only available for live channels."
+            return
+        }
+
+        recorder.startRecording(channel: channel, recordingsFolderPath: recordingsFolderPath)
     }
 
     private func addPinned(fromInput input: String) -> Bool {
@@ -361,6 +405,31 @@ struct ContentView: View {
         }
 
         return value.isEmpty ? nil : value
+    }
+}
+
+private struct RecordingStatusBadge: View {
+    let channel: String?
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Circle()
+                .fill(Color.red)
+                .frame(width: 8, height: 8)
+            Text("Recording\(channel.map { " • \($0)" } ?? "")")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.9))
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.black.opacity(0.6))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(Color.white.opacity(0.15), lineWidth: 1)
+        )
     }
 }
 

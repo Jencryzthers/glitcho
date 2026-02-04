@@ -22,6 +22,7 @@ struct SettingsModal: View {
 struct SettingsView: View {
     @AppStorage("liveAlertsEnabled") private var liveAlertsEnabled = true
     @AppStorage("liveAlertsPinnedOnly") private var liveAlertsPinnedOnly = false
+    @AppStorage("recordingsFolderPath") private var recordingsFolderPath = ""
     @Environment(\.notificationManager) private var notificationManager
     @Environment(\.dismiss) private var dismiss
     @Environment(\.openURL) private var openURL
@@ -35,8 +36,10 @@ struct SettingsView: View {
         SettingsViewContent(
             liveAlertsEnabled: $liveAlertsEnabled,
             liveAlertsPinnedOnly: $liveAlertsPinnedOnly,
+            recordingsFolderPath: $recordingsFolderPath,
             testStatus: $testStatus,
             testAction: testNotification,
+            recordingsFolderAction: chooseRecordingsFolder,
             openSettingsAction: openNotificationSettings,
             openTwitchSettingsAction: {
                 if let onOpenTwitchSettings {
@@ -102,6 +105,17 @@ struct SettingsView: View {
     private func openTwitchSettings() {
         openURL(URL(string: "https://www.twitch.tv/settings")!)
     }
+
+    private func chooseRecordingsFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Choose"
+        if panel.runModal() == .OK {
+            recordingsFolderPath = panel.url?.path ?? ""
+        }
+    }
 }
 
 enum NotificationTestStatus {
@@ -135,8 +149,10 @@ enum NotificationTestStatus {
 struct SettingsViewContent: View {
     @Binding var liveAlertsEnabled: Bool
     @Binding var liveAlertsPinnedOnly: Bool
+    @Binding var recordingsFolderPath: String
     @Binding var testStatus: NotificationTestStatus?
     let testAction: () -> Void
+    let recordingsFolderAction: () -> Void
     let openSettingsAction: () -> Void
     let openTwitchSettingsAction: () -> Void
     let isNotificationManagerAvailable: Bool
@@ -188,6 +204,31 @@ struct SettingsViewContent: View {
                             Spacer()
                         }
                         .padding(.top, 4)
+                    }
+
+                    SettingsCard(
+                        icon: "record.circle.fill",
+                        iconColor: .red,
+                        title: "Recordings",
+                        subtitle: "Choose where recordings are saved"
+                    ) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(recordingsFolderPath.isEmpty ? "No folder selected" : recordingsFolderPath)
+                                .font(.system(size: 10))
+                                .foregroundStyle(.white.opacity(0.6))
+                                .lineLimit(2)
+
+                            HStack {
+                                SettingsButton(
+                                    title: "Choose Folder",
+                                    systemImage: "folder",
+                                    style: .secondary,
+                                    action: recordingsFolderAction
+                                )
+
+                                Spacer()
+                            }
+                        }
                     }
 
                     // System Permissions Card

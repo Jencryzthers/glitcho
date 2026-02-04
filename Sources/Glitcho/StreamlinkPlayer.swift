@@ -298,6 +298,8 @@ struct StreamlinkPlayerView: View {
 /// Vue hybride : Player natif + Chat + Infos de la chaîne
 struct HybridTwitchView: View {
     @Binding var playback: NativePlaybackRequest
+    var isRecording: Bool = false
+    var recordingChannel: String?
     var onOpenSubscription: ((String) -> Void)?
     var onOpenGiftSub: ((String) -> Void)?
     var notificationEnabled: Bool = true
@@ -414,6 +416,18 @@ struct HybridTwitchView: View {
                                     }
                                     .buttonStyle(.plain)
                                     .help("Picture in Picture")
+                                }
+
+                                if playback.kind == .liveChannel {
+                                    let isRecordingHere = isRecording && recordingChannel == playback.channelName
+                                    Button(action: { onRecordRequest?() }) {
+                                        RecordingControlBadge(
+                                            isRecording: isRecordingHere,
+                                            label: isRecordingHere ? "Stop" : "Record"
+                                        )
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help(isRecordingHere ? "Stop recording" : "Start recording")
                                 }
 
                                 Button(action: { Task { await loadStream() } }) {
@@ -656,6 +670,28 @@ struct HybridTwitchView: View {
         UserDefaults.standard.set(stored, forKey: Self.chatPreferencesKey)
     }
     
+}
+
+private struct RecordingControlBadge: View {
+    let isRecording: Bool
+    let label: String
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(isRecording ? Color.red : Color.white.opacity(0.4))
+                .frame(width: 6, height: 6)
+            Text(label)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.white.opacity(isRecording ? 0.9 : 0.6))
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.white.opacity(isRecording ? 0.15 : 0.08))
+        )
+    }
 }
 
 private struct ResizeHandle: View {
