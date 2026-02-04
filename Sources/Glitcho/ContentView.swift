@@ -15,6 +15,7 @@ struct ContentView: View {
     @State private var searchText = ""
     @State private var playbackRequest = NativePlaybackRequest(kind: .liveChannel, streamlinkTarget: "twitch.tv", channelName: nil)
     @State private var useNativePlayer = false
+    @State private var isRecording = false
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @State private var showSubscriptionPopup = false
     @State private var subscriptionChannel: String?
@@ -78,7 +79,9 @@ struct ContentView: View {
                                 guard let login = playbackRequest.channelName else { return }
                                 handleChannelNotificationToggle(ChannelNotificationToggle(login: login, enabled: enabled))
                             },
+                            isRecording: isRecording,
                             onRecordRequest: {
+                                isRecording.toggle()
                                 // TODO: hook into recording pipeline
                             }
                         )
