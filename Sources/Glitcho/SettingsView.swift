@@ -26,6 +26,8 @@ struct SettingsView: View {
     @AppStorage(SidebarTint.storageKey) private var sidebarTintHex = SidebarTint.defaultHex
     @AppStorage("recordingsDirectory") private var recordingsDirectory = ""
     @AppStorage("streamlinkPath") private var streamlinkPath = ""
+    @AppStorage("autoRecordOnLive") private var autoRecordOnLive = false
+    @AppStorage("autoRecordPinnedOnly") private var autoRecordPinnedOnly = false
     @Environment(\.notificationManager) private var notificationManager
     @Environment(\.dismiss) private var dismiss
     @Environment(\.openURL) private var openURL
@@ -52,6 +54,8 @@ struct SettingsView: View {
             },
             recordingsDirectory: $recordingsDirectory,
             streamlinkPath: $streamlinkPath,
+            autoRecordOnLive: $autoRecordOnLive,
+            autoRecordPinnedOnly: $autoRecordPinnedOnly,
             selectRecordingsFolder: selectRecordingsFolder,
             selectStreamlinkBinary: selectStreamlinkBinary,
             isNotificationManagerAvailable: notificationManager != nil,
@@ -174,6 +178,8 @@ struct SettingsViewContent: View {
     let openTwitchSettingsAction: () -> Void
     @Binding var recordingsDirectory: String
     @Binding var streamlinkPath: String
+    @Binding var autoRecordOnLive: Bool
+    @Binding var autoRecordPinnedOnly: Bool
     let selectRecordingsFolder: () -> Void
     let selectStreamlinkBinary: () -> Void
     let isNotificationManagerAvailable: Bool
@@ -325,6 +331,20 @@ struct SettingsViewContent: View {
                         subtitle: "Capture live streams with Streamlink"
                     ) {
                         VStack(alignment: .leading, spacing: 10) {
+                            SettingsToggleRow(
+                                title: "Auto-record when live",
+                                detail: "Start recording followed channels as soon as they go live.",
+                                isOn: $autoRecordOnLive
+                            )
+
+                            SettingsToggleRow(
+                                title: "Favorites only",
+                                detail: "Only auto-record pinned channels with notifications enabled.",
+                                isOn: $autoRecordPinnedOnly
+                            )
+                            .disabled(!autoRecordOnLive)
+                            .opacity(autoRecordOnLive ? 1 : 0.5)
+
                             settingsValueRow(
                                 title: "Recordings folder",
                                 value: recordingsDirectory.isEmpty ? "Default (Downloads/Glitcho Recordings)" : recordingsDirectory
