@@ -1,3 +1,4 @@
+#if canImport(SwiftUI)
 import SwiftUI
 import WebKit
 
@@ -1139,3 +1140,5 @@ struct VisualEffectView: NSViewRepresentable {
         nsView.blendingMode = blendingMode
     }
 }
+
+#endif

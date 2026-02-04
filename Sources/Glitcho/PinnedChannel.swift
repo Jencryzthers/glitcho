@@ -1,3 +1,4 @@
+#if canImport(SwiftUI)
 import Foundation
 
 struct PinnedChannel: Identifiable, Codable, Hashable {
@@ -58,3 +59,5 @@ extension TwitchChannel {
         url.lastPathComponent.lowercased()
     }
 }
+
+#endif

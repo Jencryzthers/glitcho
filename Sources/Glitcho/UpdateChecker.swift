@@ -1,5 +1,7 @@
 import Foundation
 
+#if canImport(SwiftUI)
+
 @MainActor
 final class UpdateChecker: ObservableObject {
     struct UpdateInfo: Equatable {
@@ -175,3 +177,5 @@ private struct GitHubRelease: Decodable {
         case prerelease
     }
 }
+
+#endif

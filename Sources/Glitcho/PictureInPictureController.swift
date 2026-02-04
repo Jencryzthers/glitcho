@@ -1,3 +1,4 @@
+#if canImport(SwiftUI)
 import AppKit
 import AVKit
 
@@ -63,3 +64,5 @@ final class PictureInPictureController: NSObject, ObservableObject, AVPictureInP
         isAvailable = available
     }
 }
+
+#endif

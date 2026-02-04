@@ -1,3 +1,4 @@
+#if canImport(SwiftUI)
 import Foundation
 import AppKit
 import AVKit
@@ -1726,3 +1727,5 @@ struct ChannelPageWebView: NSViewRepresentable {
         }
     }
 }
+
+#endif

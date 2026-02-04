@@ -1,3 +1,4 @@
+#if canImport(SwiftUI)
 import AppKit
 import Foundation
 import UserNotifications
@@ -60,3 +61,5 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
         }
     }
 }
+
+#endif

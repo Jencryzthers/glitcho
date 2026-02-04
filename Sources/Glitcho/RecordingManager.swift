@@ -1,5 +1,7 @@
 import Foundation
 
+#if canImport(SwiftUI)
+
 final class RecordingManager: ObservableObject {
     @Published var isRecording = false
     @Published var lastOutputURL: URL?
@@ -122,3 +124,5 @@ final class RecordingManager: ObservableObject {
         return nil
     }
 }
+
+#endif

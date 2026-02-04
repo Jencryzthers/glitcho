@@ -1,3 +1,4 @@
+#if canImport(SwiftUI)
 import SwiftUI
 
 @main
@@ -186,3 +187,5 @@ struct AboutView: View {
         .background(VisualEffectView(material: .hudWindow, blendingMode: .behindWindow))
     }
 }
+
+#endif

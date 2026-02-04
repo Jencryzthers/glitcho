@@ -1,3 +1,4 @@
+#if canImport(SwiftUI)
 import AppKit
 import SwiftUI
 
@@ -516,3 +517,5 @@ private struct SettingsToggleRow: View {
         .padding(.vertical, 4)
     }
 }
+
+#endif
