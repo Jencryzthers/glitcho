@@ -10,10 +10,13 @@ struct ContentView: View {
     @AppStorage("pinnedChannels") private var pinnedChannelsJSON: String = "[]"
     @AppStorage("liveAlertsEnabled") private var liveAlertsEnabled = true
     @AppStorage("liveAlertsPinnedOnly") private var liveAlertsPinnedOnly = false
+    @AppStorage("autoRecordOnLive") private var autoRecordOnLive = false
+    @AppStorage("autoRecordPinnedOnly") private var autoRecordPinnedOnly = false
     @State private var pinnedChannels: [PinnedChannel] = []
     @State private var hasLoadedPins = false
     @State private var lastLiveLogins: Set<String> = []
     @State private var hasSeenInitialLiveList = false
+    @State private var lastAutoRecordLogin: String?
     @State private var searchText = ""
     @State private var playbackRequest = NativePlaybackRequest(kind: .liveChannel, streamlinkTarget: "twitch.tv", channelName: nil)
     @State private var useNativePlayer = false
@@ -34,6 +37,7 @@ struct ContentView: View {
                 Sidebar(
                     searchText: $searchText,
                     store: store,
+                    recordingManager: recordingManager,
                     pinnedChannels: $pinnedChannels,
                     pinnedLimit: pinnedLimit,
                     liveAlertsEnabled: $liveAlertsEnabled,
@@ -284,31 +288,55 @@ struct ContentView: View {
 
     private func handleFollowedLiveChange(_ liveChannels: [TwitchChannel]) {
         let currentLogins = Set(liveChannels.map { $0.login })
+        if let lastAutoRecordLogin, !currentLogins.contains(lastAutoRecordLogin) {
+            self.lastAutoRecordLogin = nil
+        }
         defer {
             lastLiveLogins = currentLogins
             hasSeenInitialLiveList = true
         }
 
         guard store.isLoggedIn else { return }
-        guard liveAlertsEnabled else { return }
-        guard hasSeenInitialLiveList else { return }
-        guard let notificationManager else { return }
 
         let newlyLive = currentLogins.subtracting(lastLiveLogins)
-        guard !newlyLive.isEmpty else { return }
+        let autoRecordCandidates = hasSeenInitialLiveList ? newlyLive : currentLogins
+        guard !newlyLive.isEmpty || !autoRecordCandidates.isEmpty else { return }
 
         let channelMap = Dictionary(liveChannels.map { ($0.login, $0) }, uniquingKeysWith: { first, _ in first })
         let pinMap = Dictionary(pinnedChannels.map { ($0.login, $0) }, uniquingKeysWith: { first, _ in first })
 
-        for login in newlyLive {
-            guard let channel = channelMap[login] else { continue }
-            if liveAlertsPinnedOnly {
-                guard let pin = pinMap[login], pin.notifyEnabled else { continue }
-            }
-            Task {
-                await notificationManager.notifyChannelLive(channel)
+        if hasSeenInitialLiveList, liveAlertsEnabled, let notificationManager {
+            for login in newlyLive {
+                guard let channel = channelMap[login] else { continue }
+                if liveAlertsPinnedOnly {
+                    guard let pin = pinMap[login], pin.notifyEnabled else { continue }
+                }
+                Task {
+                    await notificationManager.notifyChannelLive(channel)
+                }
             }
         }
+
+        guard autoRecordOnLive else { return }
+        guard !recordingManager.isRecording else { return }
+
+        let eligibleLogins = autoRecordCandidates.filter { login in
+            guard channelMap[login] != nil else { return false }
+            if autoRecordPinnedOnly {
+                guard let pin = pinMap[login], pin.notifyEnabled else { return false }
+            }
+            return true
+        }
+
+        guard let targetLogin = eligibleLogins.sorted().first else { return }
+        guard lastAutoRecordLogin != targetLogin else { return }
+        guard let channel = channelMap[targetLogin] else { return }
+
+        recordingManager.startRecording(
+            target: "twitch.tv/\(targetLogin)",
+            channelName: channel.name
+        )
+        lastAutoRecordLogin = targetLogin
     }
 
     private func handleChannelNotificationToggle(_ request: ChannelNotificationToggle) {
@@ -466,6 +494,7 @@ private let subscriptionPopupScript = """
 struct Sidebar: View {
     @Binding var searchText: String
     @ObservedObject var store: WebViewStore
+    @ObservedObject var recordingManager: RecordingManager
     @Binding var pinnedChannels: [PinnedChannel]
     let pinnedLimit: Int
     @Binding var liveAlertsEnabled: Bool
@@ -676,9 +705,11 @@ struct Sidebar: View {
                     } else {
                         ForEach(pinnedChannels) { pin in
                             let liveChannel = liveChannelFor(pin.login)
+                            let isRecording = recordingManager.isRecording && recordingManager.activeChannelLogin == pin.login
                             PinnedRow(
                                 channel: pin,
                                 liveChannel: liveChannel,
+                                isRecording: isRecording,
                                 onOpen: {
                                     if let liveChannel {
                                         onChannelSelected?(liveChannel.login)
@@ -720,7 +751,10 @@ struct Sidebar: View {
                         .padding(.vertical, 8)
                     } else {
                         ForEach(store.followedLive) { channel in
-                            FollowingRow(channel: channel) {
+                            FollowingRow(
+                                channel: channel,
+                                isRecording: recordingManager.isRecording && recordingManager.activeChannelLogin == channel.login
+                            ) {
                                 let channelName = channel.url.lastPathComponent
                                 onChannelSelected?(channelName)
                             }
@@ -915,6 +949,7 @@ struct SidebarRow: View {
 
 struct FollowingRow: View {
     let channel: TwitchChannel
+    let isRecording: Bool
     let action: () -> Void
     @State private var isHovered = false
 
@@ -946,6 +981,18 @@ struct FollowingRow: View {
 
                 Spacer()
 
+                if isRecording {
+                    Text("REC")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(
+                            Capsule()
+                                .fill(Color.red.opacity(0.85))
+                        )
+                }
+
                 Circle()
                     .fill(Color.red)
                     .frame(width: 8, height: 8)
@@ -970,6 +1017,7 @@ struct FollowingRow: View {
 struct PinnedRow: View {
     let channel: PinnedChannel
     let liveChannel: TwitchChannel?
+    let isRecording: Bool
     let onOpen: () -> Void
     let onRemove: () -> Void
     let onToggleNotifications: () -> Void
@@ -1021,6 +1069,18 @@ struct PinnedRow: View {
 
             HStack(spacing: 8) {
                 Spacer()
+
+                if isRecording {
+                    Text("REC")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(
+                            Capsule()
+                                .fill(Color.red.opacity(0.85))
+                        )
+                }
 
                 Circle()
                     .fill(liveChannel == nil ? Color.white.opacity(0.2) : Color.red)

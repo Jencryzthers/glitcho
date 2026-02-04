@@ -7,6 +7,8 @@ final class RecordingManager: ObservableObject {
     @Published var activeChannel: String?
     @Published var lastOutputURL: URL?
     @Published var errorMessage: String?
+    @Published var activeChannelLogin: String?
+    @Published var activeChannelName: String?
 
     private var process: Process?
     private var userInitiatedStop = false
@@ -52,10 +54,13 @@ final class RecordingManager: ObservableObject {
             return
         }
 
+        let resolvedChannelLogin = channelLogin(from: target)
+        let normalizedName = channelName?.trimmingCharacters(in: .whitespacesAndNewlines)
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
         let timestamp = formatter.string(from: Date())
-        let safeChannel = (channelName ?? "twitch").replacingOccurrences(of: " ", with: "_")
+        let safeChannel = (normalizedName?.isEmpty == false ? normalizedName : resolvedChannelLogin ?? "twitch")
+            .replacingOccurrences(of: " ", with: "_")
         let filename = "\(safeChannel)_\(timestamp).mp4"
         let outputURL = directory.appendingPathComponent(filename)
 
@@ -78,6 +83,8 @@ final class RecordingManager: ObservableObject {
                 guard let self else { return }
                 self.isRecording = false
                 self.activeChannel = nil
+                self.activeChannelLogin = nil
+                self.activeChannelName = nil
                 let didUserStop = self.userInitiatedStop
                 self.userInitiatedStop = false
                 if proc.terminationStatus != 0 && !didUserStop {
@@ -95,6 +102,8 @@ final class RecordingManager: ObservableObject {
             lastOutputURL = outputURL
             activeChannel = channelName
             isRecording = true
+            activeChannelLogin = resolvedChannelLogin
+            activeChannelName = normalizedName?.isEmpty == false ? normalizedName : resolvedChannelLogin
         } catch {
             errorMessage = "Failed to start recording: \(error.localizedDescription)"
         }
@@ -106,6 +115,8 @@ final class RecordingManager: ObservableObject {
         process = nil
         isRecording = false
         activeChannel = nil
+        activeChannelLogin = nil
+        activeChannelName = nil
     }
 
     private func resolvedTarget(from target: String) -> String {
@@ -131,6 +142,15 @@ final class RecordingManager: ObservableObject {
             }
         }
         return nil
+    }
+
+    private func channelLogin(from target: String) -> String? {
+        let resolved = resolvedTarget(from: target)
+        guard let url = URL(string: resolved) else { return nil }
+        guard let host = url.host?.lowercased(), host.contains("twitch.tv") else { return nil }
+        let parts = url.path.split(separator: "/")
+        guard let first = parts.first, !first.isEmpty else { return nil }
+        return String(first).lowercased()
     }
 }
 
