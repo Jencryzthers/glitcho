@@ -11,6 +11,8 @@ class StreamlinkManager: ObservableObject {
     @Published var streamURL: URL?
     
     private var process: Process?
+    private let streamlinkPathKey = "streamlinkPath"
+    private let ffmpegPathKey = "ffmpegPath"
     
     func getStreamURL(for channel: String, quality: String = "best") async throws -> URL {
         return try await getStreamURL(target: "twitch.tv/\(channel)", quality: quality)
@@ -19,11 +21,19 @@ class StreamlinkManager: ObservableObject {
     func getStreamURL(target: String, quality: String = "best") async throws -> URL {
         return try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
+                let streamlinkExecutable: URL
+                do {
+                    streamlinkExecutable = try self.resolveStreamlinkExecutable()
+                } catch {
+                    continuation.resume(throwing: error)
+                    return
+                }
+
                 let process = Process()
                 let pipe = Pipe()
                 let errorPipe = Pipe()
                 
-                process.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/streamlink")
+                process.executableURL = streamlinkExecutable
                 let resolvedTarget: String = {
                     let t = target.trimmingCharacters(in: .whitespacesAndNewlines)
                     if t.hasPrefix("http://") || t.hasPrefix("https://") { return t }
@@ -41,6 +51,7 @@ class StreamlinkManager: ObservableObject {
                 process.standardError = errorPipe
                 
                 do {
+                    self.process = process
                     try process.run()
                     process.waitUntilExit()
                     
@@ -71,6 +82,64 @@ class StreamlinkManager: ObservableObject {
     func stopStream() {
         process?.terminate()
         process = nil
+    }
+
+    private func resolveStreamlinkExecutable() throws -> URL {
+        if let custom = resolvedCustomPath(forKey: streamlinkPathKey) {
+            if isExecutableFile(atPath: custom) {
+                return URL(fileURLWithPath: custom)
+            }
+            throw streamlinkError("Streamlink not executable at \(custom). Check Settings → Streamlink Path.")
+        }
+
+        if let path = resolveExecutable(named: "streamlink") {
+            return URL(fileURLWithPath: path)
+        }
+
+        throw streamlinkError("Streamlink not found. Install it or set a custom path in Settings.")
+    }
+
+    private func resolveFFmpegExecutable() -> URL? {
+        if let custom = resolvedCustomPath(forKey: ffmpegPathKey), isExecutableFile(atPath: custom) {
+            return URL(fileURLWithPath: custom)
+        }
+        if let path = resolveExecutable(named: "ffmpeg") {
+            return URL(fileURLWithPath: path)
+        }
+        return nil
+    }
+
+    private func resolveExecutable(named name: String) -> String? {
+        let fallbackPaths = [
+            "/opt/homebrew/bin/\(name)",
+            "/usr/local/bin/\(name)",
+            "/usr/bin/\(name)"
+        ]
+        let pathEnvironment = ProcessInfo.processInfo.environment["PATH"] ?? ""
+        let pathEntries = pathEnvironment.split(separator: ":").map(String.init)
+        let searchPaths = pathEntries + fallbackPaths
+        for directory in searchPaths {
+            let candidate = URL(fileURLWithPath: directory).appendingPathComponent(name).path
+            if isExecutableFile(atPath: candidate) {
+                return candidate
+            }
+        }
+        return nil
+    }
+
+    private func resolvedCustomPath(forKey key: String) -> String? {
+        let rawPath = UserDefaults.standard.string(forKey: key) ?? ""
+        let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return (trimmed as NSString).expandingTildeInPath
+    }
+
+    private func isExecutableFile(atPath path: String) -> Bool {
+        FileManager.default.isExecutableFile(atPath: path)
+    }
+
+    private func streamlinkError(_ message: String) -> Error {
+        NSError(domain: "StreamlinkError", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
     }
 }
 

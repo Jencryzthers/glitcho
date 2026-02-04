@@ -22,6 +22,8 @@ struct SettingsModal: View {
 struct SettingsView: View {
     @AppStorage("liveAlertsEnabled") private var liveAlertsEnabled = true
     @AppStorage("liveAlertsPinnedOnly") private var liveAlertsPinnedOnly = false
+    @AppStorage("streamlinkPath") private var streamlinkPath = ""
+    @AppStorage("ffmpegPath") private var ffmpegPath = ""
     @Environment(\.notificationManager) private var notificationManager
     @Environment(\.dismiss) private var dismiss
     @Environment(\.openURL) private var openURL
@@ -35,6 +37,8 @@ struct SettingsView: View {
         SettingsViewContent(
             liveAlertsEnabled: $liveAlertsEnabled,
             liveAlertsPinnedOnly: $liveAlertsPinnedOnly,
+            streamlinkPath: $streamlinkPath,
+            ffmpegPath: $ffmpegPath,
             testStatus: $testStatus,
             testAction: testNotification,
             openSettingsAction: openNotificationSettings,
@@ -135,6 +139,8 @@ enum NotificationTestStatus {
 struct SettingsViewContent: View {
     @Binding var liveAlertsEnabled: Bool
     @Binding var liveAlertsPinnedOnly: Bool
+    @Binding var streamlinkPath: String
+    @Binding var ffmpegPath: String
     @Binding var testStatus: NotificationTestStatus?
     let testAction: () -> Void
     let openSettingsAction: () -> Void
@@ -248,6 +254,27 @@ struct SettingsViewContent: View {
                                 action: openTwitchSettingsAction
                             )
                         }
+                    }
+
+                    SettingsCard(
+                        icon: "terminal.fill",
+                        iconColor: .orange,
+                        title: "Streamlink",
+                        subtitle: "Point to custom installs if needed"
+                    ) {
+                        SettingsTextFieldRow(
+                            title: "Streamlink Path",
+                            detail: "Leave blank to use PATH (e.g. /opt/homebrew/bin/streamlink).",
+                            placeholder: "/path/to/streamlink",
+                            text: $streamlinkPath
+                        )
+
+                        SettingsTextFieldRow(
+                            title: "FFmpeg Path (optional)",
+                            detail: "Only needed for recording/transcoding.",
+                            placeholder: "/path/to/ffmpeg",
+                            text: $ffmpegPath
+                        )
                     }
                 }
                 .padding(16)
@@ -428,6 +455,35 @@ private struct SettingsToggleRow: View {
                 .labelsHidden()
                 .scaleEffect(0.8)
                 .tint(Color.purple)
+        }
+        .padding(.vertical, 4)
+    }
+}
+
+private struct SettingsTextFieldRow: View {
+    let title: String
+    let detail: String
+    let placeholder: String
+    @Binding var text: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.white)
+            Text(detail)
+                .font(.system(size: 10))
+                .foregroundStyle(.white.opacity(0.5))
+            TextField(placeholder, text: $text)
+                .textFieldStyle(.plain)
+                .font(.system(size: 11))
+                .padding(8)
+                .background(Color.white.opacity(0.06))
+                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                )
         }
         .padding(.vertical, 4)
     }
