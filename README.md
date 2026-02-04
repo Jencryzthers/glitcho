@@ -59,6 +59,11 @@ The app bundle is created at `Build/Glitcho.app`.
 - Some channels require authentication to play.
 - Streamlink download requires network access on first install.
 
+## Known Issues
+
+- The About/Schedule/Videos section under the native player may stay blank (black area).
+- FFmpeg may not be recognized in the Recording settings page, which can prevent remuxing recordings for playback.
+
 ## Privacy
 
 The app does not add additional analytics or telemetry. Twitch web content may collect data according to Twitch’s own policies.

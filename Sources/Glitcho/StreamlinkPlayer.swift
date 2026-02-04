@@ -150,37 +150,239 @@ struct NativeVideoPlayer: NSViewRepresentable {
     @Binding var isPlaying: Bool
     let pipController: PictureInPictureController?
 
-    init(url: URL, isPlaying: Binding<Bool>, pipController: PictureInPictureController? = nil) {
+    /// Digital zoom (1.0 = normal). Applied to the underlying video layer (not the whole UI).
+    @Binding var zoom: CGFloat
+    /// Pan offset in points (only meaningful when zoom > 1).
+    @Binding var pan: CGSize
+
+    var minZoom: CGFloat = 1.0
+    var maxZoom: CGFloat = 4.0
+
+    init(
+        url: URL,
+        isPlaying: Binding<Bool>,
+        pipController: PictureInPictureController? = nil,
+        zoom: Binding<CGFloat> = .constant(1.0),
+        pan: Binding<CGSize> = .constant(.zero),
+        minZoom: CGFloat = 1.0,
+        maxZoom: CGFloat = 4.0
+    ) {
         self.url = url
         self._isPlaying = isPlaying
         self.pipController = pipController
+        self._zoom = zoom
+        self._pan = pan
+        self.minZoom = minZoom
+        self.maxZoom = maxZoom
     }
-    
-    final class Coordinator {
-        var endObserver: Any?
-        let pipController: PictureInPictureController?
-        
-        init(pipController: PictureInPictureController?) {
-            self.pipController = pipController
+
+    final class ZoomableAVPlayerView: AVPlayerView {
+        var onLayout: ((ZoomableAVPlayerView) -> Void)?
+
+        override func layout() {
+            super.layout()
+            onLayout?(self)
         }
     }
-    
-    func makeCoordinator() -> Coordinator { Coordinator(pipController: pipController) }
-    
+
+    final class Coordinator: NSObject, NSGestureRecognizerDelegate {
+        var endObserver: Any?
+        let pipController: PictureInPictureController?
+
+        var parent: NativeVideoPlayer
+        private var magnifyStartZoom: CGFloat = 1.0
+        private var panStart: CGSize = .zero
+
+        weak var resolvedVideoLayer: CALayer?
+        weak var playerView: ZoomableAVPlayerView?
+
+        init(parent: NativeVideoPlayer, pipController: PictureInPictureController?) {
+            self.parent = parent
+            self.pipController = pipController
+        }
+
+        func gestureRecognizer(_ gestureRecognizer: NSGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: NSGestureRecognizer) -> Bool {
+            true
+        }
+
+        func gestureRecognizerShouldBegin(_ gestureRecognizer: NSGestureRecognizer) -> Bool {
+            // Avoid interfering with AVPlayerView controls: only pan when Option is held.
+            if gestureRecognizer is NSPanGestureRecognizer {
+                return NSEvent.modifierFlags.contains(.option)
+            }
+            return true
+        }
+
+        @objc func handleMagnify(_ recognizer: NSMagnificationGestureRecognizer) {
+            guard let view = recognizer.view as? AVPlayerView else { return }
+            let bounds = view.bounds
+            guard bounds.width > 0, bounds.height > 0 else { return }
+
+            switch recognizer.state {
+            case .began:
+                magnifyStartZoom = parent.zoom
+            case .changed:
+                let raw = magnifyStartZoom * (1.0 + recognizer.magnification)
+                let clamped = clampZoom(raw)
+                if parent.zoom != clamped {
+                    parent.zoom = clamped
+                }
+                parent.pan = clampPan(parent.pan, in: bounds, zoom: parent.zoom)
+                applyZoomAndPan(to: view)
+            case .ended, .cancelled, .failed:
+                parent.zoom = clampZoom(parent.zoom)
+                parent.pan = clampPan(parent.pan, in: bounds, zoom: parent.zoom)
+                applyZoomAndPan(to: view)
+            default:
+                break
+            }
+        }
+
+        @objc func handlePan(_ recognizer: NSPanGestureRecognizer) {
+            guard let view = recognizer.view as? AVPlayerView else { return }
+            let bounds = view.bounds
+            guard bounds.width > 0, bounds.height > 0 else { return }
+
+            // Only allow panning when zoomed in.
+            if parent.zoom <= (parent.minZoom + 0.001) {
+                if parent.pan != .zero {
+                    parent.pan = .zero
+                    applyZoomAndPan(to: view)
+                }
+                return
+            }
+
+            switch recognizer.state {
+            case .began:
+                panStart = parent.pan
+            case .changed:
+                let t = recognizer.translation(in: view)
+                let raw = CGSize(width: panStart.width + t.x, height: panStart.height + t.y)
+                let clamped = clampPan(raw, in: bounds, zoom: parent.zoom)
+                if parent.pan != clamped {
+                    parent.pan = clamped
+                }
+                applyZoomAndPan(to: view)
+            case .ended, .cancelled, .failed:
+                parent.pan = clampPan(parent.pan, in: bounds, zoom: parent.zoom)
+                applyZoomAndPan(to: view)
+            default:
+                break
+            }
+        }
+
+        @objc func handleDoubleClick(_ recognizer: NSClickGestureRecognizer) {
+            guard let view = recognizer.view as? AVPlayerView else { return }
+            parent.zoom = 1.0
+            parent.pan = .zero
+            applyZoomAndPan(to: view)
+        }
+
+        func applyZoomAndPan(to view: AVPlayerView) {
+            view.wantsLayer = true
+            view.layer?.masksToBounds = true
+
+            let bounds = view.bounds
+            guard bounds.width > 0, bounds.height > 0 else { return }
+
+            let z = clampZoom(parent.zoom)
+            let p = clampPan(parent.pan, in: bounds, zoom: z)
+
+            guard let videoLayer = resolveVideoLayer(in: view) else { return }
+
+            let containerBounds = videoLayer.superlayer?.bounds ?? view.layer?.bounds ?? bounds
+            let center = CGPoint(x: containerBounds.midX, y: containerBounds.midY)
+
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            videoLayer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+            videoLayer.position = CGPoint(x: center.x + p.width, y: center.y + p.height)
+            videoLayer.setAffineTransform(CGAffineTransform(scaleX: z, y: z))
+            CATransaction.commit()
+        }
+
+        private func clampZoom(_ value: CGFloat) -> CGFloat {
+            min(max(value, parent.minZoom), parent.maxZoom)
+        }
+
+        private func clampPan(_ value: CGSize, in bounds: CGRect, zoom: CGFloat) -> CGSize {
+            if zoom <= (parent.minZoom + 0.001) { return .zero }
+            let maxX = (zoom - 1.0) * bounds.width / 2.0
+            let maxY = (zoom - 1.0) * bounds.height / 2.0
+            if maxX <= 0 || maxY <= 0 { return .zero }
+            return CGSize(
+                width: min(max(value.width, -maxX), maxX),
+                height: min(max(value.height, -maxY), maxY)
+            )
+        }
+
+        private func resolveVideoLayer(in view: AVPlayerView) -> CALayer? {
+            if let existing = resolvedVideoLayer { return existing }
+
+            if let root = view.layer {
+                if root is AVPlayerLayer {
+                    resolvedVideoLayer = root
+                    return root
+                }
+                if let found = findFirstAVPlayerLayer(in: root) {
+                    resolvedVideoLayer = found
+                    return found
+                }
+            }
+
+            return nil
+        }
+
+        private func findFirstAVPlayerLayer(in layer: CALayer) -> CALayer? {
+            if layer is AVPlayerLayer { return layer }
+            for sub in layer.sublayers ?? [] {
+                if let found = findFirstAVPlayerLayer(in: sub) {
+                    return found
+                }
+            }
+            return nil
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(parent: self, pipController: pipController) }
+
     func makeNSView(context: Context) -> AVPlayerView {
-        let playerView = AVPlayerView()
+        let playerView = ZoomableAVPlayerView()
         playerView.controlsStyle = .floating
         playerView.showsFrameSteppingButtons = false
         playerView.showsFullScreenToggleButton = true
-        
+        playerView.wantsLayer = true
+        playerView.layer?.masksToBounds = true
+
         let player = AVPlayer(url: url)
         playerView.player = player
-        
+
+        // Gestures: pinch to zoom, drag to pan, double-click to reset.
+        let magnify = NSMagnificationGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleMagnify(_:)))
+        magnify.delegate = context.coordinator
+        playerView.addGestureRecognizer(magnify)
+
+        let pan = NSPanGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handlePan(_:)))
+        pan.delegate = context.coordinator
+        pan.buttonMask = 0x1 // left mouse / primary
+        playerView.addGestureRecognizer(pan)
+
+        let doubleClick = NSClickGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleDoubleClick(_:)))
+        doubleClick.delegate = context.coordinator
+        doubleClick.numberOfClicksRequired = 2
+        playerView.addGestureRecognizer(doubleClick)
+
+        playerView.onLayout = { [weak coordinator = context.coordinator] view in
+            coordinator?.applyZoomAndPan(to: view)
+        }
+
+        context.coordinator.playerView = playerView
+
         // Auto-play
         if isPlaying {
             player.play()
         }
-        
+
         // Observer pour détecter la fin
         context.coordinator.endObserver = NotificationCenter.default.addObserver(
             forName: .AVPlayerItemDidPlayToEndTime,
@@ -192,12 +394,15 @@ struct NativeVideoPlayer: NSViewRepresentable {
                 player.play()
             }
         }
-        
+
         context.coordinator.pipController?.attach(playerView)
+        context.coordinator.applyZoomAndPan(to: playerView)
         return playerView
     }
-    
+
     func updateNSView(_ playerView: AVPlayerView, context: Context) {
+        context.coordinator.parent = self
+
         if let current = playerView.player?.currentItem?.asset as? AVURLAsset, current.url != url {
             playerView.player?.replaceCurrentItem(with: AVPlayerItem(url: url))
         }
@@ -207,13 +412,15 @@ struct NativeVideoPlayer: NSViewRepresentable {
             playerView.player?.pause()
         }
         context.coordinator.pipController?.attach(playerView)
+        context.coordinator.applyZoomAndPan(to: playerView)
     }
-    
+
     static func dismantleNSView(_ playerView: AVPlayerView, coordinator: Coordinator) {
         if let token = coordinator.endObserver {
             NotificationCenter.default.removeObserver(token)
             coordinator.endObserver = nil
         }
+        (playerView as? ZoomableAVPlayerView)?.onLayout = nil
         playerView.player?.pause()
         playerView.player = nil
         coordinator.pipController?.detach(playerView)
@@ -390,6 +597,9 @@ struct HybridTwitchView: View {
     @State private var lastChannelName: String?
     @State private var recordingError: String?
 
+    @State private var videoZoom: CGFloat = 1.0
+    @State private var videoPan: CGSize = .zero
+
     private enum ChatDisplayMode: String {
         case inline
         case hidden
@@ -413,7 +623,13 @@ struct HybridTwitchView: View {
                         ZStack(alignment: .bottom) {
                             Group {
                                 if let url = streamURL {
-                                    NativeVideoPlayer(url: url, isPlaying: $isPlaying, pipController: pipController)
+                                    NativeVideoPlayer(
+                                        url: url,
+                                        isPlaying: $isPlaying,
+                                        pipController: pipController,
+                                        zoom: $videoZoom,
+                                        pan: $videoPan
+                                    )
                                 } else if streamlink.isLoading {
                                     VStack(spacing: 12) {
                                         ProgressView()
@@ -456,6 +672,44 @@ struct HybridTwitchView: View {
                                 Text(playback.channelName ?? "Stream")
                                     .font(.system(size: 12, weight: .medium))
                                     .foregroundColor(.white.opacity(0.7))
+                                    .lineLimit(1)
+
+                                HStack(spacing: 8) {
+                                    Image(systemName: "plus.magnifyingglass")
+                                        .font(.system(size: 12, weight: .medium))
+                                        .foregroundStyle(.white.opacity(0.6))
+
+                                    Slider(
+                                        value: Binding(
+                                            get: { Double(videoZoom) },
+                                            set: { newValue in
+                                                videoZoom = CGFloat(newValue)
+                                                if videoZoom <= 1.001 {
+                                                    videoPan = .zero
+                                                }
+                                            }
+                                        ),
+                                        in: 1.0...4.0,
+                                        step: 0.05
+                                    )
+                                    .frame(width: 110)
+                                    .controlSize(.mini)
+                                    .tint(.white.opacity(0.8))
+
+                                    Text(String(format: "%.2f×", Double(videoZoom)))
+                                        .font(.system(size: 11, weight: .medium))
+                                        .foregroundStyle(.white.opacity(0.6))
+                                        .frame(width: 52, alignment: .trailing)
+
+                                    Button(action: { resetVideoZoom() }) {
+                                        Image(systemName: "arrow.counterclockwise")
+                                            .font(.system(size: 11, weight: .semibold))
+                                            .foregroundStyle(.white.opacity(0.55))
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help("Reset zoom")
+                                }
+                                .help("Pinch to zoom • Option-drag to pan • Double-click to reset")
 
                                 Spacer()
 
@@ -676,6 +930,11 @@ struct HybridTwitchView: View {
         }
     }
 
+    private func resetVideoZoom() {
+        videoZoom = 1.0
+        videoPan = .zero
+    }
+
     private func detachChat(_ channel: String) {
         if let current = detachedChannelName {
             programmaticChatCloseChannel = current
@@ -863,6 +1122,36 @@ struct ChannelInfoView: NSViewRepresentable {
             self.onRecordRequest = onRecordRequest
         }
 
+        private func log(_ message: String) {
+            print("[ChannelInfoView] \(message)")
+        }
+
+        private func debugSnapshot(_ webView: WKWebView, label: String) {
+            let url = webView.url?.absoluteString ?? "nil"
+            log("\(label) url=\(url)")
+            let js = """
+            (function() {
+              const ready = !!(document.body && document.body.classList.contains('glitcho-ready'));
+              const root = !!document.getElementById('glitcho-about-root');
+              const lastErr = window.__glitcho_lastError || null;
+              const bodyLen = (document.body && document.body.innerText) ? document.body.innerText.length : 0;
+              const title = document.title || null;
+              return { ready, root, lastErr, bodyLen, title };
+            })();
+            """
+            webView.evaluateJavaScript(js) { [weak self] result, error in
+                if let error {
+                    self?.log("debug js error: \(error.localizedDescription)")
+                    return
+                }
+                if let dict = result as? [String: Any] {
+                    self?.log("debug state: \(dict)")
+                    return
+                }
+                self?.log("debug state: \(result ?? "nil")")
+            }
+        }
+
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
             switch message.name {
             case "openSubscription":
@@ -887,6 +1176,25 @@ struct ChannelInfoView: NSViewRepresentable {
             default:
                 return
             }
+        }
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            debugSnapshot(webView, label: "didFinish")
+        }
+
+        func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+            log("didFail: \(error.localizedDescription)")
+            debugSnapshot(webView, label: "didFail")
+        }
+
+        func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+            log("didFailProvisional: \(error.localizedDescription)")
+            debugSnapshot(webView, label: "didFailProvisional")
+        }
+
+        func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+            log("webContentProcessDidTerminate")
+            debugSnapshot(webView, label: "didTerminate")
         }
 
         func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
@@ -960,7 +1268,30 @@ struct ChannelInfoView: NSViewRepresentable {
         contentController.add(context.coordinator, name: "openGiftSub")
         contentController.add(context.coordinator, name: "channelNotification")
         contentController.add(context.coordinator, name: "recordStream")
-        
+
+        let debugScript = WKUserScript(
+            source: """
+            (function() {
+              if (window.__glitcho_debug) { return; }
+              window.__glitcho_debug = true;
+              window.__glitcho_lastError = null;
+              window.addEventListener('error', function(e) {
+                try {
+                  window.__glitcho_lastError = (e.message || 'error') + ' @ ' + (e.filename || '') + ':' + (e.lineno || '') + ':' + (e.colno || '');
+                } catch (_) {}
+              });
+              window.addEventListener('unhandledrejection', function(e) {
+                try {
+                  var reason = e && e.reason;
+                  window.__glitcho_lastError = 'promise rejection: ' + (reason && reason.message ? reason.message : String(reason));
+                } catch (_) {}
+              });
+            })();
+            """,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: true
+        )
+
         let blockMediaScript = WKUserScript(
             source: """
             (function() {
@@ -1659,6 +1990,21 @@ struct ChannelInfoView: NSViewRepresentable {
             forMainFrameOnly: true
         )
 
+        let revealFallbackScript = WKUserScript(
+            source: """
+            (function() {
+              if (window.__glitcho_ready_failsafe) { return; }
+              window.__glitcho_ready_failsafe = true;
+              setTimeout(function() {
+                try { document.body && document.body.classList.add('glitcho-ready'); } catch (_) {}
+              }, 3000);
+            })();
+            """,
+            injectionTime: .atDocumentEnd,
+            forMainFrameOnly: true
+        )
+
+        contentController.addUserScript(debugScript)
         contentController.addUserScript(initialHideScript)
         contentController.addUserScript(blockMediaScript)
         contentController.addUserScript(aboutOnlyScript)
@@ -1666,6 +2012,7 @@ struct ChannelInfoView: NSViewRepresentable {
         contentController.addUserScript(giftInterceptScript)
         contentController.addUserScript(blockChannelLinksScript)
         contentController.addUserScript(channelActionsScript)
+        contentController.addUserScript(revealFallbackScript)
         
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator

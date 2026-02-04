@@ -15,6 +15,10 @@ struct RecordingsLibraryView: View {
     @ObservedObject var recordingManager: RecordingManager
     @State private var recordings: [RecordingEntry] = []
     @State private var selectedRecording: RecordingEntry?
+    @State private var playbackURL: URL?
+    @State private var isPreparingPlayback = false
+    @State private var playbackError: String?
+    @State private var thumbnailRefreshToken = UUID()
     @State private var isPlaying = true
 
     private let dateFormatter: DateFormatter = {
@@ -66,10 +70,11 @@ struct RecordingsLibraryView: View {
                                         RecordingRow(
                                             recording: recording,
                                             formattedDate: formattedDate(for: recording),
-                                            isSelected: recording == selectedRecording
+                                            isSelected: recording == selectedRecording,
+                                            thumbnailRefreshToken: thumbnailRefreshToken
                                         ) {
                                             selectedRecording = recording
-                                            isPlaying = true
+                                            prepareSelectedRecording()
                                         }
                                     }
                                 }
@@ -88,9 +93,50 @@ struct RecordingsLibraryView: View {
                 .background(Color.white.opacity(0.08))
 
             VStack(spacing: 0) {
-                if let selectedRecording {
-                    NativeVideoPlayer(url: selectedRecording.url, isPlaying: $isPlaying)
+                if selectedRecording != nil {
+                    if let playbackURL {
+                        NativeVideoPlayer(url: playbackURL, isPlaying: $isPlaying)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else if isPreparingPlayback {
+                        VStack(spacing: 10) {
+                            ProgressView()
+                                .scaleEffect(0.9)
+                                .tint(.white.opacity(0.7))
+                            Text("Preparing recording…")
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundStyle(.white.opacity(0.6))
+                        }
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(Color(red: 0.05, green: 0.05, blue: 0.07))
+                    } else if let playbackError {
+                        VStack(spacing: 10) {
+                            Image(systemName: "exclamationmark.triangle")
+                                .font(.system(size: 34, weight: .light))
+                                .foregroundStyle(Color.orange.opacity(0.9))
+                            Text("Unable to play this recording")
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundStyle(.white.opacity(0.85))
+                            Text(playbackError)
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundStyle(.white.opacity(0.55))
+                                .multilineTextAlignment(.center)
+                                .frame(maxWidth: 420)
+                        }
+                        .padding(.horizontal, 28)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(Color(red: 0.05, green: 0.05, blue: 0.07))
+                    } else {
+                        VStack(spacing: 12) {
+                            Image(systemName: "film")
+                                .font(.system(size: 48, weight: .light))
+                                .foregroundStyle(.white.opacity(0.3))
+                            Text("Select a recording to play")
+                                .font(.system(size: 13, weight: .medium))
+                                .foregroundStyle(.white.opacity(0.6))
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(Color(red: 0.05, green: 0.05, blue: 0.07))
+                    }
                 } else {
                     VStack(spacing: 12) {
                         Image(systemName: "film")
@@ -137,9 +183,68 @@ struct RecordingsLibraryView: View {
     }
 
     private func refreshRecordings() {
+        let previousURL = selectedRecording?.url
         recordings = recordingManager.listRecordings()
-        if selectedRecording == nil {
+
+        if let selected = selectedRecording, !recordings.contains(selected) {
             selectedRecording = recordings.first
+        } else if selectedRecording == nil {
+            selectedRecording = recordings.first
+        }
+
+        let newURL = selectedRecording?.url
+        let selectionChanged = previousURL != newURL
+
+        if selectionChanged {
+            playbackURL = nil
+            playbackError = nil
+        }
+
+        if playbackURL == nil, selectedRecording != nil {
+            prepareSelectedRecording()
+        }
+    }
+
+    private func prepareSelectedRecording() {
+        guard let selected = selectedRecording else {
+            playbackURL = nil
+            playbackError = nil
+            isPreparingPlayback = false
+            return
+        }
+
+        let url = selected.url
+        playbackURL = nil
+        playbackError = nil
+
+        if recordingManager.isRecording, recordingManager.lastOutputURL == url {
+            isPreparingPlayback = false
+            playbackError = "This recording is still in progress. Stop recording before playing it."
+            return
+        }
+
+        isPreparingPlayback = true
+        isPlaying = false
+
+        Task {
+            do {
+                let result = try await recordingManager.prepareRecordingForPlayback(at: url)
+                if self.selectedRecording?.url != url { return }
+
+                if result.didRemux {
+                    thumbnailRefreshToken = UUID()
+                    refreshRecordings()
+                }
+
+                playbackURL = result.url
+                isPreparingPlayback = false
+                isPlaying = true
+            } catch {
+                if self.selectedRecording?.url != url { return }
+                playbackURL = nil
+                playbackError = error.localizedDescription
+                isPreparingPlayback = false
+            }
         }
     }
 }
@@ -148,6 +253,7 @@ struct RecordingRow: View {
     let recording: RecordingEntry
     let formattedDate: String
     let isSelected: Bool
+    let thumbnailRefreshToken: UUID
     let onSelect: () -> Void
     @State private var isHovered = false
 
@@ -155,6 +261,7 @@ struct RecordingRow: View {
         Button(action: onSelect) {
             HStack(spacing: 12) {
                 RecordingThumbnailView(url: recording.url)
+                    .id("\(recording.url.path):\(thumbnailRefreshToken.uuidString)")
                     .frame(width: 120, height: 68)
                     .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
 

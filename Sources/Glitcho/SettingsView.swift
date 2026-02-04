@@ -15,7 +15,7 @@ struct SettingsModal: View {
                 .onTapGesture { }  // Absorb taps, don't close
 
             // Centered settings panel
-            SettingsView(onClose: onClose, recordingManager: recordingManager, onOpenTwitchSettings: onOpenTwitchSettings)
+            SettingsView(recordingManager: recordingManager, onClose: onClose, onOpenTwitchSettings: onOpenTwitchSettings)
                 .shadow(color: .black.opacity(0.5), radius: 40, x: 0, y: 20)
         }
     }
@@ -408,7 +408,7 @@ struct SettingsViewContent: View {
 
                             HStack {
                                 SettingsButton(
-                                    title: recordingManager.isInstalling ? "Downloading…" : "Download Streamlink",
+                                    title: recordingManager.isInstalling ? "Installing…" : "Install Streamlink",
                                     systemImage: "arrow.down.circle",
                                     style: .primary,
                                     action: {
@@ -417,6 +417,15 @@ struct SettingsViewContent: View {
                                 )
                                 .disabled(recordingManager.isInstalling)
                                 Spacer()
+                            }
+
+                            if !recordingManager.isInstalling, let status = recordingManager.installStatus {
+                                let lower = status.lowercased()
+                                let isSuccess = lower.contains("installed") || lower.contains("available")
+                                Text(status)
+                                    .font(.system(size: 10, weight: .medium))
+                                    .foregroundStyle(isSuccess ? Color.green.opacity(0.8) : Color.white.opacity(0.6))
+                                    .lineLimit(2)
                             }
 
                             if let installError = recordingManager.installError {

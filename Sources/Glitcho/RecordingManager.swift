@@ -2,6 +2,7 @@ import Foundation
 
 #if canImport(SwiftUI)
 
+@MainActor
 final class RecordingManager: ObservableObject {
     @Published var isRecording = false
     @Published var activeChannel: String?
@@ -23,9 +24,6 @@ final class RecordingManager: ObservableObject {
         return formatter
     }()
 
-    deinit {
-        stopRecording()
-    }
 
     func recordingsDirectory() -> URL {
         if let saved = UserDefaults.standard.string(forKey: "recordingsDirectory"),
@@ -108,8 +106,8 @@ final class RecordingManager: ObservableObject {
         let resolvedChannelLogin = channelLogin(from: target)
         let normalizedName = channelName?.trimmingCharacters(in: .whitespacesAndNewlines)
         let timestamp = filenameDateFormatter.string(from: Date())
-        let safeChannel = (normalizedName?.isEmpty == false ? normalizedName : resolvedChannelLogin ?? "twitch")
-            .replacingOccurrences(of: " ", with: "_")
+        let safeChannelBase = (normalizedName?.isEmpty == false ? normalizedName! : (resolvedChannelLogin ?? "twitch"))
+        let safeChannel = safeChannelBase.replacingOccurrences(of: " ", with: "_")
         let filename = "\(safeChannel)_\(timestamp).mp4"
         let outputURL = directory.appendingPathComponent(filename)
 
@@ -128,7 +126,7 @@ final class RecordingManager: ObservableObject {
         process.standardError = errorPipe
 
         process.terminationHandler = { [weak self] proc in
-            DispatchQueue.main.async {
+            Task { @MainActor in
                 guard let self else { return }
                 self.isRecording = false
                 self.activeChannel = nil
@@ -142,6 +140,15 @@ final class RecordingManager: ObservableObject {
                     self.errorMessage = message?.isEmpty == false ? message : "Recording stopped unexpectedly."
                 }
                 self.process = nil
+
+                // Streamlink outputs MPEG-TS data even when the filename ends with .mp4.
+                // Remux to a real MP4 so AVPlayer can play it.
+                let shouldAttemptFinalize = proc.terminationStatus == 0 || didUserStop
+                if shouldAttemptFinalize {
+                    Task {
+                        _ = try? await self.prepareRecordingForPlayback(at: outputURL)
+                    }
+                }
             }
         }
 
@@ -166,6 +173,98 @@ final class RecordingManager: ObservableObject {
         activeChannel = nil
         activeChannelLogin = nil
         activeChannelName = nil
+    }
+
+    /// Ensures the given recording file is playable by AVPlayer.
+    ///
+    /// Streamlink writes MPEG transport stream data to disk by default. Even if the filename
+    /// ends with `.mp4`, the file may actually be `.ts` data and will fail to play in AVPlayer.
+    /// This method detects that case and remuxes the file in-place using ffmpeg.
+    func prepareRecordingForPlayback(at url: URL) async throws -> (url: URL, didRemux: Bool) {
+        guard url.isFileURL else { return (url, false) }
+        let pathExt = url.pathExtension.lowercased()
+        guard pathExt == "mp4" else { return (url, false) }
+
+        // If the file already looks like a transport stream, remux it.
+        guard isTransportStreamFile(at: url) else { return (url, false) }
+
+        guard let ffmpegPath = resolveFFmpegPath() else {
+            throw NSError(
+                domain: "RecordingError",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "FFmpeg was not found. Set it in Settings → Recording, or install ffmpeg (e.g. via Homebrew)."]
+            )
+        }
+
+        let tempURL = uniqueTemporaryMP4URL(for: url)
+        do {
+            _ = try await runProcess(
+                executable: ffmpegPath,
+                arguments: [
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-i",
+                    url.path,
+                    "-c",
+                    "copy",
+                    "-movflags",
+                    "+faststart",
+                    "-bsf:a",
+                    "aac_adtstoasc",
+                    tempURL.path
+                ]
+            )
+
+            // Atomically replace the original file with the remuxed MP4.
+            _ = try FileManager.default.replaceItemAt(url, withItemAt: tempURL, backupItemName: nil, options: [])
+            return (url, true)
+        } catch {
+            // Best-effort cleanup.
+            try? FileManager.default.removeItem(at: tempURL)
+            throw error
+        }
+    }
+
+    private func resolveFFmpegPath() -> String? {
+        let raw = UserDefaults.standard.string(forKey: "ffmpegPath") ?? ""
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            let expanded = (trimmed as NSString).expandingTildeInPath
+            if FileManager.default.isExecutableFile(atPath: expanded) {
+                return expanded
+            }
+        }
+        return resolveExecutable(named: "ffmpeg")
+    }
+
+    private func isTransportStreamFile(at url: URL) -> Bool {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? handle.close() }
+
+        guard let data = try? handle.read(upToCount: 512),
+              !data.isEmpty else {
+            return false
+        }
+
+        func byte(at offset: Int) -> UInt8? {
+            guard offset >= 0, offset < data.count else { return nil }
+            return data[data.index(data.startIndex, offsetBy: offset)]
+        }
+
+        // MPEG-TS packets start with a sync byte 0x47 every 188 bytes.
+        guard byte(at: 0) == 0x47 else { return false }
+        if let b188 = byte(at: 188), b188 != 0x47 { return false }
+        if let b376 = byte(at: 376), b376 != 0x47 { return false }
+        return true
+    }
+
+    private func uniqueTemporaryMP4URL(for url: URL) -> URL {
+        let directory = url.deletingLastPathComponent()
+        let base = url.deletingPathExtension().lastPathComponent
+        let name = "\(base).remux-\(UUID().uuidString).mp4"
+        return directory.appendingPathComponent(name)
     }
 
     private func resolvedTarget(from target: String) -> String {
@@ -205,24 +304,65 @@ final class RecordingManager: ObservableObject {
 
     func installStreamlink() async {
         guard !isInstalling else { return }
+
         isInstalling = true
         installError = nil
-        installStatus = "Checking latest Streamlink release..."
+        installStatus = "Preparing Streamlink installer..."
+
+        defer {
+            isInstalling = false
+        }
+
+        if let detected = resolveStreamlinkPath() {
+            // Make the detected path explicit in Settings (so users can see what will be used).
+            UserDefaults.standard.set(detected, forKey: "streamlinkPath")
+            installStatus = "Streamlink is already available."
+            return
+        }
+
+        guard let pythonPath = resolvePython3Path() else {
+            installError = "Python 3 was not found. Install Streamlink with Homebrew (`brew install streamlink`) or set a custom Streamlink path."
+            installStatus = nil
+            return
+        }
 
         do {
-            let asset = try await fetchLatestStreamlinkAsset()
-            installStatus = "Downloading Streamlink..."
-            let archiveURL = try await downloadAsset(from: asset.downloadURL, filename: asset.name)
+            let installDir = streamlinkInstallDirectory()
+            try FileManager.default.createDirectory(at: installDir, withIntermediateDirectories: true)
+
+            let venvDir = installDir.appendingPathComponent("venv", isDirectory: true)
+            if !FileManager.default.fileExists(atPath: venvDir.path) {
+                installStatus = "Creating Python environment..."
+                _ = try await runProcess(executable: pythonPath, arguments: ["-m", "venv", venvDir.path])
+            }
+
+            guard let venvPython = resolveVenvPython(at: venvDir) else {
+                throw RecordingInstallError.missingBinary("python")
+            }
+
+            installStatus = "Preparing pip..."
+            _ = try? await runProcess(executable: venvPython, arguments: ["-m", "ensurepip", "--upgrade"])
+
+            let pipEnv: [String: String] = [
+                "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+                "PIP_NO_INPUT": "1"
+            ]
+
             installStatus = "Installing Streamlink..."
-            let binaryPath = try installArchive(at: archiveURL)
-            UserDefaults.standard.set(binaryPath, forKey: "streamlinkPath")
+            _ = try? await runProcess(executable: venvPython, arguments: ["-m", "pip", "install", "--upgrade", "pip"], environment: pipEnv)
+            _ = try await runProcess(executable: venvPython, arguments: ["-m", "pip", "install", "--upgrade", "streamlink"], environment: pipEnv)
+
+            let streamlinkBinary = venvDir.appendingPathComponent("bin/streamlink").path
+            guard FileManager.default.isExecutableFile(atPath: streamlinkBinary) else {
+                throw RecordingInstallError.missingBinary("streamlink")
+            }
+
+            UserDefaults.standard.set(streamlinkBinary, forKey: "streamlinkPath")
             installStatus = "Streamlink installed."
         } catch {
             installError = error.localizedDescription
             installStatus = nil
         }
-
-        isInstalling = false
     }
 
     private func bundledStreamlinkPath() -> String? {
@@ -238,135 +378,126 @@ final class RecordingManager: ObservableObject {
             .appendingPathComponent("Streamlink", isDirectory: true)
     }
 
-    private func fetchLatestStreamlinkAsset() async throws -> StreamlinkAsset {
-        let api = URL(string: "https://api.github.com/repos/streamlink/streamlink/releases/latest")!
-        let (data, _) = try await URLSession.shared.data(from: api)
-        let release = try JSONDecoder().decode(GitHubRelease.self, from: data)
-        let assets = release.assets
-        let preferred = preferredAssetMatch(from: assets)
-        guard let asset = preferred else {
-            throw RecordingInstallError.missingAsset
-        }
-        return StreamlinkAsset(name: asset.name, downloadURL: asset.browserDownloadURL)
+    private func resolvePython3Path() -> String? {
+        resolveExecutable(named: "python3")
+            ?? ["/usr/bin/python3", "/opt/homebrew/bin/python3", "/usr/local/bin/python3"].first { path in
+                FileManager.default.isExecutableFile(atPath: path)
+            }
     }
 
-    private func preferredAssetMatch(from assets: [GitHubRelease.Asset]) -> GitHubRelease.Asset? {
-        let suffix = ".zip"
-        let isAppleSilicon = (ProcessInfo.processInfo.environment["PROCESSOR_ARCHITECTURE"] ?? "").contains("ARM")
-        let preferArm = isAppleSilicon || (ProcessInfo.processInfo.machineArchitecture?.contains("arm") ?? false)
-        let filtered = assets.filter { $0.name.hasSuffix(suffix) && $0.name.lowercased().contains("macos") }
-
-        let priority = filtered.sorted { lhs, rhs in
-            scoreAsset(lhs, preferArm: preferArm) > scoreAsset(rhs, preferArm: preferArm)
-        }
-        return priority.first
-    }
-
-    private func scoreAsset(_ asset: GitHubRelease.Asset, preferArm: Bool) -> Int {
-        let name = asset.name.lowercased()
-        var score = 0
-        if name.contains("universal") { score += 4 }
-        if preferArm, name.contains("arm") { score += 3 }
-        if !preferArm, (name.contains("x86") || name.contains("intel")) { score += 3 }
-        if name.contains("macos") || name.contains("osx") { score += 2 }
-        return score
-    }
-
-    private func downloadAsset(from url: URL, filename: String) async throws -> URL {
-        let (tempURL, response) = try await URLSession.shared.download(from: url)
-        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            throw RecordingInstallError.downloadFailed
-        }
-        let destination = FileManager.default.temporaryDirectory.appendingPathComponent(filename)
-        try? FileManager.default.removeItem(at: destination)
-        try FileManager.default.moveItem(at: tempURL, to: destination)
-        return destination
-    }
-
-    private func installArchive(at archiveURL: URL) throws -> String {
-        let installDir = streamlinkInstallDirectory()
-        try FileManager.default.createDirectory(at: installDir, withIntermediateDirectories: true)
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
-        process.arguments = ["-q", archiveURL.path, "-d", installDir.path]
-        try process.run()
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else {
-            throw RecordingInstallError.unzipFailed
-        }
-
-        guard let binary = findStreamlinkBinary(in: installDir) else {
-            throw RecordingInstallError.missingBinary
-        }
-
-        let finalPath = installDir.appendingPathComponent("streamlink")
-        if FileManager.default.fileExists(atPath: finalPath.path) {
-            try? FileManager.default.removeItem(at: finalPath)
-        }
-        try FileManager.default.copyItem(at: binary, to: finalPath)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: finalPath.path)
-        return finalPath.path
-    }
-
-    private func findStreamlinkBinary(in directory: URL) -> URL? {
-        let enumerator = FileManager.default.enumerator(at: directory, includingPropertiesForKeys: [.isRegularFileKey])
-        while let fileURL = enumerator?.nextObject() as? URL {
-            if fileURL.lastPathComponent == "streamlink" {
-                return fileURL
+    private func resolveVenvPython(at venvDir: URL) -> String? {
+        let candidates = [
+            venvDir.appendingPathComponent("bin/python3").path,
+            venvDir.appendingPathComponent("bin/python").path
+        ]
+        for candidate in candidates {
+            if FileManager.default.isExecutableFile(atPath: candidate) {
+                return candidate
             }
         }
         return nil
+    }
+
+    private func resolveExecutable(named name: String) -> String? {
+        let fallbackPaths = [
+            "/opt/homebrew/bin/\(name)",
+            "/usr/local/bin/\(name)",
+            "/usr/bin/\(name)"
+        ]
+        let pathEnvironment = ProcessInfo.processInfo.environment["PATH"] ?? ""
+        let pathEntries = pathEnvironment.split(separator: ":").map(String.init)
+        let searchPaths = pathEntries + fallbackPaths
+        for directory in searchPaths {
+            let candidate = URL(fileURLWithPath: directory).appendingPathComponent(name).path
+            if FileManager.default.isExecutableFile(atPath: candidate) {
+                return candidate
+            }
+        }
+        return nil
+    }
+
+    private struct ProcessOutput {
+        let stdout: String
+        let stderr: String
+        let exitCode: Int32
+    }
+
+    private struct ProcessExecutionError: LocalizedError {
+        let executable: String
+        let arguments: [String]
+        let exitCode: Int32
+        let stdout: String
+        let stderr: String
+
+        var errorDescription: String? {
+            let command = ([executable] + arguments).joined(separator: " ")
+            let message = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+            if message.isEmpty {
+                return "Command failed (\(exitCode)): \(command)"
+            }
+            return "Command failed (\(exitCode)): \(command)\n\(message)"
+        }
+    }
+
+    private func runProcess(
+        executable: String,
+        arguments: [String],
+        environment: [String: String] = [:]
+    ) async throws -> ProcessOutput {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        process.standardOutput = outPipe
+        process.standardError = errPipe
+
+        if !environment.isEmpty {
+            process.environment = ProcessInfo.processInfo.environment.merging(environment, uniquingKeysWith: { _, new in new })
+        }
+
+        return try await withCheckedThrowingContinuation { continuation in
+            process.terminationHandler = { proc in
+                let stdoutData = outPipe.fileHandleForReading.readDataToEndOfFile()
+                let stderrData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                let stdout = String(decoding: stdoutData, as: UTF8.self)
+                let stderr = String(decoding: stderrData, as: UTF8.self)
+                let output = ProcessOutput(stdout: stdout, stderr: stderr, exitCode: proc.terminationStatus)
+
+                if proc.terminationStatus == 0 {
+                    continuation.resume(returning: output)
+                } else {
+                    continuation.resume(
+                        throwing: ProcessExecutionError(
+                            executable: executable,
+                            arguments: arguments,
+                            exitCode: proc.terminationStatus,
+                            stdout: stdout,
+                            stderr: stderr
+                        )
+                    )
+                }
+            }
+
+            do {
+                try process.run()
+            } catch {
+                continuation.resume(throwing: error)
+            }
+        }
     }
 }
 
 #endif
 
-private struct StreamlinkAsset {
-    let name: String
-    let downloadURL: URL
-}
-
 private enum RecordingInstallError: LocalizedError {
-    case missingAsset
-    case downloadFailed
-    case unzipFailed
-    case missingBinary
+    case missingBinary(String)
 
     var errorDescription: String? {
         switch self {
-        case .missingAsset:
-            return "Unable to find a macOS Streamlink download."
-        case .downloadFailed:
-            return "Failed to download Streamlink."
-        case .unzipFailed:
-            return "Failed to extract the Streamlink archive."
-        case .missingBinary:
-            return "Streamlink binary not found after extraction."
+        case .missingBinary(let name):
+            return "Streamlink install failed: expected '\(name)' executable was not found."
         }
-    }
-}
-
-private struct GitHubRelease: Decodable {
-    struct Asset: Decodable {
-        let name: String
-        let browserDownloadURL: URL
-
-        enum CodingKeys: String, CodingKey {
-            case name
-            case browserDownloadURL = "browser_download_url"
-        }
-    }
-
-    let assets: [Asset]
-}
-
-private extension ProcessInfo {
-    var machineArchitecture: String? {
-        #if os(macOS)
-        return (self.environment["HW_MACHINE"] ?? self.environment["PROCESSOR_ARCHITECTURE"])
-        #else
-        return self.environment["PROCESSOR_ARCHITECTURE"]
-        #endif
     }
 }
