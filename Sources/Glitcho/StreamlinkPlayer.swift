@@ -302,7 +302,10 @@ struct HybridTwitchView: View {
     var onOpenGiftSub: ((String) -> Void)?
     var notificationEnabled: Bool = true
     var onNotificationToggle: ((Bool) -> Void)?
+    var isRecording: Bool = false
+    var isRecordingCurrentChannel: Bool = false
     var onRecordRequest: (() -> Void)?
+    var onStopRecording: (() -> Void)?
     @Environment(\.openWindow) private var openWindow
     @StateObject private var streamlink = StreamlinkManager()
     @StateObject private var pipController = PictureInPictureController()
@@ -387,6 +390,26 @@ struct HybridTwitchView: View {
                                 Spacer()
 
                                 if playback.kind == .liveChannel, let channel = playback.channelName {
+                                    let recordDisabled = isRecording && !isRecordingCurrentChannel
+
+                                    Button(action: { onRecordRequest?() }) {
+                                        HStack(spacing: 6) {
+                                            Circle()
+                                                .fill(isRecordingCurrentChannel ? Color.red : Color.white.opacity(0.4))
+                                                .frame(width: 8, height: 8)
+                                            Text(isRecordingCurrentChannel ? "Recording" : "Record")
+                                                .font(.system(size: 11, weight: .semibold))
+                                                .foregroundStyle(.white.opacity(recordDisabled ? 0.4 : 0.9))
+                                        }
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 6)
+                                        .background(Color.white.opacity(recordDisabled ? 0.08 : 0.15))
+                                        .clipShape(Capsule())
+                                    }
+                                    .buttonStyle(.plain)
+                                    .disabled(recordDisabled)
+                                    .help(recordDisabled ? "Recording another channel" : (isRecordingCurrentChannel ? "Stop recording" : "Start recording"))
+
                                     if !isChatDetached {
                                         Button(action: { toggleChatVisibility(channel: channel) }) {
                                             Image(systemName: "sidebar.right")
@@ -534,6 +557,7 @@ struct HybridTwitchView: View {
             isPlaying = false
             streamURL = nil
             closeDetachedChat()
+            onStopRecording?()
         }
         .onReceive(NotificationCenter.default.publisher(for: .detachedChatAttachRequested)) { notification in
             guard let channel = notification.userInfo?["channel"] as? String else { return }

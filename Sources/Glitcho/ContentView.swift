@@ -3,6 +3,7 @@ import WebKit
 
 struct ContentView: View {
     @StateObject private var store = WebViewStore(url: URL(string: "https://www.twitch.tv")!)
+    @StateObject private var recordingManager = RecordingManager()
     @EnvironmentObject private var updateChecker: UpdateChecker
     @Environment(\.notificationManager) private var notificationManager
     @AppStorage("pinnedChannels") private var pinnedChannelsJSON: String = "[]"
@@ -78,8 +79,13 @@ struct ContentView: View {
                                 guard let login = playbackRequest.channelName else { return }
                                 handleChannelNotificationToggle(ChannelNotificationToggle(login: login, enabled: enabled))
                             },
+                            isRecording: recordingManager.isRecording,
+                            isRecordingCurrentChannel: isRecordingCurrentChannel(),
                             onRecordRequest: {
-                                // TODO: hook into recording pipeline
+                                handleRecordRequest()
+                            },
+                            onStopRecording: {
+                                recordingManager.stopRecording()
                             }
                         )
                     } else {
@@ -326,6 +332,47 @@ struct ContentView: View {
         guard let login = playbackRequest.channelName?.lowercased() else { return true }
         let pin = pinnedChannels.first { $0.login == login }
         return pin?.notifyEnabled ?? !liveAlertsPinnedOnly
+    }
+
+    private func isRecordingCurrentChannel() -> Bool {
+        guard let recordingTarget = recordingManager.currentTarget else { return false }
+        return normalizedStreamTarget(recordingTarget) == normalizedStreamTarget(playbackRequest.streamlinkTarget)
+    }
+
+    private func handleRecordRequest() {
+        guard playbackRequest.kind == .liveChannel, let channelName = playbackRequest.channelName else { return }
+        if recordingManager.isRecording {
+            recordingManager.stopRecording()
+            return
+        }
+
+        do {
+            let outputURL = try makeRecordingOutputURL(channelName: channelName)
+            try recordingManager.startRecording(target: playbackRequest.streamlinkTarget, quality: "best", outputURL: outputURL)
+        } catch {
+            print("[Recording] Failed to start: \(error)")
+        }
+    }
+
+    private func makeRecordingOutputURL(channelName: String) throws -> URL {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
+        let timestamp = formatter.string(from: Date())
+        let fileName = "\(channelName.lowercased())_\(timestamp).mp4"
+
+        let baseDirectory = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Movies", isDirectory: true)
+            .appendingPathComponent("Glitcho", isDirectory: true)
+        try FileManager.default.createDirectory(at: baseDirectory, withIntermediateDirectories: true)
+        return baseDirectory.appendingPathComponent(fileName)
+    }
+
+    private func normalizedStreamTarget(_ target: String) -> String {
+        let trimmed = target.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("http://") || trimmed.hasPrefix("https://") {
+            return trimmed.lowercased()
+        }
+        return "https://\(trimmed)".lowercased()
     }
 
     private func decodePinnedChannels(from json: String) -> [PinnedChannel] {
