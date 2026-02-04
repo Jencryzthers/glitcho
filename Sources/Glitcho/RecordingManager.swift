@@ -8,6 +8,7 @@ final class RecordingManager: ObservableObject {
     @Published var errorMessage: String?
 
     private var process: Process?
+    private var userInitiatedStop = false
 
     deinit {
         stopRecording()
@@ -35,6 +36,7 @@ final class RecordingManager: ObservableObject {
     func startRecording(target: String, channelName: String?, quality: String = "best") {
         guard !isRecording else { return }
         errorMessage = nil
+        userInitiatedStop = false
 
         guard let streamlinkPath = resolveStreamlinkPath() else {
             errorMessage = "Streamlink is not installed. Please install it or update the path in Settings."
@@ -74,7 +76,9 @@ final class RecordingManager: ObservableObject {
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.isRecording = false
-                if proc.terminationStatus != 0 {
+                let didUserStop = self.userInitiatedStop
+                self.userInitiatedStop = false
+                if proc.terminationStatus != 0 && !didUserStop {
                     let data = errorPipe.fileHandleForReading.readDataToEndOfFile()
                     let message = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
                     self.errorMessage = message?.isEmpty == false ? message : "Recording stopped unexpectedly."
@@ -94,6 +98,7 @@ final class RecordingManager: ObservableObject {
     }
 
     func stopRecording() {
+        userInitiatedStop = process != nil
         process?.terminate()
         process = nil
         isRecording = false
