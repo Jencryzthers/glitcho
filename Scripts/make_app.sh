@@ -4,8 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="$ROOT_DIR/Build"
 APP_NAME="Glitcho"
-APP_VERSION="1.0.3"
-APP_BUILD="103"
+APP_VERSION="1.0.4"
+APP_BUILD="104"
 APP_DIR="$BUILD_DIR/${APP_NAME}.app"
 
 swift build -c release --package-path "$ROOT_DIR"

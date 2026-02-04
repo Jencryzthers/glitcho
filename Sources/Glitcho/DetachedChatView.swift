@@ -1,3 +1,4 @@
+#if canImport(SwiftUI)
 import AppKit
 import SwiftUI
 
@@ -136,3 +137,5 @@ extension Notification.Name {
     static let detachedChatDidClose = Notification.Name("glitcho.detachedChatDidClose")
     static let detachedChatAttachRequested = Notification.Name("glitcho.detachedChatAttachRequested")
 }
+
+#endif
