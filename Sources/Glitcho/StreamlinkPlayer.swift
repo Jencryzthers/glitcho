@@ -1862,22 +1862,25 @@ struct ChannelInfoView: NSViewRepresentable {
                     }
 
                     const actionsClone = cloneActions();
-                    if (!actionsClone) { return false; }
 
                     try {
                         const root = document.createElement('div');
                         root.id = 'glitcho-about-root';
                         const shell = document.createElement('div');
                         shell.setAttribute('data-glitcho-about-block', '1');
-                        actionsClone.setAttribute('data-glitcho-actions', '1');
-                        actionsClone.style.marginBottom = '14px';
+                        if (actionsClone) {
+                            actionsClone.setAttribute('data-glitcho-actions', '1');
+                            actionsClone.style.marginBottom = '14px';
+                        }
 
                         const contentWrapper = document.createElement('div');
                         contentWrapper.setAttribute('data-glitcho-about-content', '1');
                         const rawHTML = sanitizeHTML(container.innerHTML || container.outerHTML || '');
                         contentWrapper.innerHTML = rawHTML;
 
-                        shell.appendChild(actionsClone);
+                        if (actionsClone) {
+                            shell.appendChild(actionsClone);
+                        }
                         shell.appendChild(contentWrapper);
                         root.appendChild(shell);
                         document.body.innerHTML = '';
@@ -1999,6 +2002,11 @@ struct ChannelInfoView: NSViewRepresentable {
                     if (ok || tries >= maxTries) {
                         clearInterval(timer);
                         document.body.classList.add('glitcho-ready');
+                        if (!ok) {
+                            try {
+                                document.body.style.opacity = '1';
+                            } catch (_) {}
+                        }
                     }
                 }, 200);
             })();
