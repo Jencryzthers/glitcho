@@ -1294,93 +1294,102 @@ struct ChannelAboutPanelView: View {
     let onOpenSubscription: () -> Void
     let onOpenGiftSub: () -> Void
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack {
-                Text("About \(channelName)")
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundColor(.white.opacity(0.9))
-                Spacer()
-                Button("Subscribe", action: onOpenSubscription)
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                Button("Gift Sub", action: onOpenGiftSub)
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-            }
+    private let gridColumns = [
+        GridItem(.adaptive(minimum: 240, maximum: 360), spacing: 16, alignment: .top)
+    ]
 
-            if store.isLoading && store.panels.isEmpty {
-                HStack(spacing: 8) {
-                    ProgressView()
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                HStack {
+                    Text("About \(channelName)")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.9))
+                    Spacer()
+                    Button("Subscribe", action: onOpenSubscription)
+                        .buttonStyle(.bordered)
                         .controlSize(.small)
-                    Text("Loading channel info…")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundColor(.white.opacity(0.6))
+                    Button("Gift Sub", action: onOpenGiftSub)
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
                 }
-            } else if store.panels.isEmpty {
-                Text("No channel panels found yet.")
-                    .font(.system(size: 12))
-                    .foregroundColor(.white.opacity(0.6))
-            } else {
-                ForEach(store.panels) { panel in
-                    VStack(alignment: .leading, spacing: 8) {
-                    if !panel.title.isEmpty {
-                        Text(panel.title)
-                            .font(.system(size: 13, weight: .semibold))
-                            .foregroundColor(.white.opacity(0.9))
+
+                if store.isLoading && store.panels.isEmpty {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Loading channel info…")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundColor(.white.opacity(0.6))
                     }
-                    if let imageURL = panel.imageURL {
-                        AsyncImage(url: imageURL) { image in
-                            image
-                                .resizable()
-                                .scaledToFit()
-                                .frame(maxHeight: 140)
-                                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                        } placeholder: {
-                            Color.white.opacity(0.08)
-                                .frame(height: 100)
-                                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                        }
-                    }
-                    if !panel.body.isEmpty {
-                        Text(panel.body)
-                            .font(.system(size: 12))
-                            .foregroundColor(.white.opacity(0.75))
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    if !panel.links.isEmpty {
-                        VStack(alignment: .leading, spacing: 6) {
-                            ForEach(panel.links) { link in
-                                HStack(spacing: 8) {
-                                    if let imageURL = link.imageURL {
-                                        AsyncImage(url: imageURL) { image in
-                                            image
-                                                .resizable()
-                                                .scaledToFill()
-                                                .frame(width: 42, height: 42)
-                                                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                                        } placeholder: {
-                                            Color.white.opacity(0.08)
-                                                .frame(width: 42, height: 42)
-                                                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                } else if store.panels.isEmpty {
+                    Text("No channel panels found yet.")
+                        .font(.system(size: 12))
+                        .foregroundColor(.white.opacity(0.6))
+                } else {
+                    LazyVGrid(columns: gridColumns, alignment: .leading, spacing: 16) {
+                        ForEach(store.panels) { panel in
+                            VStack(alignment: .leading, spacing: 10) {
+                                if !panel.title.isEmpty {
+                                    Text(panel.title)
+                                        .font(.system(size: 13, weight: .semibold))
+                                        .foregroundColor(.white.opacity(0.9))
+                                }
+                                if let imageURL = panel.imageURL {
+                                    AsyncImage(url: imageURL) { image in
+                                        image
+                                            .resizable()
+                                            .scaledToFit()
+                                            .frame(maxHeight: 160)
+                                            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                    } placeholder: {
+                                        Color.white.opacity(0.08)
+                                            .frame(height: 110)
+                                            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                    }
+                                }
+                                if !panel.body.isEmpty {
+                                    Text(panel.body)
+                                        .font(.system(size: 12))
+                                        .foregroundColor(.white.opacity(0.75))
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                                if !panel.links.isEmpty {
+                                    VStack(alignment: .leading, spacing: 8) {
+                                        ForEach(panel.links) { link in
+                                            HStack(spacing: 8) {
+                                                if let imageURL = link.imageURL {
+                                                    AsyncImage(url: imageURL) { image in
+                                                        image
+                                                            .resizable()
+                                                            .scaledToFill()
+                                                            .frame(width: 42, height: 42)
+                                                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                                                    } placeholder: {
+                                                        Color.white.opacity(0.08)
+                                                            .frame(width: 42, height: 42)
+                                                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                                                    }
+                                                }
+                                                Link(link.title, destination: link.url)
+                                                    .font(.system(size: 12, weight: .medium))
+                                                    .foregroundColor(.purple.opacity(0.9))
+                                            }
                                         }
                                     }
-                                    Link(link.title, destination: link.url)
-                                        .font(.system(size: 12, weight: .medium))
-                                        .foregroundColor(.purple.opacity(0.9))
                                 }
                             }
+                            .padding(12)
+                            .frame(maxWidth: .infinity, alignment: .topLeading)
+                            .background(Color.white.opacity(0.06))
+                            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                         }
                     }
-                    }
-                    .padding(12)
-                    .background(Color.white.opacity(0.06))
-                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                 }
             }
+            .padding(16)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
         }
-        .padding(16)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .fill(Color.white.opacity(0.04))
