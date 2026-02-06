@@ -1091,6 +1091,7 @@ struct ChannelAboutPanel: Identifiable, Hashable {
     let id = UUID()
     let title: String
     let body: String
+    let imageURL: URL?
     let links: [ChannelAboutLink]
 }
 
@@ -1098,6 +1099,7 @@ struct ChannelAboutLink: Identifiable, Hashable {
     let id = UUID()
     let title: String
     let url: URL
+    let imageURL: URL?
 }
 
 final class ChannelAboutStore: NSObject, ObservableObject, WKNavigationDelegate, WKScriptMessageHandler {
@@ -1170,13 +1172,15 @@ final class ChannelAboutStore: NSObject, ObservableObject, WKNavigationDelegate,
               document.querySelector('[data-a-target="channel-info-content"]') ||
               document.querySelector('section[aria-label*="About"]') ||
               document.querySelector('section[aria-label*="À propos"]') ||
-              document.querySelector('section[aria-label*="A propos"]');
+              document.querySelector('section[aria-label*="A propos"]') ||
+              document.querySelector('main') ||
+              document.querySelector('[role="main"]');
           }
 
           function extractPanels() {
             const container = findContainer();
             if (!container) { return []; }
-            let panelNodes = Array.from(container.querySelectorAll('[data-test-selector="channel-panel"], [data-a-target="channel-panel"]'));
+            let panelNodes = Array.from(container.querySelectorAll('[data-test-selector="channel-panel"], [data-a-target="channel-panel"], [data-test-selector*="panel"], [data-a-target*="panel"]'));
             if (!panelNodes.length) {
               panelNodes = Array.from(container.querySelectorAll('section'));
             }
@@ -1197,15 +1201,20 @@ final class ChannelAboutStore: NSObject, ObservableObject, WKNavigationDelegate,
               const body = trim(bodyEl ? bodyEl.textContent : '');
               if (!title && !body) { continue; }
 
+              const imageEl = panel.querySelector('img[src]');
+              const imageURL = imageEl ? imageEl.getAttribute('src') || '' : '';
+
               const linkNodes = Array.from(panel.querySelectorAll('a[href]'));
               const links = linkNodes.map(link => {
+                const linkImage = link.querySelector('img[src]');
                 return {
                   title: trim(link.textContent || link.getAttribute('href') || ''),
-                  url: link.getAttribute('href') || ''
+                  url: link.getAttribute('href') || '',
+                  imageURL: linkImage ? (linkImage.getAttribute('src') || '') : ''
                 };
               }).filter(item => item.url);
 
-              panels.push({ title: title, body: body, links: links });
+              panels.push({ title: title, body: body, imageURL: imageURL, links: links });
             }
 
             return panels;
@@ -1242,14 +1251,18 @@ final class ChannelAboutStore: NSObject, ObservableObject, WKNavigationDelegate,
         let panels = items.compactMap { item -> ChannelAboutPanel? in
             let title = (item["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let body = (item["body"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let imageURLString = (item["imageURL"] as? String) ?? ""
+            let imageURL = imageURLString.isEmpty ? nil : URL(string: imageURLString)
             let linkItems = item["links"] as? [[String: String]] ?? []
             let links = linkItems.compactMap { link -> ChannelAboutLink? in
                 guard let urlString = link["url"], let url = URL(string: urlString) else { return nil }
                 let label = (link["title"] ?? urlString).trimmingCharacters(in: .whitespacesAndNewlines)
-                return ChannelAboutLink(title: label.isEmpty ? urlString : label, url: url)
+                let linkImageString = (link["imageURL"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                let linkImageURL = linkImageString.isEmpty ? nil : URL(string: linkImageString)
+                return ChannelAboutLink(title: label.isEmpty ? urlString : label, url: url, imageURL: linkImageURL)
             }
             guard !title.isEmpty || !body.isEmpty || !links.isEmpty else { return nil }
-            return ChannelAboutPanel(title: title, body: body, links: links)
+            return ChannelAboutPanel(title: title, body: body, imageURL: imageURL, links: links)
         }
 
         DispatchQueue.main.async {
@@ -1264,12 +1277,14 @@ struct ChannelAboutScraperView: NSViewRepresentable {
 
     func makeNSView(context: Context) -> WKWebView {
         let view = store.attachWebView()
-        view.isHidden = true
+        view.isHidden = false
+        view.alphaValue = 0.0
         return view
     }
 
     func updateNSView(_ nsView: WKWebView, context: Context) {
-        nsView.isHidden = true
+        nsView.isHidden = false
+        nsView.alphaValue = 0.0
     }
 }
 
@@ -1309,26 +1324,54 @@ struct ChannelAboutPanelView: View {
             } else {
                 ForEach(store.panels) { panel in
                     VStack(alignment: .leading, spacing: 8) {
-                        if !panel.title.isEmpty {
-                            Text(panel.title)
-                                .font(.system(size: 13, weight: .semibold))
-                                .foregroundColor(.white.opacity(0.9))
+                    if !panel.title.isEmpty {
+                        Text(panel.title)
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundColor(.white.opacity(0.9))
+                    }
+                    if let imageURL = panel.imageURL {
+                        AsyncImage(url: imageURL) { image in
+                            image
+                                .resizable()
+                                .scaledToFit()
+                                .frame(maxHeight: 140)
+                                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        } placeholder: {
+                            Color.white.opacity(0.08)
+                                .frame(height: 100)
+                                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                         }
-                        if !panel.body.isEmpty {
-                            Text(panel.body)
-                                .font(.system(size: 12))
-                                .foregroundColor(.white.opacity(0.75))
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                        if !panel.links.isEmpty {
-                            VStack(alignment: .leading, spacing: 6) {
-                                ForEach(panel.links) { link in
+                    }
+                    if !panel.body.isEmpty {
+                        Text(panel.body)
+                            .font(.system(size: 12))
+                            .foregroundColor(.white.opacity(0.75))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    if !panel.links.isEmpty {
+                        VStack(alignment: .leading, spacing: 6) {
+                            ForEach(panel.links) { link in
+                                HStack(spacing: 8) {
+                                    if let imageURL = link.imageURL {
+                                        AsyncImage(url: imageURL) { image in
+                                            image
+                                                .resizable()
+                                                .scaledToFill()
+                                                .frame(width: 42, height: 42)
+                                                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                                        } placeholder: {
+                                            Color.white.opacity(0.08)
+                                                .frame(width: 42, height: 42)
+                                                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                                        }
+                                    }
                                     Link(link.title, destination: link.url)
                                         .font(.system(size: 12, weight: .medium))
                                         .foregroundColor(.purple.opacity(0.9))
                                 }
                             }
                         }
+                    }
                     }
                     .padding(12)
                     .background(Color.white.opacity(0.06))
