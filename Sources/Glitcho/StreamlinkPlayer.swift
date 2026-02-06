@@ -1598,14 +1598,14 @@ struct ChannelInfoView: NSViewRepresentable {
             forMainFrameOnly: true
         )
 
-        // Script to hide page until customization is done (with failsafe).
+        // Keep page visible; extraction runs opportunistically.
         let initialHideScript = WKUserScript(
             source: """
             (function() {
               if (document.getElementById('glitcho-channel-hide')) { return; }
               const style = document.createElement('style');
               style.id = 'glitcho-channel-hide';
-              style.textContent = 'html { background: transparent !important; } body { opacity: 0 !important; transition: opacity 0.12s ease-out !important; } body.glitcho-ready { opacity: 1 !important; }';
+              style.textContent = 'html { background: transparent !important; } body { opacity: 1 !important; } body.glitcho-ready { opacity: 1 !important; }';
               document.documentElement.appendChild(style);
             })();
             """,
