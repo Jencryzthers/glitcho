@@ -599,6 +599,7 @@ struct HybridTwitchView: View {
 
     @State private var videoZoom: CGFloat = 1.0
     @State private var videoPan: CGSize = .zero
+    @StateObject private var aboutStore = ChannelAboutStore()
 
     private enum ChatDisplayMode: String {
         case inline
@@ -796,22 +797,11 @@ struct HybridTwitchView: View {
                         )
 
                     if let channel = playback.channelName {
-                        // Vue "section du bas" Twitch (About/Schedule/Videos) sans player/chat.
-                        // Intercepte les clips/VODs pour ne changer que le flux du player natif.
-                        ChannelInfoView(
+                        ChannelAboutPanelView(
                             channelName: channel,
+                            store: aboutStore,
                             onOpenSubscription: { onOpenSubscription?(channel) },
-                            onOpenGiftSub: { onOpenGiftSub?(channel) },
-                            onSelectPlayback: { request in
-                                playback = request
-                            },
-                            notificationEnabled: notificationEnabled,
-                            onNotificationToggle: { enabled in
-                                onNotificationToggle?(enabled)
-                            },
-                            onRecordRequest: {
-                                onRecordRequest?()
-                            }
+                            onOpenGiftSub: { onOpenGiftSub?(channel) }
                         )
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .layoutPriority(0)
@@ -846,6 +836,7 @@ struct HybridTwitchView: View {
             lastChannelName = playback.channelName
             if playback.kind == .liveChannel, let channel = playback.channelName {
                 applyChatPreference(for: channel)
+                aboutStore.load(channelName: channel)
             } else {
                 showChat = false
             }
@@ -860,6 +851,7 @@ struct HybridTwitchView: View {
                 lastChannelName = newValue.channelName
                 if newValue.kind == .liveChannel, let channel = newValue.channelName {
                     applyChatPreference(for: channel)
+                    aboutStore.load(channelName: channel)
                 } else {
                     showChat = false
                     closeDetachedChat()
@@ -1091,6 +1083,278 @@ struct TwitchChatView: NSViewRepresentable {
         let chatURL = URL(string: "https://www.twitch.tv/embed/\(channelName)/chat?parent=localhost&darkpopout")!
         if nsView.url?.host != chatURL.host || !(nsView.url?.absoluteString.contains("/embed/\(channelName)/chat") ?? false) {
             nsView.load(URLRequest(url: chatURL))
+        }
+    }
+}
+
+struct ChannelAboutPanel: Identifiable, Hashable {
+    let id = UUID()
+    let title: String
+    let body: String
+    let links: [ChannelAboutLink]
+}
+
+struct ChannelAboutLink: Identifiable, Hashable {
+    let id = UUID()
+    let title: String
+    let url: URL
+}
+
+final class ChannelAboutStore: NSObject, ObservableObject, WKNavigationDelegate, WKScriptMessageHandler {
+    @Published var panels: [ChannelAboutPanel] = []
+    @Published var isLoading = false
+    @Published var lastError: String?
+
+    private var webView: WKWebView?
+    private var currentChannel: String?
+
+    override init() {
+        super.init()
+        webView = makeWebView()
+    }
+
+    func attachWebView() -> WKWebView {
+        if let webView { return webView }
+        let view = makeWebView()
+        webView = view
+        return view
+    }
+
+    func load(channelName: String) {
+        let normalized = channelName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return }
+        guard normalized != currentChannel else { return }
+        currentChannel = normalized
+        isLoading = true
+        lastError = nil
+        panels = []
+        let url = URL(string: "https://www.twitch.tv/\(normalized)/about")!
+        webView?.load(URLRequest(url: url))
+    }
+
+    private func makeWebView() -> WKWebView {
+        let config = WKWebViewConfiguration()
+        let contentController = WKUserContentController()
+        config.userContentController = contentController
+        config.websiteDataStore = .default()
+        config.defaultWebpagePreferences.allowsContentJavaScript = true
+        config.mediaTypesRequiringUserActionForPlayback = [.audio, .video]
+
+        contentController.add(self, name: "aboutPanels")
+        contentController.addUserScript(Self.scrapePanelsScript)
+
+        let webView = WKWebView(frame: .zero, configuration: config)
+        webView.navigationDelegate = self
+        webView.setValue(false, forKey: "drawsBackground")
+        if #available(macOS 12.0, *) {
+            webView.underPageBackgroundColor = .clear
+        }
+        webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15"
+        return webView
+    }
+
+    private static let scrapePanelsScript = WKUserScript(
+        source: """
+        (function() {
+          if (window.__glitcho_about_scrape) { return; }
+          window.__glitcho_about_scrape = true;
+
+          function trim(s) {
+            return (s || '').replace(/\\s+/g, ' ').trim();
+          }
+
+          function findContainer() {
+            return document.querySelector('[data-test-selector="channel-panels"]') ||
+              document.querySelector('[data-a-target="channel-panels"]') ||
+              document.querySelector('[data-test-selector="channel-info-content"]') ||
+              document.querySelector('[data-a-target="channel-info-content"]') ||
+              document.querySelector('section[aria-label*="About"]') ||
+              document.querySelector('section[aria-label*="À propos"]') ||
+              document.querySelector('section[aria-label*="A propos"]');
+          }
+
+          function extractPanels() {
+            const container = findContainer();
+            if (!container) { return []; }
+            let panelNodes = Array.from(container.querySelectorAll('[data-test-selector="channel-panel"], [data-a-target="channel-panel"]'));
+            if (!panelNodes.length) {
+              panelNodes = Array.from(container.querySelectorAll('section'));
+            }
+            if (!panelNodes.length) {
+              panelNodes = Array.from(container.children || []);
+            }
+
+            const panels = [];
+            for (const panel of panelNodes) {
+              const titleEl = panel.querySelector('[data-test-selector="channel-panel-title"]') ||
+                panel.querySelector('h1,h2,h3,[role="heading"]');
+              const title = trim(titleEl ? titleEl.textContent : '');
+
+              let bodyEl = panel.querySelector('[data-test-selector="channel-panel-content"]') ||
+                panel.querySelector('[data-a-target="channel-panel-content"]') ||
+                panel.querySelector('p') ||
+                panel;
+              const body = trim(bodyEl ? bodyEl.textContent : '');
+              if (!title && !body) { continue; }
+
+              const linkNodes = Array.from(panel.querySelectorAll('a[href]'));
+              const links = linkNodes.map(link => {
+                return {
+                  title: trim(link.textContent || link.getAttribute('href') || ''),
+                  url: link.getAttribute('href') || ''
+                };
+              }).filter(item => item.url);
+
+              panels.push({ title: title, body: body, links: links });
+            }
+
+            return panels;
+          }
+
+          function postPanels() {
+            const panels = extractPanels();
+            try {
+              window.webkit.messageHandlers.aboutPanels.postMessage({ panels: panels });
+            } catch (_) {}
+          }
+
+          postPanels();
+          const observer = new MutationObserver(postPanels);
+          observer.observe(document.documentElement, { childList: true, subtree: true });
+          setTimeout(postPanels, 1000);
+          setTimeout(postPanels, 2000);
+          setTimeout(postPanels, 4000);
+        })();
+        """,
+        injectionTime: .atDocumentEnd,
+        forMainFrameOnly: true
+    )
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        webView.evaluateJavaScript("window.__glitcho_about_scrape && true;", completionHandler: nil)
+    }
+
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard message.name == "aboutPanels" else { return }
+        guard let dict = message.body as? [String: Any] else { return }
+        guard let items = dict["panels"] as? [[String: Any]] else { return }
+
+        let panels = items.compactMap { item -> ChannelAboutPanel? in
+            let title = (item["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let body = (item["body"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let linkItems = item["links"] as? [[String: String]] ?? []
+            let links = linkItems.compactMap { link -> ChannelAboutLink? in
+                guard let urlString = link["url"], let url = URL(string: urlString) else { return nil }
+                let label = (link["title"] ?? urlString).trimmingCharacters(in: .whitespacesAndNewlines)
+                return ChannelAboutLink(title: label.isEmpty ? urlString : label, url: url)
+            }
+            guard !title.isEmpty || !body.isEmpty || !links.isEmpty else { return nil }
+            return ChannelAboutPanel(title: title, body: body, links: links)
+        }
+
+        DispatchQueue.main.async {
+            self.panels = panels
+            self.isLoading = false
+        }
+    }
+}
+
+struct ChannelAboutScraperView: NSViewRepresentable {
+    @ObservedObject var store: ChannelAboutStore
+
+    func makeNSView(context: Context) -> WKWebView {
+        let view = store.attachWebView()
+        view.isHidden = true
+        return view
+    }
+
+    func updateNSView(_ nsView: WKWebView, context: Context) {
+        nsView.isHidden = true
+    }
+}
+
+struct ChannelAboutPanelView: View {
+    let channelName: String
+    @ObservedObject var store: ChannelAboutStore
+    let onOpenSubscription: () -> Void
+    let onOpenGiftSub: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                Text("About \(channelName)")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.9))
+                Spacer()
+                Button("Subscribe", action: onOpenSubscription)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                Button("Gift Sub", action: onOpenGiftSub)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+            }
+
+            if store.isLoading && store.panels.isEmpty {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Loading channel info…")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(.white.opacity(0.6))
+                }
+            } else if store.panels.isEmpty {
+                Text("No channel panels found yet.")
+                    .font(.system(size: 12))
+                    .foregroundColor(.white.opacity(0.6))
+            } else {
+                ForEach(store.panels) { panel in
+                    VStack(alignment: .leading, spacing: 8) {
+                        if !panel.title.isEmpty {
+                            Text(panel.title)
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundColor(.white.opacity(0.9))
+                        }
+                        if !panel.body.isEmpty {
+                            Text(panel.body)
+                                .font(.system(size: 12))
+                                .foregroundColor(.white.opacity(0.75))
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        if !panel.links.isEmpty {
+                            VStack(alignment: .leading, spacing: 6) {
+                                ForEach(panel.links) { link in
+                                    Link(link.title, destination: link.url)
+                                        .font(.system(size: 12, weight: .medium))
+                                        .foregroundColor(.purple.opacity(0.9))
+                                }
+                            }
+                        }
+                    }
+                    .padding(12)
+                    .background(Color.white.opacity(0.06))
+                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                }
+            }
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(Color.white.opacity(0.04))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                )
+        )
+        .overlay(
+            ChannelAboutScraperView(store: store)
+                .frame(width: 0, height: 0)
+        )
+        .onAppear {
+            store.load(channelName: channelName)
+        }
+        .onChange(of: channelName) { newValue in
+            store.load(channelName: newValue)
         }
     }
 }
