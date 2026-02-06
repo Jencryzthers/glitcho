@@ -61,8 +61,7 @@ The app bundle is created at `Build/Glitcho.app`.
 
 ## Known Issues
 
-- The About/Schedule/Videos section under the native player may stay blank (black area).
-- FFmpeg may not be recognized in the Recording settings page, which can prevent remuxing recordings for playback.
+- If recordings won't play back, make sure FFmpeg is set in Settings > Recording (you can now install it from there).
 
 ## Privacy
 

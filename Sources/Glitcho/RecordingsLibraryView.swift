@@ -21,6 +21,10 @@ struct RecordingsLibraryView: View {
     @State private var thumbnailRefreshToken = UUID()
     @State private var isPlaying = true
 
+    @State private var recordingPendingDeletion: RecordingEntry?
+    @State private var deletionError: String?
+    @State private var isShowingDeletionError = false
+
     private let dateFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateStyle = .medium
@@ -67,15 +71,22 @@ struct RecordingsLibraryView: View {
                                         .padding(.horizontal, 16)
 
                                     ForEach(group.items) { recording in
+                                        let isDeleteDisabled = recordingManager.isRecording && recordingManager.lastOutputURL == recording.url
+
                                         RecordingRow(
                                             recording: recording,
                                             formattedDate: formattedDate(for: recording),
                                             isSelected: recording == selectedRecording,
-                                            thumbnailRefreshToken: thumbnailRefreshToken
-                                        ) {
-                                            selectedRecording = recording
-                                            prepareSelectedRecording()
-                                        }
+                                            thumbnailRefreshToken: thumbnailRefreshToken,
+                                            isDeleteDisabled: isDeleteDisabled,
+                                            onSelect: {
+                                                selectedRecording = recording
+                                                prepareSelectedRecording()
+                                            },
+                                            onDelete: {
+                                                recordingPendingDeletion = recording
+                                            }
+                                        )
                                     }
                                 }
                             }
@@ -155,6 +166,33 @@ struct RecordingsLibraryView: View {
         .onAppear {
             refreshRecordings()
         }
+        .confirmationDialog(
+            "Delete recording?",
+            isPresented: Binding(
+                get: { recordingPendingDeletion != nil },
+                set: { isPresented in
+                    if !isPresented { recordingPendingDeletion = nil }
+                }
+            ),
+            presenting: recordingPendingDeletion
+        ) { recording in
+            Button("Move to Trash", role: .destructive) {
+                performDelete(recording)
+            }
+            Button("Cancel", role: .cancel) {
+                recordingPendingDeletion = nil
+            }
+        } message: { recording in
+            Text("This will move \(recording.url.lastPathComponent) to the Trash.")
+        }
+        .alert(
+            "Couldn't delete recording",
+            isPresented: $isShowingDeletionError
+        ) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(deletionError ?? "Unknown error")
+        }
     }
 
     private var groupedRecordings: [(channel: String, items: [RecordingEntry])] {
@@ -202,6 +240,28 @@ struct RecordingsLibraryView: View {
 
         if playbackURL == nil, selectedRecording != nil {
             prepareSelectedRecording()
+        }
+    }
+
+    private func performDelete(_ recording: RecordingEntry) {
+        recordingPendingDeletion = nil
+
+        do {
+            try recordingManager.deleteRecording(at: recording.url)
+
+            if selectedRecording == recording {
+                selectedRecording = nil
+                playbackURL = nil
+                playbackError = nil
+                isPreparingPlayback = false
+                isPlaying = false
+            }
+
+            thumbnailRefreshToken = UUID()
+            refreshRecordings()
+        } catch {
+            deletionError = error.localizedDescription
+            isShowingDeletionError = true
         }
     }
 
@@ -254,36 +314,49 @@ struct RecordingRow: View {
     let formattedDate: String
     let isSelected: Bool
     let thumbnailRefreshToken: UUID
+    let isDeleteDisabled: Bool
     let onSelect: () -> Void
+    let onDelete: () -> Void
     @State private var isHovered = false
 
     var body: some View {
-        Button(action: onSelect) {
-            HStack(spacing: 12) {
-                RecordingThumbnailView(url: recording.url)
-                    .id("\(recording.url.path):\(thumbnailRefreshToken.uuidString)")
-                    .frame(width: 120, height: 68)
-                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        HStack(spacing: 12) {
+            RecordingThumbnailView(url: recording.url)
+                .id("\(recording.url.path):\(thumbnailRefreshToken.uuidString)")
+                .frame(width: 120, height: 68)
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
 
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(recording.channelName)
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(.white)
-                    Text(formattedDate)
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.5))
-                }
-
-                Spacer()
+            VStack(alignment: .leading, spacing: 6) {
+                Text(recording.channelName)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.white)
+                Text(formattedDate)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.5))
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 8)
-            .background(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(isSelected ? Color.white.opacity(0.08) : Color.clear)
-            )
+
+            Spacer()
+
+            Button(action: onDelete) {
+                Image(systemName: "trash")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(isDeleteDisabled ? Color.white.opacity(0.15) : Color.red.opacity(0.85))
+            }
+            .buttonStyle(.plain)
+            .disabled(isDeleteDisabled)
+            .help(isDeleteDisabled ? "Stop recording to delete" : "Delete recording")
+            .opacity((isHovered || isSelected) ? 1.0 : 0.0)
         }
-        .buttonStyle(.plain)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(isSelected ? Color.white.opacity(0.08) : Color.clear)
+        )
+        .contentShape(Rectangle())
+        .onTapGesture {
+            onSelect()
+        }
         .onHover { hovering in
             withAnimation(.easeOut(duration: 0.12)) {
                 isHovered = hovering

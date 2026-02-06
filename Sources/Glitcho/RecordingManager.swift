@@ -15,6 +15,10 @@ final class RecordingManager: ObservableObject {
     @Published var installStatus: String?
     @Published var installError: String?
 
+    @Published var isInstallingFFmpeg = false
+    @Published var ffmpegInstallStatus: String?
+    @Published var ffmpegInstallError: String?
+
     private var process: Process?
     private var userInitiatedStop = false
     private let filenameDateFormatter: DateFormatter = {
@@ -24,6 +28,8 @@ final class RecordingManager: ObservableObject {
         return formatter
     }()
 
+    /// Override ffmpeg path resolution (primarily for unit tests).
+    var _resolveFFmpegPathOverride: (() -> String?)?
 
     func recordingsDirectory() -> URL {
         if let saved = UserDefaults.standard.string(forKey: "recordingsDirectory"),
@@ -75,6 +81,32 @@ final class RecordingManager: ObservableObject {
             case (.none, .none):
                 return left.url.lastPathComponent < right.url.lastPathComponent
             }
+        }
+    }
+
+    func deleteRecording(at url: URL) throws {
+        guard url.isFileURL else {
+            throw NSError(
+                domain: "RecordingError",
+                code: 10,
+                userInfo: [NSLocalizedDescriptionKey: "Recording path is invalid."]
+            )
+        }
+
+        if isRecording, lastOutputURL == url {
+            throw NSError(
+                domain: "RecordingError",
+                code: 11,
+                userInfo: [NSLocalizedDescriptionKey: "This recording is still in progress. Stop recording before deleting it."]
+            )
+        }
+
+        // Prefer moving to Trash to avoid accidental data loss.
+        do {
+            _ = try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+        } catch {
+            // Fallback: if Trash isn't available for some reason, attempt a hard delete.
+            try FileManager.default.removeItem(at: url)
         }
     }
     func toggleRecording(target: String, channelName: String?, quality: String = "best") {
@@ -228,6 +260,10 @@ final class RecordingManager: ObservableObject {
     }
 
     private func resolveFFmpegPath() -> String? {
+        if let override = _resolveFFmpegPathOverride {
+            return override()
+        }
+
         let raw = UserDefaults.standard.string(forKey: "ffmpegPath") ?? ""
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty {
@@ -239,7 +275,7 @@ final class RecordingManager: ObservableObject {
         return resolveExecutable(named: "ffmpeg")
     }
 
-    private func isTransportStreamFile(at url: URL) -> Bool {
+    func isTransportStreamFile(at url: URL) -> Bool {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
         defer { try? handle.close() }
 
@@ -365,6 +401,146 @@ final class RecordingManager: ObservableObject {
         }
     }
 
+    func installFFmpeg() async {
+        guard !isInstallingFFmpeg else { return }
+
+        isInstallingFFmpeg = true
+        ffmpegInstallError = nil
+        ffmpegInstallStatus = "Preparing FFmpeg installer..."
+
+        defer {
+            isInstallingFFmpeg = false
+        }
+
+        if let detected = resolveFFmpegPath() {
+            // Make the detected path explicit in Settings (so users can see what will be used).
+            UserDefaults.standard.set(detected, forKey: "ffmpegPath")
+            ffmpegInstallStatus = "FFmpeg is already available."
+            return
+        }
+
+        // Prefer Homebrew when available (best chance of matching the user's CPU architecture).
+        if let brewPath = resolveExecutable(named: "brew") {
+            do {
+                ffmpegInstallStatus = "Installing FFmpeg with Homebrew..."
+                _ = try await runProcess(executable: brewPath, arguments: ["install", "ffmpeg"])
+
+                if let detected = resolveFFmpegPath() {
+                    UserDefaults.standard.set(detected, forKey: "ffmpegPath")
+                    ffmpegInstallStatus = "FFmpeg installed."
+                    return
+                }
+
+                // Fall through to direct download if brew succeeded but ffmpeg is still not resolvable.
+                ffmpegInstallStatus = "FFmpeg installed via Homebrew, but wasn't found in PATH. Downloading a standalone build..."
+            } catch {
+                // If brew fails (not installed / not configured), fall back to direct download.
+                ffmpegInstallStatus = "Homebrew install failed. Downloading a standalone build..."
+            }
+        }
+
+        func desiredFFmpegDownloadArch() -> String {
+#if arch(arm64)
+            return "arm64"
+#else
+            return "amd64"
+#endif
+        }
+
+        func isZipFile(at url: URL) -> Bool {
+            guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
+            defer { try? handle.close() }
+            let data = (try? handle.read(upToCount: 4)) ?? Data()
+            // ZIP files start with "PK" (0x50 0x4B). Allow empty check too.
+            return data.count >= 2 && data[0] == 0x50 && data[1] == 0x4B
+        }
+
+        func sniffTextPrefix(at url: URL, maxBytes: Int = 2048) -> String? {
+            guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+            defer { try? handle.close() }
+            let data = (try? handle.read(upToCount: maxBytes)) ?? Data()
+            guard !data.isEmpty else { return nil }
+            let text = String(decoding: data, as: UTF8.self)
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+
+        do {
+            let installDir = ffmpegInstallDirectory()
+            try FileManager.default.createDirectory(at: installDir, withIntermediateDirectories: true)
+
+            // evermeet.cx (previous source) now frequently returns an HTML error page instead of a ZIP.
+            // Use Martin Riedl's build server which provides stable redirect URLs for automation.
+            let arch = desiredFFmpegDownloadArch()
+            let downloadURL = URL(string: "https://ffmpeg.martin-riedl.de/redirect/latest/macos/\(arch)/release/ffmpeg.zip")!
+            let tempZip = installDir.appendingPathComponent("ffmpeg.zip")
+            let extractDir = installDir.appendingPathComponent("extract", isDirectory: true)
+
+            ffmpegInstallStatus = "Downloading FFmpeg..."
+            let (downloadedURL, response) = try await URLSession.shared.download(from: downloadURL)
+
+            if let http = response as? HTTPURLResponse,
+               !(200...299).contains(http.statusCode) {
+                throw NSError(
+                    domain: "RecordingError",
+                    code: 3,
+                    userInfo: [NSLocalizedDescriptionKey: "FFmpeg download failed (HTTP \(http.statusCode))."]
+                )
+            }
+
+            // Replace any previous download.
+            try? FileManager.default.removeItem(at: tempZip)
+            try FileManager.default.moveItem(at: downloadedURL, to: tempZip)
+
+            // Sanity check: ensure we actually downloaded a ZIP.
+            guard isZipFile(at: tempZip) else {
+                let prefix = sniffTextPrefix(at: tempZip) ?? "(unreadable)"
+                try? FileManager.default.removeItem(at: tempZip)
+                throw NSError(
+                    domain: "RecordingError",
+                    code: 4,
+                    userInfo: [NSLocalizedDescriptionKey: "FFmpeg download did not return a ZIP archive. Received: \(prefix.prefix(400))"]
+                )
+            }
+
+            // Fresh extract directory.
+            try? FileManager.default.removeItem(at: extractDir)
+            try FileManager.default.createDirectory(at: extractDir, withIntermediateDirectories: true)
+
+            ffmpegInstallStatus = "Extracting FFmpeg..."
+            do {
+                _ = try await runProcess(executable: "/usr/bin/ditto", arguments: ["-x", "-k", tempZip.path, extractDir.path])
+            } catch {
+                // Fallback: some macOS configurations behave better with unzip.
+                _ = try await runProcess(executable: "/usr/bin/unzip", arguments: ["-o", "-q", tempZip.path, "-d", extractDir.path])
+            }
+
+            guard let extractedBinary = findBinary(named: "ffmpeg", in: extractDir) else {
+                throw RecordingFFmpegInstallError.missingBinary("ffmpeg")
+            }
+
+            let finalBinaryURL = installDir.appendingPathComponent("ffmpeg")
+            try? FileManager.default.removeItem(at: finalBinaryURL)
+            try FileManager.default.copyItem(at: extractedBinary, to: finalBinaryURL)
+
+            // Make executable.
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: finalBinaryURL.path)
+
+            // Best-effort: remove quarantine if present.
+            _ = try? await runProcess(executable: "/usr/bin/xattr", arguments: ["-d", "com.apple.quarantine", finalBinaryURL.path])
+
+            UserDefaults.standard.set(finalBinaryURL.path, forKey: "ffmpegPath")
+            ffmpegInstallStatus = "FFmpeg installed."
+
+            // Cleanup.
+            try? FileManager.default.removeItem(at: extractDir)
+            try? FileManager.default.removeItem(at: tempZip)
+        } catch {
+            ffmpegInstallError = error.localizedDescription
+            ffmpegInstallStatus = nil
+        }
+    }
+
     private func bundledStreamlinkPath() -> String? {
         Bundle.main.path(forResource: "streamlink", ofType: nil)
     }
@@ -376,6 +552,15 @@ final class RecordingManager: ObservableObject {
             .appendingPathComponent("Glitcho", isDirectory: true)
             .appendingPathComponent("Tools", isDirectory: true)
             .appendingPathComponent("Streamlink", isDirectory: true)
+    }
+
+    private func ffmpegInstallDirectory() -> URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser
+        return base
+            .appendingPathComponent("Glitcho", isDirectory: true)
+            .appendingPathComponent("Tools", isDirectory: true)
+            .appendingPathComponent("FFmpeg", isDirectory: true)
     }
 
     private func resolvePython3Path() -> String? {
@@ -398,6 +583,22 @@ final class RecordingManager: ObservableObject {
         return nil
     }
 
+    private func findBinary(named name: String, in directory: URL) -> URL? {
+        let enumerator = FileManager.default.enumerator(
+            at: directory,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        )
+
+        while let item = enumerator?.nextObject() {
+            guard let url = item as? URL else { continue }
+            guard url.lastPathComponent == name else { continue }
+            return url
+        }
+
+        return nil
+    }
+
     private func resolveExecutable(named name: String) -> String? {
         let fallbackPaths = [
             "/opt/homebrew/bin/\(name)",
@@ -416,13 +617,13 @@ final class RecordingManager: ObservableObject {
         return nil
     }
 
-    private struct ProcessOutput {
+    struct ProcessOutput {
         let stdout: String
         let stderr: String
         let exitCode: Int32
     }
 
-    private struct ProcessExecutionError: LocalizedError {
+    struct ProcessExecutionError: LocalizedError {
         let executable: String
         let arguments: [String]
         let exitCode: Int32
@@ -430,16 +631,31 @@ final class RecordingManager: ObservableObject {
         let stderr: String
 
         var errorDescription: String? {
-            let command = ([executable] + arguments).joined(separator: " ")
-            let message = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
-            if message.isEmpty {
-                return "Command failed (\(exitCode)): \(command)"
+            func shellQuoted(_ value: String) -> String {
+                // For display only (not execution). Keep it simple and readable.
+                if value.isEmpty { return "\"\"" }
+                let needsQuotes = value.contains(where: { $0.isWhitespace }) || value.contains("\"")
+                guard needsQuotes else { return value }
+                let escaped = value.replacingOccurrences(of: "\\", with: "\\\\")
+                    .replacingOccurrences(of: "\"", with: "\\\"")
+                return "\"\(escaped)\""
             }
-            return "Command failed (\(exitCode)): \(command)\n\(message)"
+
+            let command = ([executable] + arguments).map(shellQuoted).joined(separator: " ")
+            let stderrMessage = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+            let stdoutMessage = stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            if !stderrMessage.isEmpty {
+                return "Command failed (\(exitCode)): \(command)\n\(stderrMessage)"
+            }
+            if !stdoutMessage.isEmpty {
+                return "Command failed (\(exitCode)): \(command)\n\(stdoutMessage)"
+            }
+            return "Command failed (\(exitCode)): \(command)"
         }
     }
 
-    private func runProcess(
+    func runProcess(
         executable: String,
         arguments: [String],
         environment: [String: String] = [:]
@@ -498,6 +714,17 @@ private enum RecordingInstallError: LocalizedError {
         switch self {
         case .missingBinary(let name):
             return "Streamlink install failed: expected '\(name)' executable was not found."
+        }
+    }
+}
+
+private enum RecordingFFmpegInstallError: LocalizedError {
+    case missingBinary(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .missingBinary(let name):
+            return "FFmpeg install failed: expected '\(name)' executable was not found."
         }
     }
 }

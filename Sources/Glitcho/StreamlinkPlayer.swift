@@ -1105,6 +1105,267 @@ struct ChannelInfoView: NSViewRepresentable {
     let onNotificationToggle: (Bool) -> Void
     let onRecordRequest: () -> Void
 
+    // Bump this when changing injected cleanup logic so we can re-apply reliably.
+    private static let cleanupScriptVersion = "channel-info-cleanup-v4"
+
+    private static let channelInfoCleanupEvalScript = """
+    (function() {
+      // Allow re-applying the cleanup on demand (Twitch is an SPA).
+      try {
+        if (window.__glitcho_channel_info_cleanup_apply) {
+          window.__glitcho_channel_info_cleanup_apply();
+          return;
+        }
+      } catch (_) {}
+
+      const css = `
+        html, body { background: transparent !important; background-color: transparent !important; margin: 0 !important; padding: 0 !important; }
+        body, #root, .tw-root, .twilight-minimal-root { background: transparent !important; background-color: transparent !important; }
+
+        /* Hide Twitch chrome */
+        header, .top-nav, [data-a-target="top-nav-container"], [data-test-selector="top-nav-container"], [data-a-target="side-nav"], [data-a-target="left-nav"], [data-test-selector="left-nav"], nav[aria-label="Primary Navigation"], #sideNav {
+          display: none !important;
+          height: 0 !important;
+          min-height: 0 !important;
+          width: 0 !important;
+          min-width: 0 !important;
+          opacity: 0 !important;
+          pointer-events: none !important;
+        }
+
+        /* Hide the channel header/info bar above the About/Schedule/Videos section */
+        [data-a-target="channel-header"],
+        [data-test-selector="channel-header"],
+        [data-a-target="channel-info-bar"],
+        [data-test-selector="channel-info-bar"],
+        [data-a-target="channel-info-content"],
+        [data-test-selector="channel-info-content"],
+        [data-a-target="stream-info-card"],
+        [data-test-selector="stream-info-card"],
+        [data-a-target*="stream-info"],
+        [data-a-target*="channel-root"],
+        [data-test-selector*="channel-root"],
+        [data-test-selector*="channel-header"],
+        [data-test-selector*="channel-info-bar"] {
+          display: none !important;
+          height: 0 !important;
+          min-height: 0 !important;
+          margin: 0 !important;
+          padding: 0 !important;
+          opacity: 0 !important;
+          pointer-events: none !important;
+        }
+
+        /* Hide player + chat; keep About/Schedule/Videos content */
+        [data-a-target="video-player"],
+        [data-a-target="player-overlay-click-handler"],
+        [data-a-target="player"],
+        [data-a-target*="player"],
+        [data-test-selector*="player"],
+        .video-player,
+        .persistent-player,
+        video {
+          display: none !important;
+          height: 0 !important;
+          min-height: 0 !important;
+          visibility: hidden !important;
+          opacity: 0 !important;
+          pointer-events: none !important;
+        }
+        [data-a-target="right-column"],
+        [data-a-target="chat-shell"],
+        aside[aria-label*="Chat"],
+        [role="complementary"] {
+          display: none !important;
+          width: 0 !important;
+          min-width: 0 !important;
+          opacity: 0 !important;
+          pointer-events: none !important;
+        }
+
+        /* Expand main content */
+        main, [data-test-selector="main-page-scrollable-area"], [data-a-target="content"], .root-scrollable {
+          margin: 0 !important;
+          padding: 0 !important;
+          max-width: 100% !important;
+        }
+      `;
+
+      function ensureStyle() {
+        let style = document.getElementById('glitcho-channel-info-cleanup-style');
+        if (!style) {
+          style = document.createElement('style');
+          style.id = 'glitcho-channel-info-cleanup-style';
+          style.textContent = css;
+          (document.head || document.documentElement).appendChild(style);
+        }
+      }
+
+      function normalize(s) {
+        // Keep this simple to avoid fragile unicode escape sequences inside Swift multiline strings.
+        try {
+          return (s || '').toLowerCase().trim();
+        } catch (_) {
+          return '';
+        }
+      }
+
+      function hideEl(el) {
+        if (!el) { return; }
+        try {
+          el.style.display = 'none';
+          el.style.height = '0';
+          el.style.minHeight = '0';
+          el.style.margin = '0';
+          el.style.padding = '0';
+          el.style.opacity = '0';
+          el.style.pointerEvents = 'none';
+        } catch (_) {}
+      }
+
+      function closestUnderRoot(el, root) {
+        if (!el || !root) { return null; }
+        let cur = el;
+        while (cur && cur.parentElement && cur.parentElement !== root) {
+          cur = cur.parentElement;
+        }
+        return cur && cur.parentElement === root ? cur : null;
+      }
+
+      function detectKeepRoot() {
+        // Twitch usually renders the channel content inside this scrollable container.
+        return document.querySelector('[data-test-selector="main-page-scrollable-area"]')
+          || document.querySelector('main')
+          || document.querySelector('[role="main"]')
+          || null;
+      }
+
+      function findTabsAnchor(scope) {
+        const root = scope || document;
+
+        // 1) First choice: ARIA tablist (most reliable if present)
+        const tablists = Array.from(root.querySelectorAll('[role="tablist"]'));
+        for (const tl of tablists) {
+          const tabs = tl.querySelectorAll('[role="tab"],a,button');
+          if (tabs && tabs.length >= 3) {
+            return tl;
+          }
+        }
+
+        // 2) Next: a nav/container that links to /about /schedule /videos (avoid relying on visible text)
+        const containers = Array.from(root.querySelectorAll('nav,section,div'));
+        for (const c of containers) {
+          const hrefs = Array.from(c.querySelectorAll('a[href]'))
+            .map(a => (a.getAttribute('href') || '').toLowerCase());
+          if (!hrefs.length) { continue; }
+          const hasAbout = hrefs.some(h => h.includes('/about'));
+          const hasSchedule = hrefs.some(h => h.includes('/schedule'));
+          const hasVideos = hrefs.some(h => h.includes('/videos'));
+          if (hasAbout && (hasSchedule || hasVideos)) {
+            return c;
+          }
+        }
+
+        // 3) Last resort: an "About <channel>" heading
+        const headings = Array.from(root.querySelectorAll('h1,h2,h3,[role="heading"]'));
+        for (const h of headings) {
+          const t = normalize(h.textContent);
+          if (!t) continue;
+          if (t.startsWith('about') || t.startsWith('a propos') || t.startsWith('à propos')) {
+            return h;
+          }
+        }
+
+        return null;
+      }
+
+      function keepOnlyPathTo(target) {
+        if (!target || !document.body) { return; }
+
+        const path = [];
+        let cur = target;
+        while (cur && cur !== document.body) {
+          path.push(cur);
+          cur = cur.parentElement;
+        }
+        path.push(document.body);
+
+        const pathSet = new Set(path);
+
+        // Hide everything that is not on the ancestor chain to target.
+        for (let i = 0; i < path.length - 1; i++) {
+          const node = path[i];
+          const parent = node.parentElement;
+          if (!parent) { continue; }
+          Array.from(parent.children).forEach(child => {
+            if (child !== node && !pathSet.has(child)) {
+              hideEl(child);
+            }
+          });
+        }
+
+        // Also hide any remaining body children not on the path.
+        Array.from(document.body.children).forEach(child => {
+          if (!pathSet.has(child) && !child.contains(target)) {
+            hideEl(child);
+          }
+        });
+      }
+
+      function hidePrecedingSiblings(root, anchor) {
+        if (!root || !anchor) { return; }
+
+        // Hide everything that comes before the anchor at each nesting level.
+        // This reliably removes the channel header/info bar even when Twitch nests it
+        // in the same React tree as the tab bar.
+        let cur = anchor;
+        while (cur && cur !== root) {
+          const parent = cur.parentElement;
+          if (!parent) { break; }
+          let sib = parent.firstElementChild;
+          while (sib && sib !== cur) {
+            hideEl(sib);
+            sib = sib.nextElementSibling;
+          }
+          cur = parent;
+        }
+      }
+
+      function apply() {
+        const keepRoot = detectKeepRoot();
+        if (!keepRoot) {
+          try { document.body && document.body.classList.add('glitcho-ready'); } catch (_) {}
+          return;
+        }
+
+        try { ensureStyle(); } catch (_) {}
+        try { keepOnlyPathTo(keepRoot); } catch (_) {}
+
+        const anchor = findTabsAnchor(keepRoot);
+        if (anchor) {
+          try { hidePrecedingSiblings(keepRoot, anchor); } catch (_) {}
+        }
+
+        try { document.body && document.body.classList.add('glitcho-ready'); } catch (_) {}
+      }
+
+      window.__glitcho_channel_info_cleanup_apply = apply;
+      apply();
+      const observer = new MutationObserver(apply);
+      observer.observe(document.documentElement, { childList: true, subtree: true });
+
+      // SPA URL changes
+      let lastUrl = location.href;
+      setInterval(function() {
+        const url = location.href;
+        if (url !== lastUrl) {
+          lastUrl = url;
+          apply();
+        }
+      }, 400);
+    })();
+    """
+
     final class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
         let onOpenSubscription: () -> Void
         let onOpenGiftSub: () -> Void
@@ -1195,6 +1456,12 @@ struct ChannelInfoView: NSViewRepresentable {
         func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
             log("webContentProcessDidTerminate")
             debugSnapshot(webView, label: "didTerminate")
+
+            // Twitch can occasionally crash/restart the web content process.
+            // When that happens the view can remain blank (black) unless we reload.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                webView.reload()
+            }
         }
 
         func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
@@ -1331,401 +1598,70 @@ struct ChannelInfoView: NSViewRepresentable {
             forMainFrameOnly: true
         )
 
-        // Hide page initially until customization is done
+        // Keep the page visible even if Twitch DOM changes break our scraper.
         let initialHideScript = WKUserScript(
             source: """
             (function() {
               if (document.getElementById('glitcho-channel-hide')) { return; }
               const style = document.createElement('style');
               style.id = 'glitcho-channel-hide';
-              style.textContent = 'html { background: transparent !important; } body { opacity: 0 !important; transition: opacity 0.12s ease-out !important; } body.glitcho-ready { opacity: 1 !important; }';
+              style.textContent = 'html { background: transparent !important; } body { opacity: 1 !important; } body.glitcho-ready { opacity: 1 !important; }';
               document.documentElement.appendChild(style);
+
+              // Start-time failsafe: never allow a permanent blank state.
+              setTimeout(function() {
+                try { document.body && document.body.classList.add('glitcho-ready'); } catch (_) {}
+              }, 2500);
             })();
             """,
             injectionTime: .atDocumentStart,
             forMainFrameOnly: true
         )
 
-        // Script pour n'afficher que le contenu "About" et le placer au top.
+        // Script to show only offline-channel-main-content
         let aboutOnlyScript = WKUserScript(
             source: """
             (function() {
-                if (window.__glitcho_about_only) { return; }
-                window.__glitcho_about_only = true;
+                if (window.__glitcho_channel_info) return;
+                window.__glitcho_channel_info = true;
 
-                const css = `
-                    html, body {
-                        background: transparent !important;
-                        background-color: transparent !important;
-                        margin: 0 !important;
-                        padding: 0 !important;
-                        overflow-x: hidden !important;
-                    }
-                    body {
-                        color-scheme: dark;
-                        -webkit-font-smoothing: antialiased;
-                        text-rendering: optimizeLegibility;
-                    }
-                    /* Si Twitch applique une couleur de fond/overlay, on neutralise */
-                    body::before, body::after,
-                    #root::before, #root::after {
-                        background: transparent !important;
-                        background-color: transparent !important;
-                    }
-                    footer { display: none !important; }
-                    /* Sécurité: masquer le player/chat si jamais ils apparaissent */
-                    [data-a-target="video-player"],
-                    [data-a-target="player-overlay-click-handler"],
-                    [data-a-target="right-column"],
-                    [data-a-target="chat-shell"],
-                    video,
-                    .video-player,
-                    .persistent-player,
-                    aside[aria-label*="Chat"] {
-                        display: none !important;
-                    }
-                    /* Le contenu doit démarrer en haut, sans padding excessif */
-                    main, [data-test-selector="main-page-scrollable-area"] {
-                        margin: 0 !important;
-                        padding: 0 !important;
-                        max-width: 100% !important;
-                        background: transparent !important;
-                    }
-                    [data-glitcho-about-block="1"] {
-                        padding: 18px 18px 22px !important;
-                        margin: 0 !important;
-                        background: rgba(18, 18, 22, 0.35) !important;
-                        border: 1px solid rgba(255, 255, 255, 0.08) !important;
-                        border-radius: 18px !important;
-                    }
-                    [data-glitcho-about-block="1"] a {
-                        color: rgba(180, 140, 255, 0.95) !important;
-                    }
-                    [data-glitcho-about-block="1"] a:visited {
-                        color: rgba(180, 140, 255, 0.85) !important;
-                    }
-                    /* Boutons d'action (Follow / notif / Gift / Resubscribe) */
-                    [data-glitcho-actions="1"] button,
-                    [data-glitcho-actions="1"] a,
-                    [data-glitcho-actions="1"] [role="button"] {
-                        border-radius: 999px !important;
-                        border: 1px solid rgba(255, 255, 255, 0.14) !important;
-                        background: rgba(255, 255, 255, 0.08) !important;
-                        box-shadow: none !important;
-                        backdrop-filter: blur(10px) !important;
-                    }
-                    [data-glitcho-actions="1"] button:hover,
-                    [data-glitcho-actions="1"] a:hover,
-                    [data-glitcho-actions="1"] [role="button"]:hover {
-                        background: rgba(255, 255, 255, 0.12) !important;
-                        border-color: rgba(255, 255, 255, 0.18) !important;
-                    }
-                    [data-glitcho-actions="1"] svg {
-                        filter: drop-shadow(0 1px 0 rgba(0,0,0,0.35));
-                    }
-                    /* Hide channel tabs we don't want if they slip into About */
-                    a[href$="/chat"], a[href*="/chat?"], a[href*="/chat/"],
-                    a[href$="/home"], a[href*="/home?"], a[href*="/home/"] {
-                        display: none !important;
-                    }
-                    /* Hide the top channel header block (avatar/live banner) if it slips into extracted content */
-                    [data-a-target="channel-header"],
-                    [data-test-selector="channel-header"],
-                    [data-a-target="channel-info-bar"],
-                    [data-test-selector="channel-info-bar"] {
-                        display: none !important;
-                        height: 0 !important;
-                        margin: 0 !important;
-                        padding: 0 !important;
-                    }
-                    /* Disable channel name links that navigate to streamer page */
-                    a[href^="/"]:not([href*="/videos"]):not([href*="/clip"]):not([href*="/schedule"]):not([href*="/about"]):not([href*="http"]) {
-                        pointer-events: none !important;
-                        cursor: default !important;
-                    }
-                    /* Re-enable external links and specific action links */
-                    a[href^="http"], a[href*="/videos"], a[href*="/clip"] {
-                        pointer-events: auto !important;
-                        cursor: pointer !important;
-                    }
-                `;
-
-                function ensureStyle() {
-                    let style = document.getElementById('glitcho-about-only-style');
-                    if (!style) {
-                        style = document.createElement('style');
-                        style.id = 'glitcho-about-only-style';
-                        style.textContent = css;
-                        (document.head || document.documentElement).appendChild(style);
-                    }
-                }
-
-                function normalizeText(s) {
-                    try {
-                        return (s || '')
-                            .toLowerCase()
-                            .normalize('NFD')
-                            .replace(/[\\u0300-\\u036f]/g, '')
-                            .trim();
-                    } catch (_) {
-                        return (s || '').toLowerCase().trim();
-                    }
-                }
-
-                function isAboutText(t) {
-                    const s = normalizeText(t);
-                    return s.startsWith('about') || s.startsWith('a propos') || s.includes('a propos de') || s.includes('about ');
-                }
-
-                function findAboutMarker(main) {
-                    const headingish = Array.from(main.querySelectorAll('h1,h2,h3,[role="heading"]'));
-                    const direct = headingish.find(el => isAboutText(el.textContent));
-                    if (direct) { return direct; }
-
-                    // Fallback: chercher un élément "petit" qui contient About/À propos (pas tout le main)
-                    const all = Array.from(main.querySelectorAll('*'));
-                    for (const el of all) {
-                        const text = (el.textContent || '').trim();
-                        if (!text || text.length > 120) { continue; }
-                        if (isAboutText(text)) { return el; }
-                    }
+                function findContent() {
+                    // Try offline channel content first
+                    let el = document.getElementById('offline-channel-main-content');
+                    if (el) return el;
+                    
+                    // Try live channel content
+                    el = document.getElementById('live-channel-stream-information');
+                    if (el) return el;
+                    
+                    // Fallback: section with Main Content label
+                    el = document.querySelector('section[aria-label="Main Content"]');
+                    if (el) return el;
+                    
                     return null;
                 }
 
-                function pickAboutContainer(marker, main) {
-                    if (!marker) { return null; }
-                    const preferred = marker.closest('section') || marker.closest('[data-test-selector]') || marker.closest('[data-a-target]');
-                    if (preferred && preferred !== document.body && preferred !== main) { return preferred; }
-                    const block = marker.closest('div') || marker.parentElement;
-                    if (block && block !== document.body && block !== main) { return block; }
-                    return marker;
+                function extractChannelInfo() {
+                    if (document.body.dataset.glitchoExtracted) return;
+                    
+                    const content = findContent();
+                    if (!content) return;
+                    
+                    document.body.dataset.glitchoExtracted = 'true';
+                    const clone = content.cloneNode(true);
+                    document.body.innerHTML = '';
+                    document.body.appendChild(clone);
+                    document.body.style.cssText = 'background:transparent!important;margin:0;padding:0;';
+                    document.documentElement.style.background = 'transparent';
                 }
 
-                function closestUnderMain(el, main) {
-                    if (!el || !main) { return null; }
-                    let cur = el;
-                    while (cur && cur.parentElement && cur.parentElement !== main) {
-                        cur = cur.parentElement;
-                    }
-                    return cur && cur.parentElement === main ? cur : null;
-                }
-
-                function hide(el) {
-                    if (!el) { return; }
-                    el.style.display = 'none';
-                    el.style.height = '0';
-                    el.style.opacity = '0';
-                    el.style.pointerEvents = 'none';
-                }
-
-                function extractAboutOnly() {
-                    const main = document.querySelector('main') || document.querySelector('[role="main"]') || document.body;
-                    if (!main) { return false; }
-                    const marker = findAboutMarker(main);
-                    if (!marker) { return false; }
-                    const container = pickAboutContainer(marker, main);
-                    if (!container) { return false; }
-
-
-                    // Si le container est trop petit, la page n'est peut-être pas encore hydratée.
-                    try {
-                        const rect = container.getBoundingClientRect();
-                        if (rect && rect.height && rect.height < 40) { return false; }
-                    } catch (_) {}
-
-                    function closestButton(el) {
-                        if (!el) { return null; }
-                        return el.closest('button,[role="button"],a') || el;
-                    }
-
-                    function findFollowButton(root) {
-                        const scope = root || document;
-                        const direct = scope.querySelector('[data-a-target*="follow"], button[aria-label*="Follow"], button[aria-label*="Suivre"], button[aria-label*="Following"], button[aria-label*="Abonné"], button[aria-label*="Abonne"]');
-                        if (direct) { return closestButton(direct); }
-                        const list = Array.from(scope.querySelectorAll('button,[role="button"],a')).slice(0, 240);
-                        for (const el of list) {
-                            const t = normalizeText(el.getAttribute('aria-label') || el.textContent || '');
-                            if (t === 'follow' || t === 'suivre' || t === 'following' || t === 'abonne' || t === 'abonné') {
-                                return closestButton(el);
-                            }
-                        }
-                        return null;
-                    }
-
-                    function findBellButton(root) {
-                        const scope = root || document;
-                        const direct = scope.querySelector('[data-a-target="notifications-button"], [data-a-target="notification-button"], button[aria-label*="Notification"], button[aria-label*="Notifications"], button[aria-label*="Notific"]');
-                        return closestButton(direct);
-                    }
-
-                    function cloneActions() {
-                        const selectors = [
-                          '[data-a-target="channel-actions"]',
-                          '[data-a-target*="channel-actions"]',
-                          '[data-test-selector*="channel-actions"]',
-                          '[data-test-selector="channel-info-bar-actions"]',
-                          '[data-test-selector*="channel-info-bar"] [data-a-target*="actions"]'
-                        ];
-                        for (const sel of selectors) {
-                          const node = document.querySelector(sel);
-                          if (node) { return node.cloneNode(true); }
-                        }
-                        const follow = findFollowButton(document);
-                        const bell = findBellButton(document);
-                        if (!follow && !bell) { return null; }
-                        const wrapper = document.createElement('div');
-                        wrapper.setAttribute('data-glitcho-actions', '1');
-                        wrapper.style.display = 'flex';
-                        wrapper.style.flexWrap = 'wrap';
-                        wrapper.style.alignItems = 'center';
-                        wrapper.style.gap = '10px';
-                        if (follow) { wrapper.appendChild(follow.cloneNode(true)); }
-                        if (bell) { wrapper.appendChild(bell.cloneNode(true)); }
-                        return wrapper;
-                    }
-
-                    const actionsClone = cloneActions();
-                    if (!actionsClone) { return false; }
-
-                    // Version "propre" : extraire UNIQUEMENT le bloc About pour éviter de remettre tout le layout Twitch.
-                    try {
-                        const root = document.createElement('div');
-                        root.id = 'glitcho-about-root';
-                        const shell = document.createElement('div');
-                        shell.setAttribute('data-glitcho-about-block', '1');
-                        actionsClone.setAttribute('data-glitcho-actions', '1');
-                        actionsClone.style.marginBottom = '14px';
-                        shell.appendChild(actionsClone);
-                        shell.appendChild(container);
-                        root.appendChild(shell);
-                        document.body.innerHTML = '';
-                        document.body.appendChild(root);
-
-                        // Enlever uniquement les tabs non désirés (Home/Chat) et limiter la tab-bar.
-                        const killSelectors = [
-                          '[data-a-target="channel-header"]',
-                          '[data-test-selector="channel-header"]',
-                          '[data-a-target="channel-info-bar"]',
-                          '[data-test-selector="channel-info-bar"]'
-                        ];
-                        killSelectors.forEach(sel => {
-                          try {
-                            root.querySelectorAll(sel).forEach(el => {
-                              if (el.matches('[data-glitcho-actions="1"]') || el.querySelector('[data-glitcho-actions="1"]')) {
-                                return;
-                              }
-                              el.remove();
-                            });
-                          } catch (_) {}
-                        });
-
-                        const norm = (s) => {
-                          try { return (s || '').toLowerCase().normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').trim(); }
-                          catch (_) { return (s || '').toLowerCase().trim(); }
-                        };
-                        Array.from(root.querySelectorAll('button,a,[role="button"],[role="tab"]')).forEach(el => {
-                          const t = norm(el.textContent);
-                          if (!t) { return; }
-                          const hit =
-                            t === 'home' ||
-                            t === 'chat' ||
-                            t === 'following';
-                          if (hit) {
-                            // Pour les tabs, on cache le <li> mais on garde la barre (About/Videos)
-                            const li = el.closest('li');
-                            if (li) {
-                              li.remove();
-                            } else {
-                              const wrapper = el.closest('div') || el;
-                              wrapper.remove();
-                            }
-                          }
-                        });
-
-                        // Extra: hide/remove by href patterns.
-                        Array.from(root.querySelectorAll('a[href]')).forEach(a => {
-                          const href = (a.getAttribute('href') || '').toLowerCase();
-                          if (!href) { return; }
-                          if (href.endsWith('/chat') || href.includes('/chat?') || href.includes('/chat/')) {
-                            const li = a.closest('li');
-                            if (li) li.remove(); else (a.closest('div') || a).remove();
-                          }
-                          if (href.endsWith('/following') || href.includes('/following?') || href.includes('/following/')) {
-                            const li = a.closest('li');
-                            if (li) li.remove(); else (a.closest('div') || a).remove();
-                          }
-                          if (href.endsWith('/home') || href.includes('/home?') || href.includes('/home/')) {
-                            const li = a.closest('li');
-                            if (li) li.remove(); else (a.closest('div') || a).remove();
-                          }
-                        });
-
-                        // Si la barre de tabs existe, ne garder que About + Schedule + Videos.
-                        try {
-                          const allowed = new Set(['about', 'a propos', 'à propos', 'schedule', 'videos', 'vidéos']);
-                          const tabs = Array.from(root.querySelectorAll('[role="tab"], a, button'));
-                          tabs.forEach(el => {
-                            const t = norm(el.textContent);
-                            if (!t) { return; }
-                            if (t === 'home' || t === 'chat' || t === 'following') { return; }
-                            // si ça ressemble à un tab label mais pas About/Videos, on le retire
-                            const isTabby = el.getAttribute('role') === 'tab' || (el.closest('[role="tablist"]') != null);
-                            if (isTabby) {
-                              const ok = Array.from(allowed).some(a => t === a);
-                              if (!ok) {
-                                const li = el.closest('li');
-                                if (li) li.remove(); else el.remove();
-                              }
-                            }
-                          });
-                        } catch (_) {}
-
-                        // Collapse any empty top rows left after removals.
-                        try {
-                          const isEmptyish = (el) => {
-                            if (!el) return true;
-                            const text = norm(el.textContent || '');
-                            const hasMedia = !!el.querySelector('img,svg,video,audio,button,[role=\"button\"],a');
-                            return text.length === 0 && !hasMedia;
-                          };
-                          let guardCount = 0;
-                          while (guardCount++ < 12) {
-                            const first = shell.firstElementChild;
-                            if (!first) break;
-                            const rect = first.getBoundingClientRect ? first.getBoundingClientRect() : null;
-                            const small = !rect || rect.height < 140;
-                            if (small && isEmptyish(first)) {
-                              first.remove();
-                              continue;
-                            }
-                            break;
-                          }
-                        } catch (_) {}
-                    } catch (_) { return false; }
-
-                    try {
-                      if (window.__glitcho_decorateChannelActions) {
-                        window.__glitcho_decorateChannelActions();
-                      }
-                    } catch (_) {}
-
-                    try { window.scrollTo(0, 0); } catch (_) {}
-                    return true;
-                }
-
-                ensureStyle();
-                let tries = 0;
-                const maxTries = 60; // ~12s (React hydrate parfois lentement)
-                const timer = setInterval(() => {
-                    ensureStyle();
-                    const ok = extractAboutOnly();
-                    tries++;
-                    if (ok || tries >= maxTries) {
-                        clearInterval(timer);
-                        // Reveal page after customization
-                        document.body.classList.add('glitcho-ready');
-                    }
-                }, 200);
+                const obs = new MutationObserver(extractChannelInfo);
+                obs.observe(document.documentElement, { childList: true, subtree: true });
+                
+                setTimeout(extractChannelInfo, 1000);
+                setTimeout(extractChannelInfo, 2000);
+                setTimeout(extractChannelInfo, 4000);
+                setTimeout(extractChannelInfo, 6000);
             })();
             """,
             injectionTime: .atDocumentEnd,
@@ -1739,10 +1675,11 @@ struct ChannelInfoView: NSViewRepresentable {
               window.__glitcho_subscribe_intercept = true;
 
               function normalize(s) {
+                // Keep this simple to avoid fragile unicode escape sequences inside Swift multiline strings.
                 try {
-                  return (s || '').toLowerCase().normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').trim();
-                } catch (_) {
                   return (s || '').toLowerCase().trim();
+                } catch (_) {
+                  return '';
                 }
               }
 
@@ -1784,10 +1721,11 @@ struct ChannelInfoView: NSViewRepresentable {
               window.__glitcho_gift_intercept = true;
 
               function normalize(s) {
+                // Keep this simple to avoid fragile unicode escape sequences inside Swift multiline strings.
                 try {
-                  return (s || '').toLowerCase().normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').trim();
-                } catch (_) {
                   return (s || '').toLowerCase().trim();
+                } catch (_) {
+                  return '';
                 }
               }
 
@@ -2022,8 +1960,8 @@ struct ChannelInfoView: NSViewRepresentable {
         }
         webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15"
         
-        // Charger la page About (l'utilisateur peut ensuite cliquer Videos/Schedule)
-        let url = URL(string: "https://www.twitch.tv/\(channelName)/about")!
+        // Load channel root page to get offline-channel-main-content
+        let url = URL(string: "https://www.twitch.tv/\(channelName)")!
         webView.load(URLRequest(url: url))
         
         return webView
@@ -2031,13 +1969,14 @@ struct ChannelInfoView: NSViewRepresentable {
     
     func updateNSView(_ nsView: WKWebView, context: Context) {
         // Reload if channel changed
-        let url = URL(string: "https://www.twitch.tv/\(channelName)/about")!
+        let url = URL(string: "https://www.twitch.tv/\(channelName)")!
         let currentPath = nsView.url?.path ?? ""
         if !currentPath.lowercased().hasPrefix("/\(channelName.lowercased())") {
             nsView.load(URLRequest(url: url))
         }
         let normalized = channelName.lowercased()
-        let js = "window.__glitcho_setBellState && window.__glitcho_setBellState('\(normalized)', \(notificationEnabled ? "true" : "false"));"
+        let enabled = notificationEnabled ? "true" : "false"
+        let js = "window.__glitcho_setBellState && window.__glitcho_setBellState('\(normalized)', \(enabled));"
         nsView.evaluateJavaScript(js, completionHandler: nil)
     }
 }

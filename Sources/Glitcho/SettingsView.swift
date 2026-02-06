@@ -449,6 +449,46 @@ struct SettingsViewContent: View {
                                 )
                                 Spacer()
                             }
+
+                            if recordingManager.isInstallingFFmpeg {
+                                HStack(spacing: 8) {
+                                    ProgressView()
+                                        .scaleEffect(0.7)
+                                    Text(recordingManager.ffmpegInstallStatus ?? "Installing FFmpeg…")
+                                        .font(.system(size: 10))
+                                        .foregroundStyle(.white.opacity(0.7))
+                                    Spacer()
+                                }
+                            }
+
+                            HStack {
+                                SettingsButton(
+                                    title: recordingManager.isInstallingFFmpeg ? "Installing…" : "Install FFmpeg",
+                                    systemImage: "arrow.down.circle",
+                                    style: .primary,
+                                    action: {
+                                        Task { await recordingManager.installFFmpeg() }
+                                    }
+                                )
+                                .disabled(recordingManager.isInstallingFFmpeg)
+                                Spacer()
+                            }
+
+                            if !recordingManager.isInstallingFFmpeg, let status = recordingManager.ffmpegInstallStatus {
+                                let lower = status.lowercased()
+                                let isSuccess = lower.contains("installed") || lower.contains("available")
+                                Text(status)
+                                    .font(.system(size: 10, weight: .medium))
+                                    .foregroundStyle(isSuccess ? Color.green.opacity(0.8) : Color.white.opacity(0.6))
+                                    .lineLimit(2)
+                            }
+
+                            if let installError = recordingManager.ffmpegInstallError {
+                                Text(installError)
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(Color.orange.opacity(0.85))
+                                    .lineLimit(2)
+                            }
                         }
                     }
                 }
