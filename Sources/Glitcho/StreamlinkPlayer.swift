@@ -1598,70 +1598,409 @@ struct ChannelInfoView: NSViewRepresentable {
             forMainFrameOnly: true
         )
 
-        // Keep the page visible even if Twitch DOM changes break our scraper.
+        // Script to hide page until customization is done (with failsafe).
         let initialHideScript = WKUserScript(
             source: """
             (function() {
               if (document.getElementById('glitcho-channel-hide')) { return; }
               const style = document.createElement('style');
               style.id = 'glitcho-channel-hide';
-              style.textContent = 'html { background: transparent !important; } body { opacity: 1 !important; } body.glitcho-ready { opacity: 1 !important; }';
+              style.textContent = 'html { background: transparent !important; } body { opacity: 0 !important; transition: opacity 0.12s ease-out !important; } body.glitcho-ready { opacity: 1 !important; }';
               document.documentElement.appendChild(style);
-
-              // Start-time failsafe: never allow a permanent blank state.
-              setTimeout(function() {
-                try { document.body && document.body.classList.add('glitcho-ready'); } catch (_) {}
-              }, 2500);
             })();
             """,
             injectionTime: .atDocumentStart,
             forMainFrameOnly: true
         )
 
-        // Script to show only offline-channel-main-content
+        // Script to show only the About content and keep it at the top.
         let aboutOnlyScript = WKUserScript(
             source: """
             (function() {
-                if (window.__glitcho_channel_info) return;
-                window.__glitcho_channel_info = true;
+                if (window.__glitcho_about_only) { return; }
+                window.__glitcho_about_only = true;
 
-                function findContent() {
-                    // Try offline channel content first
-                    let el = document.getElementById('offline-channel-main-content');
-                    if (el) return el;
-                    
-                    // Try live channel content
-                    el = document.getElementById('live-channel-stream-information');
-                    if (el) return el;
-                    
-                    // Fallback: section with Main Content label
-                    el = document.querySelector('section[aria-label="Main Content"]');
-                    if (el) return el;
-                    
+                const css = `
+                    html, body {
+                        background: transparent !important;
+                        background-color: transparent !important;
+                        margin: 0 !important;
+                        padding: 0 !important;
+                        overflow-x: hidden !important;
+                    }
+                    body {
+                        color-scheme: dark;
+                        -webkit-font-smoothing: antialiased;
+                        text-rendering: optimizeLegibility;
+                    }
+                    /* Neutralize overlays */
+                    body::before, body::after,
+                    #root::before, #root::after {
+                        background: transparent !important;
+                        background-color: transparent !important;
+                    }
+                    footer { display: none !important; }
+                    /* Hide player/chat if they appear */
+                    [data-a-target="video-player"],
+                    [data-a-target="player-overlay-click-handler"],
+                    [data-a-target="right-column"],
+                    [data-a-target="chat-shell"],
+                    video,
+                    .video-player,
+                    .persistent-player,
+                    aside[aria-label*="Chat"] {
+                        display: none !important;
+                    }
+                    /* Keep content flush to top */
+                    main, [data-test-selector="main-page-scrollable-area"] {
+                        margin: 0 !important;
+                        padding: 0 !important;
+                        max-width: 100% !important;
+                        background: transparent !important;
+                    }
+                    [data-glitcho-about-block="1"] {
+                        padding: 18px 18px 22px !important;
+                        margin: 0 !important;
+                        background: rgba(18, 18, 22, 0.35) !important;
+                        border: 1px solid rgba(255, 255, 255, 0.08) !important;
+                        border-radius: 18px !important;
+                    }
+                    [data-glitcho-about-block="1"] a {
+                        color: rgba(180, 140, 255, 0.95) !important;
+                    }
+                    [data-glitcho-about-block="1"] a:visited {
+                        color: rgba(180, 140, 255, 0.85) !important;
+                    }
+                    /* Action buttons (Follow / notif / Gift / Resubscribe) */
+                    [data-glitcho-actions="1"] button,
+                    [data-glitcho-actions="1"] a,
+                    [data-glitcho-actions="1"] [role="button"] {
+                        border-radius: 999px !important;
+                        border: 1px solid rgba(255, 255, 255, 0.14) !important;
+                        background: rgba(255, 255, 255, 0.08) !important;
+                        box-shadow: none !important;
+                        backdrop-filter: blur(10px) !important;
+                    }
+                    [data-glitcho-actions="1"] button:hover,
+                    [data-glitcho-actions="1"] a:hover,
+                    [data-glitcho-actions="1"] [role="button"]:hover {
+                        background: rgba(255, 255, 255, 0.12) !important;
+                        border-color: rgba(255, 255, 255, 0.18) !important;
+                    }
+                    [data-glitcho-actions="1"] svg {
+                        filter: drop-shadow(0 1px 0 rgba(0,0,0,0.35));
+                    }
+                    /* Hide channel tabs we don't want if they slip into About */
+                    a[href$="/chat"], a[href*="/chat?"], a[href*="/chat/"],
+                    a[href$="/home"], a[href*="/home?"], a[href*="/home/"] {
+                        display: none !important;
+                    }
+                    /* Hide the top channel header block */
+                    [data-a-target="channel-header"],
+                    [data-test-selector="channel-header"],
+                    [data-a-target="channel-info-bar"],
+                    [data-test-selector="channel-info-bar"] {
+                        display: none !important;
+                        height: 0 !important;
+                        margin: 0 !important;
+                        padding: 0 !important;
+                    }
+                    /* Disable channel name links that navigate to streamer page */
+                    a[href^="/"]:not([href*="/videos"]):not([href*="/clip"]):not([href*="/schedule"]):not([href*="/about"]):not([href*="http"]) {
+                        pointer-events: none !important;
+                        cursor: default !important;
+                    }
+                    /* Re-enable external links and specific action links */
+                    a[href^="http"], a[href*="/videos"], a[href*="/clip"] {
+                        pointer-events: auto !important;
+                        cursor: pointer !important;
+                    }
+                `;
+
+                function ensureStyle() {
+                    let style = document.getElementById('glitcho-about-only-style');
+                    if (!style) {
+                        style = document.createElement('style');
+                        style.id = 'glitcho-about-only-style';
+                        style.textContent = css;
+                        (document.head || document.documentElement).appendChild(style);
+                    }
+                }
+
+                function normalizeText(s) {
+                    try {
+                        return (s || '')
+                            .toLowerCase()
+                            .normalize('NFD')
+                            .replace(/[\\u0300-\\u036f]/g, '')
+                            .trim();
+                    } catch (_) {
+                        return (s || '').toLowerCase().trim();
+                    }
+                }
+
+                function isAboutText(t) {
+                    const s = normalizeText(t);
+                    return s.startsWith('about') || s.startsWith('a propos') || s.includes('a propos de') || s.includes('about ');
+                }
+
+                function findPanelsContainer(main) {
+                    const root = main || document;
+                    const selectors = [
+                        '[data-a-target="channel-panels"]',
+                        '[data-test-selector="channel-panels"]',
+                        '[data-a-target*="about-panel"]',
+                        '[data-test-selector*="about-panel"]',
+                        '[data-a-target="channel-info-content"]',
+                        '[data-test-selector="channel-info-content"]',
+                        'section[aria-label*="About"]',
+                        'section[aria-label*="À propos"]',
+                        'section[aria-label*="A propos"]'
+                    ];
+                    for (const sel of selectors) {
+                        const hit = root.querySelector(sel);
+                        if (hit) { return hit; }
+                    }
                     return null;
                 }
 
-                function extractChannelInfo() {
-                    if (document.body.dataset.glitchoExtracted) return;
-                    
-                    const content = findContent();
-                    if (!content) return;
-                    
-                    document.body.dataset.glitchoExtracted = 'true';
-                    const clone = content.cloneNode(true);
-                    document.body.innerHTML = '';
-                    document.body.appendChild(clone);
-                    document.body.style.cssText = 'background:transparent!important;margin:0;padding:0;';
-                    document.documentElement.style.background = 'transparent';
+                function findAboutMarker(main) {
+                    const headingish = Array.from(main.querySelectorAll('h1,h2,h3,[role="heading"]'));
+                    const direct = headingish.find(el => isAboutText(el.textContent));
+                    if (direct) { return direct; }
+
+                    const all = Array.from(main.querySelectorAll('*'));
+                    for (const el of all) {
+                        const text = (el.textContent || '').trim();
+                        if (!text || text.length > 120) { continue; }
+                        if (isAboutText(text)) { return el; }
+                    }
+                    return null;
                 }
 
-                const obs = new MutationObserver(extractChannelInfo);
-                obs.observe(document.documentElement, { childList: true, subtree: true });
-                
-                setTimeout(extractChannelInfo, 1000);
-                setTimeout(extractChannelInfo, 2000);
-                setTimeout(extractChannelInfo, 4000);
-                setTimeout(extractChannelInfo, 6000);
+                function pickAboutContainer(marker, main) {
+                    if (!marker) { return null; }
+                    const preferred = marker.closest('section') || marker.closest('[data-test-selector]') || marker.closest('[data-a-target]');
+                    if (preferred && preferred !== document.body && preferred !== main) { return preferred; }
+                    const block = marker.closest('div') || marker.parentElement;
+                    if (block && block !== document.body && block !== main) { return block; }
+                    return marker;
+                }
+
+                function sanitizeHTML(html) {
+                    if (!html) { return ''; }
+                    return String(html)
+                      .replace(/<script[\\s\\S]*?<\\/script>/gi, '')
+                      .replace(/<style[\\s\\S]*?<\\/style>/gi, '');
+                }
+
+                function extractAboutOnly() {
+                    const main = document.querySelector('main') || document.querySelector('[role="main"]') || document.body;
+                    if (!main) { return false; }
+                    let container = findPanelsContainer(main);
+                    if (!container) {
+                        const marker = findAboutMarker(main);
+                        if (!marker) { return false; }
+                        container = pickAboutContainer(marker, main);
+                        if (!container) { return false; }
+                    }
+
+                    try {
+                        const rect = container.getBoundingClientRect();
+                        if (rect && rect.height && rect.height < 40) { return false; }
+                    } catch (_) {}
+
+                    function closestButton(el) {
+                        if (!el) { return null; }
+                        return el.closest('button,[role="button"],a') || el;
+                    }
+
+                    function findFollowButton(root) {
+                        const scope = root || document;
+                        const direct = scope.querySelector('[data-a-target*="follow"], button[aria-label*="Follow"], button[aria-label*="Suivre"], button[aria-label*="Following"], button[aria-label*="Abonné"], button[aria-label*="Abonne"]');
+                        if (direct) { return closestButton(direct); }
+                        const list = Array.from(scope.querySelectorAll('button,[role="button"],a')).slice(0, 240);
+                        for (const el of list) {
+                            const t = normalizeText(el.getAttribute('aria-label') || el.textContent || '');
+                            if (t === 'follow' || t === 'suivre' || t === 'following' || t === 'abonne' || t === 'abonné') {
+                                return closestButton(el);
+                            }
+                        }
+                        return null;
+                    }
+
+                    function findBellButton(root) {
+                        const scope = root || document;
+                        const direct = scope.querySelector('[data-a-target="notifications-button"], [data-a-target="notification-button"], button[aria-label*="Notification"], button[aria-label*="Notifications"], button[aria-label*="Notific"]');
+                        return closestButton(direct);
+                    }
+
+                    function cloneActions() {
+                        const selectors = [
+                          '[data-a-target="channel-actions"]',
+                          '[data-a-target*="channel-actions"]',
+                          '[data-test-selector*="channel-actions"]',
+                          '[data-test-selector="channel-info-bar-actions"]',
+                          '[data-test-selector*="channel-info-bar"] [data-a-target*="actions"]'
+                        ];
+                        for (const sel of selectors) {
+                          const node = document.querySelector(sel);
+                          if (node) { return node.cloneNode(true); }
+                        }
+                        const follow = findFollowButton(document);
+                        const bell = findBellButton(document);
+                        if (!follow && !bell) { return null; }
+                        const wrapper = document.createElement('div');
+                        wrapper.setAttribute('data-glitcho-actions', '1');
+                        wrapper.style.display = 'flex';
+                        wrapper.style.flexWrap = 'wrap';
+                        wrapper.style.alignItems = 'center';
+                        wrapper.style.gap = '10px';
+                        if (follow) { wrapper.appendChild(follow.cloneNode(true)); }
+                        if (bell) { wrapper.appendChild(bell.cloneNode(true)); }
+                        return wrapper;
+                    }
+
+                    const actionsClone = cloneActions();
+                    if (!actionsClone) { return false; }
+
+                    try {
+                        const root = document.createElement('div');
+                        root.id = 'glitcho-about-root';
+                        const shell = document.createElement('div');
+                        shell.setAttribute('data-glitcho-about-block', '1');
+                        actionsClone.setAttribute('data-glitcho-actions', '1');
+                        actionsClone.style.marginBottom = '14px';
+
+                        const contentWrapper = document.createElement('div');
+                        contentWrapper.setAttribute('data-glitcho-about-content', '1');
+                        const rawHTML = sanitizeHTML(container.innerHTML || container.outerHTML || '');
+                        contentWrapper.innerHTML = rawHTML;
+
+                        shell.appendChild(actionsClone);
+                        shell.appendChild(contentWrapper);
+                        root.appendChild(shell);
+                        document.body.innerHTML = '';
+                        document.body.appendChild(root);
+
+                        const killSelectors = [
+                          '[data-a-target="channel-header"]',
+                          '[data-test-selector="channel-header"]',
+                          '[data-a-target="channel-info-bar"]',
+                          '[data-test-selector="channel-info-bar"]'
+                        ];
+                        killSelectors.forEach(sel => {
+                          try {
+                            root.querySelectorAll(sel).forEach(el => {
+                              if (el.matches('[data-glitcho-actions="1"]') || el.querySelector('[data-glitcho-actions="1"]')) {
+                                return;
+                              }
+                              el.remove();
+                            });
+                          } catch (_) {}
+                        });
+
+                        const norm = (s) => {
+                          try { return (s || '').toLowerCase().normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').trim(); }
+                          catch (_) { return (s || '').toLowerCase().trim(); }
+                        };
+                        Array.from(root.querySelectorAll('button,a,[role="button"],[role="tab"]')).forEach(el => {
+                          const t = norm(el.textContent);
+                          if (!t) { return; }
+                          const hit =
+                            t === 'home' ||
+                            t === 'chat' ||
+                            t === 'following';
+                          if (hit) {
+                            const li = el.closest('li');
+                            if (li) {
+                              li.remove();
+                            } else {
+                              const wrapper = el.closest('div') || el;
+                              wrapper.remove();
+                            }
+                          }
+                        });
+
+                        Array.from(root.querySelectorAll('a[href]')).forEach(a => {
+                          const href = (a.getAttribute('href') || '').toLowerCase();
+                          if (!href) { return; }
+                          if (href.endsWith('/chat') || href.includes('/chat?') || href.includes('/chat/')) {
+                            const li = a.closest('li');
+                            if (li) li.remove(); else (a.closest('div') || a).remove();
+                          }
+                          if (href.endsWith('/following') || href.includes('/following?') || href.includes('/following/')) {
+                            const li = a.closest('li');
+                            if (li) li.remove(); else (a.closest('div') || a).remove();
+                          }
+                          if (href.endsWith('/home') || href.includes('/home?') || href.includes('/home/')) {
+                            const li = a.closest('li');
+                            if (li) li.remove(); else (a.closest('div') || a).remove();
+                          }
+                        });
+
+                        try {
+                          const allowed = new Set(['about', 'a propos', 'à propos', 'schedule', 'videos', 'vidéos']);
+                          const tabs = Array.from(root.querySelectorAll('[role="tab"], a, button'));
+                          tabs.forEach(el => {
+                            const t = norm(el.textContent);
+                            if (!t) { return; }
+                            if (t === 'home' || t === 'chat' || t === 'following') { return; }
+                            const isTabby = el.getAttribute('role') === 'tab' || (el.closest('[role="tablist"]') != null);
+                            if (isTabby) {
+                              const ok = Array.from(allowed).some(a => t === a);
+                              if (!ok) {
+                                const li = el.closest('li');
+                                if (li) li.remove(); else el.remove();
+                              }
+                            }
+                          });
+                        } catch (_) {}
+
+                        try {
+                          const isEmptyish = (el) => {
+                            if (!el) return true;
+                            const text = norm(el.textContent || '');
+                            const hasMedia = !!el.querySelector('img,svg,video,audio,button,[role="button"],a');
+                            return text.length === 0 && !hasMedia;
+                          };
+                          let guardCount = 0;
+                          while (guardCount++ < 12) {
+                            const first = shell.firstElementChild;
+                            if (!first) break;
+                            const rect = first.getBoundingClientRect ? first.getBoundingClientRect() : null;
+                            const small = !rect || rect.height < 140;
+                            if (small && isEmptyish(first)) {
+                              first.remove();
+                              continue;
+                            }
+                            break;
+                          }
+                        } catch (_) {}
+                    } catch (_) { return false; }
+
+                    try {
+                      if (window.__glitcho_decorateChannelActions) {
+                        window.__glitcho_decorateChannelActions();
+                      }
+                    } catch (_) {}
+
+                    try { window.scrollTo(0, 0); } catch (_) {}
+                    return true;
+                }
+
+                ensureStyle();
+                let tries = 0;
+                const maxTries = 60;
+                const timer = setInterval(() => {
+                    ensureStyle();
+                    const ok = extractAboutOnly();
+                    tries++;
+                    if (ok || tries >= maxTries) {
+                        clearInterval(timer);
+                        document.body.classList.add('glitcho-ready');
+                    }
+                }, 200);
             })();
             """,
             injectionTime: .atDocumentEnd,
@@ -1960,8 +2299,8 @@ struct ChannelInfoView: NSViewRepresentable {
         }
         webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15"
         
-        // Load channel root page to get offline-channel-main-content
-        let url = URL(string: "https://www.twitch.tv/\(channelName)")!
+        // Load the About page (users can switch tabs to Videos/Schedule)
+        let url = URL(string: "https://www.twitch.tv/\(channelName)/about")!
         webView.load(URLRequest(url: url))
         
         return webView
@@ -1969,7 +2308,7 @@ struct ChannelInfoView: NSViewRepresentable {
     
     func updateNSView(_ nsView: WKWebView, context: Context) {
         // Reload if channel changed
-        let url = URL(string: "https://www.twitch.tv/\(channelName)")!
+        let url = URL(string: "https://www.twitch.tv/\(channelName)/about")!
         let currentPath = nsView.url?.path ?? ""
         if !currentPath.lowercased().hasPrefix("/\(channelName.lowercased())") {
             nsView.load(URLRequest(url: url))
