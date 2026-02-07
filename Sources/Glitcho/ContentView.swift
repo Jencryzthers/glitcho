@@ -124,22 +124,19 @@ struct ContentView: View {
                                 guard playbackRequest.kind == .liveChannel else { return }
                                 guard let login = playbackRequest.channelName?.lowercased() else { return }
 
-                                if recordingManager.isRecording(channelLogin: login) {
-                                    recordingManager.stopRecording(channelLogin: login)
+                                if recordingManager.isRecordingInBackgroundAgent(channelLogin: login) {
+                                    // Stop manual recording via background agent
+                                    backgroundAgentManager.removeManualRecording(login: login)
+                                    scheduleSyncBackgroundRecordingAgent()
                                     autoRecordSuppressedLogins.insert(login)
                                     autoRecordRetryState.removeValue(forKey: login)
-                                    autoRecordedLogins.insert(login)
-                                } else if recordingManager.isRecordingInBackgroundAgent(channelLogin: login) {
-                                    recordingManager.errorMessage = "This channel is being recorded by background auto-record. Disable Auto Record to stop it."
                                 } else {
-                                    let started = recordingManager.startRecording(
-                                        target: playbackRequest.streamlinkTarget,
-                                        channelName: playbackRequest.channelName
-                                    )
-                                    if started {
-                                        autoRecordSuppressedLogins.remove(login)
-                                        autoRecordRetryState.removeValue(forKey: login)
-                                    }
+                                    // Start manual recording via background agent
+                                    let displayName = playbackRequest.channelName ?? login
+                                    backgroundAgentManager.addManualRecording(login: login, displayName: displayName)
+                                    scheduleSyncBackgroundRecordingAgent()
+                                    autoRecordSuppressedLogins.remove(login)
+                                    autoRecordRetryState.removeValue(forKey: login)
                                 }
                             }
                         )

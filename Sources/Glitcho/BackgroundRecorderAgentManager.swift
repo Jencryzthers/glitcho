@@ -15,6 +15,7 @@ struct BackgroundRecorderAgentConfig: Codable, Equatable {
     let quality: String
     let pollIntervalSeconds: Double
     let channels: [BackgroundRecorderAgentChannel]
+    let manualRecordings: [BackgroundRecorderAgentChannel]?
 }
 
 @MainActor
@@ -58,6 +59,20 @@ final class BackgroundRecorderAgentManager: ObservableObject {
         logsDirectory.appendingPathComponent("agent.stderr.log")
     }
 
+    private var manualRecordings: [BackgroundRecorderAgentChannel] = []
+    
+    func addManualRecording(login: String, displayName: String?) {
+        let channel = BackgroundRecorderAgentChannel(login: login.lowercased(), displayName: displayName)
+        if !manualRecordings.contains(where: { $0.login == channel.login }) {
+            manualRecordings.append(channel)
+        }
+    }
+    
+    func removeManualRecording(login: String) {
+        let normalized = login.lowercased()
+        manualRecordings.removeAll { $0.login == normalized }
+    }
+    
     func sync(
         enabled: Bool,
         channels: [BackgroundRecorderAgentChannel],
@@ -67,7 +82,10 @@ final class BackgroundRecorderAgentManager: ObservableObject {
     ) {
         do {
             let normalizedChannels = deduplicatedChannels(channels)
+            let normalizedManual = deduplicatedChannels(manualRecordings)
             let effectiveEnabled = enabled && !normalizedChannels.isEmpty
+            let hasManualRecordings = !normalizedManual.isEmpty
+            let shouldBeRunning = effectiveEnabled || hasManualRecordings
 
             try FileManager.default.createDirectory(at: appSupportDirectory, withIntermediateDirectories: true)
             try FileManager.default.createDirectory(at: logsDirectory, withIntermediateDirectories: true)
@@ -80,7 +98,8 @@ final class BackgroundRecorderAgentManager: ObservableObject {
                 recordingsDirectory: recordingsDirectory,
                 quality: quality,
                 pollIntervalSeconds: 25,
-                channels: normalizedChannels
+                channels: normalizedChannels,
+                manualRecordings: normalizedManual
             )
 
             let configData = try JSONEncoder().encode(config)
@@ -91,14 +110,14 @@ final class BackgroundRecorderAgentManager: ObservableObject {
 
             try writeLaunchAgentPlist()
 
-            if effectiveEnabled {
+            if shouldBeRunning {
                 if lastEffectiveEnabled != true {
                     try ensureAgentRunning()
                 }
             } else if lastEffectiveEnabled != false {
                 stopAgent()
             }
-            lastEffectiveEnabled = effectiveEnabled
+            lastEffectiveEnabled = shouldBeRunning
         } catch {
             print("[BackgroundRecorderAgent] Sync failed: \(error.localizedDescription)")
         }

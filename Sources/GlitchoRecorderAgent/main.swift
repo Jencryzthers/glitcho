@@ -14,6 +14,7 @@ struct AgentConfig: Codable, Equatable {
     let quality: String
     let pollIntervalSeconds: Double
     let channels: [AgentChannel]
+    let manualRecordings: [AgentChannel]?
 }
 
 private struct RetryState {
@@ -45,7 +46,8 @@ final class RecorderAgent {
         recordingsDirectory: "",
         quality: "best",
         pollIntervalSeconds: 25,
-        channels: []
+        channels: [],
+        manualRecordings: nil
     )
 
     private var configLastModifiedAt: Date?
@@ -134,17 +136,37 @@ final class RecorderAgent {
     }
 
     private func reconcileDesiredSessions() {
-        let desiredChannels = normalizedChannels(from: config.channels)
-        let desiredLogins = Set(desiredChannels.map(\.login))
+        let autoChannels = normalizedChannels(from: config.channels)
+        let manualChannels = normalizedChannels(from: config.manualRecordings ?? [])
+        
+        // Combine both lists, prioritizing manual recordings
+        var combinedChannels: [AgentChannel] = []
+        var seen = Set<String>()
+        
+        for channel in manualChannels {
+            if seen.insert(channel.login).inserted {
+                combinedChannels.append(channel)
+            }
+        }
+        
+        if config.enabled {
+            for channel in autoChannels {
+                if seen.insert(channel.login).inserted {
+                    combinedChannels.append(channel)
+                }
+            }
+        }
+        
+        let desiredLogins = Set(combinedChannels.map(\.login))
 
-        // Stop sessions no longer desired or when disabled.
+        // Stop sessions no longer desired.
         for (login, session) in sessions {
-            if !config.enabled || !desiredLogins.contains(login) {
+            if !desiredLogins.contains(login) {
                 session.process.terminate()
             }
         }
 
-        guard config.enabled else { return }
+        guard !combinedChannels.isEmpty else { return }
 
         guard let streamlinkPath = resolveStreamlinkPath() else {
             print("[RecorderAgent] Streamlink path not found")
@@ -162,7 +184,7 @@ final class RecorderAgent {
         }
 
         let now = Date()
-        for channel in desiredChannels {
+        for channel in combinedChannels {
             let login = channel.login
             if let session = sessions[login], session.process.isRunning { continue }
             if let retry = retryByLogin[login], now < retry.nextAttemptAt { continue }
