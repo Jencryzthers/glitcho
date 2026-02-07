@@ -145,6 +145,7 @@ struct ContentView: View {
                     case .settings:
                         SettingsDetailView(
                             recordingManager: recordingManager,
+                            backgroundAgentManager: backgroundAgentManager,
                             onOpenTwitchSettings: {
                                 detailMode = .web
                                 store.navigate(to: URL(string: "https://www.twitch.tv/settings")!)
@@ -728,11 +729,11 @@ private struct RecordingStatusBadge: View {
     let channel: String?
     let count: Int
 
-    private var suffix: String {
-        if count > 1 {
-            return " • \(count) channels"
+    private var text: String {
+        if let channel {
+            return "Recording • \(channel)"
         }
-        return channel.map { " • \($0)" } ?? ""
+        return "Recording"
     }
 
     var body: some View {
@@ -740,7 +741,7 @@ private struct RecordingStatusBadge: View {
             Circle()
                 .fill(Color.red)
                 .frame(width: 8, height: 8)
-            Text("Recording\(suffix)")
+            Text(text)
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(.white.opacity(0.9))
         }

@@ -17,6 +17,7 @@ struct SettingsDetailView: View {
     @State private var clearTask: Task<Void, Never>?
 
     @ObservedObject var recordingManager: RecordingManager
+    @ObservedObject var backgroundAgentManager: BackgroundRecorderAgentManager
     var onOpenTwitchSettings: (() -> Void)?
 
     var body: some View {
@@ -293,6 +294,40 @@ struct SettingsDetailView: View {
                                     .font(.system(size: 10))
                                     .foregroundStyle(Color.orange.opacity(0.85))
                                     .lineLimit(2)
+                            }
+                            
+                            Divider()
+                                .padding(.vertical, 8)
+                            
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Background Recorder")
+                                    .font(.system(size: 12, weight: .medium))
+                                    .foregroundStyle(.white)
+                                Text("Manage the background recording agent")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(.white.opacity(0.5))
+                            }
+                            
+                            HStack(spacing: 10) {
+                                SettingsButton(
+                                    title: "Restart Agent",
+                                    systemImage: "arrow.clockwise",
+                                    style: .secondary,
+                                    action: {
+                                        backgroundAgentManager.restartAgent()
+                                    }
+                                )
+                                
+                                SettingsButton(
+                                    title: "Stop All Recordings",
+                                    systemImage: "stop.circle",
+                                    style: .secondary,
+                                    action: {
+                                        backgroundAgentManager.killAgent()
+                                    }
+                                )
+                                
+                                Spacer()
                             }
                         }
                     }

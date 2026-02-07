@@ -294,6 +294,24 @@ final class BackgroundRecorderAgentManager: ObservableObject {
         let plistPath = launchAgentPlistPath.path
         try? runLaunchctl(["bootout", target, plistPath], allowFailure: true)
     }
+    
+    func restartAgent() {
+        stopAgent()
+        do {
+            try FileManager.default.createDirectory(at: appSupportDirectory, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: logsDirectory, withIntermediateDirectories: true)
+            try installHelperBinaryIfNeeded()
+            try writeLaunchAgentPlist()
+            try ensureAgentRunning()
+        } catch {
+            print("[BackgroundRecorderAgent] Restart failed: \(error.localizedDescription)")
+        }
+    }
+    
+    func killAgent() {
+        stopAgent()
+        manualRecordings = []
+    }
 }
 
 #endif
