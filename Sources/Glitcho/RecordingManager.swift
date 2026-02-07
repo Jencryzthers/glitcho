@@ -1,15 +1,26 @@
 import Foundation
+import Darwin
 
 #if canImport(SwiftUI)
 
 @MainActor
 final class RecordingManager: ObservableObject {
+    struct RecoveryIntent: Codable, Equatable {
+        let target: String
+        let channelLogin: String?
+        let channelName: String?
+        let quality: String
+        let capturedAt: Date
+    }
+
     @Published var isRecording = false
     @Published var activeChannel: String?
     @Published var activeChannelLogin: String?
     @Published var activeChannelName: String?
     @Published var lastOutputURL: URL?
     @Published var errorMessage: String?
+    @Published private(set) var activeRecordingCount = 0
+    @Published private(set) var backgroundRecordingCount = 0
 
     @Published var isInstalling = false
     @Published var installStatus: String?
@@ -19,8 +30,29 @@ final class RecordingManager: ObservableObject {
     @Published var ffmpegInstallStatus: String?
     @Published var ffmpegInstallError: String?
 
-    private var process: Process?
-    private var userInitiatedStop = false
+    private struct RecordingSession {
+        let key: String
+        let target: String
+        let login: String?
+        let channelName: String?
+        let quality: String
+        let outputURL: URL
+        let process: Process
+        let startedAt: Date
+        var userInitiatedStop: Bool
+    }
+
+    private struct BackgroundAgentActiveSession: Decodable {
+        let login: String
+        let pid: Int32
+    }
+
+    private var recordingSessions: [String: RecordingSession] = [:]
+    private var backgroundRecordingLogins: Set<String> = []
+    private var backgroundRecordingMonitor: Timer?
+    private var pendingRecoveryIntents: [RecoveryIntent] = []
+    private let recoveryDefaultsKey = "recordingRecoveryIntents.v1"
+
     private let filenameDateFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
@@ -30,6 +62,31 @@ final class RecordingManager: ObservableObject {
 
     /// Override ffmpeg path resolution (primarily for unit tests).
     var _resolveFFmpegPathOverride: (() -> String?)?
+    /// Override streamlink path resolution (primarily for unit tests).
+    var _resolveStreamlinkPathOverride: (() -> String?)?
+
+    init() {
+        pendingRecoveryIntents = loadPersistedRecoveryIntents()
+        refreshBackgroundRecordingState()
+        startBackgroundRecordingMonitor()
+    }
+
+    deinit {
+        backgroundRecordingMonitor?.invalidate()
+    }
+
+    func consumeRecoveryIntents() -> [RecoveryIntent] {
+        return pendingRecoveryIntents
+    }
+
+    func clearPendingRecoveryIntent(channelLogin: String) {
+        let normalized = channelLogin.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty else { return }
+        pendingRecoveryIntents.removeAll { intent in
+            normalizedChannelLogin(intent.channelLogin) == normalized
+        }
+        persistRecoveryIntents(from: Array(recordingSessions.values))
+    }
 
     func recordingsDirectory() -> URL {
         if let saved = UserDefaults.standard.string(forKey: "recordingsDirectory"),
@@ -93,7 +150,7 @@ final class RecordingManager: ObservableObject {
             )
         }
 
-        if isRecording, lastOutputURL == url {
+        if isRecording(outputURL: url) {
             throw NSError(
                 domain: "RecordingError",
                 code: 11,
@@ -110,21 +167,37 @@ final class RecordingManager: ObservableObject {
         }
     }
     func toggleRecording(target: String, channelName: String?, quality: String = "best") {
-        if isRecording {
-            stopRecording()
-        } else {
-            startRecording(target: target, channelName: channelName, quality: quality)
+        let resolvedChannelLogin = channelLogin(from: target)
+        if let resolvedChannelLogin, isRecording(channelLogin: resolvedChannelLogin) {
+            stopRecording(channelLogin: resolvedChannelLogin)
+            return
         }
+
+        let key = recordingKey(target: target, channelLogin: resolvedChannelLogin)
+        if recordingSessions[key] != nil {
+            stopRecording(forKey: key)
+            return
+        }
+
+        _ = startRecording(target: target, channelName: channelName, quality: quality)
     }
 
-    func startRecording(target: String, channelName: String?, quality: String = "best") {
-        guard !isRecording else { return }
+    @discardableResult
+    func startRecording(target: String, channelName: String?, quality: String = "best") -> Bool {
         errorMessage = nil
-        userInitiatedStop = false
+
+        let resolvedChannelLogin = channelLogin(from: target)
+        if let resolvedChannelLogin,
+           isRecordingInBackgroundAgent(channelLogin: resolvedChannelLogin) {
+            errorMessage = "This channel is already being recorded by the background recorder."
+            return false
+        }
+        let sessionKey = recordingKey(target: target, channelLogin: resolvedChannelLogin)
+        guard recordingSessions[sessionKey] == nil else { return false }
 
         guard let streamlinkPath = resolveStreamlinkPath() else {
             errorMessage = "Streamlink is not installed. Use Settings > Recording to download it or set a custom path."
-            return
+            return false
         }
 
         let directory = recordingsDirectory()
@@ -132,13 +205,17 @@ final class RecordingManager: ObservableObject {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         } catch {
             errorMessage = "Unable to create recordings folder: \(error.localizedDescription)"
-            return
+            return false
         }
 
-        let resolvedChannelLogin = channelLogin(from: target)
         let normalizedName = channelName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let displayName = normalizedName?.isEmpty == false ? normalizedName : resolvedChannelLogin
+        let resolvedRecordingTarget = resolvedTarget(from: target)
+        if let resolvedChannelLogin {
+            clearPendingRecoveryIntent(channelLogin: resolvedChannelLogin)
+        }
         let timestamp = filenameDateFormatter.string(from: Date())
-        let safeChannelBase = (normalizedName?.isEmpty == false ? normalizedName! : (resolvedChannelLogin ?? "twitch"))
+        let safeChannelBase = displayName ?? "twitch"
         let safeChannel = safeChannelBase.replacingOccurrences(of: " ", with: "_")
         let filename = "\(safeChannel)_\(timestamp).mp4"
         let outputURL = directory.appendingPathComponent(filename)
@@ -146,7 +223,7 @@ final class RecordingManager: ObservableObject {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: streamlinkPath)
         process.arguments = [
-            resolvedTarget(from: target),
+            resolvedRecordingTarget,
             quality,
             "--twitch-disable-ads",
             "--twitch-low-latency",
@@ -160,51 +237,207 @@ final class RecordingManager: ObservableObject {
         process.terminationHandler = { [weak self] proc in
             Task { @MainActor in
                 guard let self else { return }
-                self.isRecording = false
-                self.activeChannel = nil
-                self.activeChannelLogin = nil
-                self.activeChannelName = nil
-                let didUserStop = self.userInitiatedStop
-                self.userInitiatedStop = false
+                guard let session = self.recordingSessions.removeValue(forKey: sessionKey) else { return }
+                self.syncPublishedRecordingState()
+
+                let didUserStop = session.userInitiatedStop
                 if proc.terminationStatus != 0 && !didUserStop {
                     let data = errorPipe.fileHandleForReading.readDataToEndOfFile()
                     let message = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
                     self.errorMessage = message?.isEmpty == false ? message : "Recording stopped unexpectedly."
                 }
-                self.process = nil
 
                 // Streamlink outputs MPEG-TS data even when the filename ends with .mp4.
                 // Remux to a real MP4 so AVPlayer can play it.
                 let shouldAttemptFinalize = proc.terminationStatus == 0 || didUserStop
                 if shouldAttemptFinalize {
                     Task {
-                        _ = try? await self.prepareRecordingForPlayback(at: outputURL)
+                        _ = try? await self.prepareRecordingForPlayback(at: session.outputURL)
                     }
                 }
             }
         }
 
+        recordingSessions[sessionKey] = RecordingSession(
+            key: sessionKey,
+            target: resolvedRecordingTarget,
+            login: resolvedChannelLogin,
+            channelName: displayName,
+            quality: quality,
+            outputURL: outputURL,
+            process: process,
+            startedAt: Date(),
+            userInitiatedStop: false
+        )
+        syncPublishedRecordingState()
+
         do {
             try process.run()
-            self.process = process
-            lastOutputURL = outputURL
-            activeChannel = channelName
-            isRecording = true
-            activeChannelLogin = resolvedChannelLogin
-            activeChannelName = normalizedName?.isEmpty == false ? normalizedName : resolvedChannelLogin
+            return true
         } catch {
+            recordingSessions.removeValue(forKey: sessionKey)
+            syncPublishedRecordingState()
             errorMessage = "Failed to start recording: \(error.localizedDescription)"
+            return false
         }
     }
 
+    func stopRecording(channelLogin: String) {
+        guard let normalized = normalizedChannelLogin(channelLogin) else { return }
+        stopRecording(forKey: loginKey(for: normalized))
+    }
+
     func stopRecording() {
-        userInitiatedStop = process != nil
-        process?.terminate()
-        process = nil
-        isRecording = false
-        activeChannel = nil
-        activeChannelLogin = nil
-        activeChannelName = nil
+        for key in Array(recordingSessions.keys) {
+            stopRecording(forKey: key)
+        }
+    }
+
+    func isRecording(channelLogin: String?) -> Bool {
+        guard let channelLogin, let normalized = normalizedChannelLogin(channelLogin) else { return false }
+        return recordingSessions[loginKey(for: normalized)] != nil
+    }
+
+    func isRecording(outputURL: URL) -> Bool {
+        let normalizedURL = outputURL.standardizedFileURL
+        return recordingSessions.values.contains { $0.outputURL.standardizedFileURL == normalizedURL }
+    }
+
+    func isRecordingAny(channelLogin: String?) -> Bool {
+        isRecording(channelLogin: channelLogin) || isRecordingInBackgroundAgent(channelLogin: channelLogin)
+    }
+
+    func isRecordingInBackgroundAgent(channelLogin: String?) -> Bool {
+        guard let channelLogin, let normalized = normalizedChannelLogin(channelLogin) else { return false }
+        return backgroundRecordingLogins.contains(normalized)
+    }
+
+    func isAnyRecordingIncludingBackground() -> Bool {
+        !recordingSessions.isEmpty || !backgroundRecordingLogins.isEmpty
+    }
+
+    func recordingCountIncludingBackground() -> Int {
+        let localLogins = Set(recordingSessions.values.compactMap { normalizedChannelLogin($0.login) })
+        let localWithoutLoginCount = recordingSessions.values.filter { normalizedChannelLogin($0.login) == nil }.count
+        return localLogins.union(backgroundRecordingLogins).count + localWithoutLoginCount
+    }
+
+    func recordingBadgeChannelIncludingBackground() -> String? {
+        if let activeChannel {
+            return activeChannel
+        }
+        return backgroundRecordingLogins.sorted().first
+    }
+
+    func streamlinkPathForBackgroundAgent() -> String? {
+        resolveStreamlinkPath()
+    }
+
+    private func stopRecording(forKey key: String) {
+        guard var session = recordingSessions[key] else { return }
+        if !session.userInitiatedStop {
+            session.userInitiatedStop = true
+            recordingSessions[key] = session
+        }
+        session.process.terminate()
+    }
+
+    private func syncPublishedRecordingState() {
+        let sessions = recordingSessions.values.sorted { lhs, rhs in
+            lhs.startedAt > rhs.startedAt
+        }
+
+        persistRecoveryIntents(from: sessions)
+
+        activeRecordingCount = sessions.count
+        isRecording = !sessions.isEmpty
+
+        guard let primary = sessions.first else {
+            activeChannel = nil
+            activeChannelLogin = nil
+            activeChannelName = nil
+            lastOutputURL = nil
+            return
+        }
+
+        activeChannel = primary.channelName ?? primary.login
+        activeChannelLogin = primary.login
+        activeChannelName = primary.channelName ?? primary.login
+        lastOutputURL = primary.outputURL
+    }
+
+    private func normalizedChannelLogin(_ login: String?) -> String? {
+        guard let login else { return nil }
+        let normalized = login.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return normalized.isEmpty ? nil : normalized
+    }
+
+    private func loginKey(for login: String) -> String {
+        "login:\(login)"
+    }
+
+    private func recordingKey(target: String, channelLogin: String?) -> String {
+        if let normalizedLogin = normalizedChannelLogin(channelLogin) {
+            return loginKey(for: normalizedLogin)
+        }
+        return "target:\(resolvedTarget(from: target).lowercased())"
+    }
+
+    private func recoveryIntentKey(for intent: RecoveryIntent) -> String {
+        if let normalizedLogin = normalizedChannelLogin(intent.channelLogin) {
+            return loginKey(for: normalizedLogin)
+        }
+        return "target:\(intent.target.lowercased())"
+    }
+
+    private func persistRecoveryIntents(from sessions: [RecordingSession]) {
+        let activeIntents = sessions.map { session in
+            RecoveryIntent(
+                target: session.target,
+                channelLogin: session.login,
+                channelName: session.channelName,
+                quality: session.quality,
+                capturedAt: session.startedAt
+            )
+        }
+
+        var byKey: [String: RecoveryIntent] = [:]
+        for intent in activeIntents {
+            byKey[recoveryIntentKey(for: intent)] = intent
+        }
+        for intent in pendingRecoveryIntents {
+            let key = recoveryIntentKey(for: intent)
+            if byKey[key] == nil {
+                byKey[key] = intent
+            }
+        }
+        let intents = byKey.values.sorted { lhs, rhs in
+            lhs.capturedAt > rhs.capturedAt
+        }
+
+        if let data = try? JSONEncoder().encode(intents) {
+            UserDefaults.standard.set(data, forKey: recoveryDefaultsKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: recoveryDefaultsKey)
+        }
+    }
+
+    private func loadPersistedRecoveryIntents() -> [RecoveryIntent] {
+        guard let data = UserDefaults.standard.data(forKey: recoveryDefaultsKey) else {
+            return []
+        }
+        guard let decoded = try? JSONDecoder().decode([RecoveryIntent].self, from: data) else {
+            return []
+        }
+
+        var seen = Set<String>()
+        return decoded
+            .sorted { lhs, rhs in lhs.capturedAt > rhs.capturedAt }
+            .filter { intent in
+                let key = recoveryIntentKey(for: intent)
+                guard !key.isEmpty else { return false }
+                return seen.insert(key).inserted
+            }
     }
 
     /// Ensures the given recording file is playable by AVPlayer.
@@ -272,7 +505,7 @@ final class RecordingManager: ObservableObject {
                 return expanded
             }
         }
-        return resolveExecutable(named: "ffmpeg")
+        return Glitcho.resolveExecutable(named: "ffmpeg")
     }
 
     func isTransportStreamFile(at url: URL) -> Bool {
@@ -312,6 +545,10 @@ final class RecordingManager: ObservableObject {
     }
 
     private func resolveStreamlinkPath() -> String? {
+        if let override = _resolveStreamlinkPathOverride {
+            return override()
+        }
+
         let candidates = [
             UserDefaults.standard.string(forKey: "streamlinkPath"),
             bundledStreamlinkPath(),
@@ -327,6 +564,78 @@ final class RecordingManager: ObservableObject {
             }
         }
         return nil
+    }
+
+    private func backgroundAgentSessionsDirectory() -> URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser
+        return base
+            .appendingPathComponent("Glitcho", isDirectory: true)
+            .appendingPathComponent("BackgroundRecorder", isDirectory: true)
+            .appendingPathComponent("ActiveSessions", isDirectory: true)
+    }
+
+    private func startBackgroundRecordingMonitor() {
+        backgroundRecordingMonitor?.invalidate()
+        let timer = Timer(timeInterval: 5, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.refreshBackgroundRecordingState()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        backgroundRecordingMonitor = timer
+    }
+
+    private func refreshBackgroundRecordingState() {
+        let logins = currentBackgroundRecordingLogins()
+        if logins != backgroundRecordingLogins {
+            backgroundRecordingLogins = logins
+            backgroundRecordingCount = logins.count
+        } else if backgroundRecordingCount != logins.count {
+            backgroundRecordingCount = logins.count
+        }
+    }
+
+    private func currentBackgroundRecordingLogins() -> Set<String> {
+        let directory = backgroundAgentSessionsDirectory()
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+
+        var logins = Set<String>()
+        for file in files where file.pathExtension.lowercased() == "json" {
+            guard let data = try? Data(contentsOf: file),
+                  let decoded = try? JSONDecoder().decode(BackgroundAgentActiveSession.self, from: data) else {
+                try? FileManager.default.removeItem(at: file)
+                continue
+            }
+
+            let login = decoded.login.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !login.isEmpty else {
+                try? FileManager.default.removeItem(at: file)
+                continue
+            }
+            guard isProcessAlive(decoded.pid) else {
+                try? FileManager.default.removeItem(at: file)
+                continue
+            }
+
+            logins.insert(login)
+        }
+
+        return logins
+    }
+
+    private func isProcessAlive(_ pid: Int32) -> Bool {
+        guard pid > 0 else { return false }
+        if kill(pid, 0) == 0 {
+            return true
+        }
+        return errno == EPERM
     }
 
     private func channelLogin(from target: String) -> String? {
@@ -420,7 +729,7 @@ final class RecordingManager: ObservableObject {
         }
 
         // Prefer Homebrew when available (best chance of matching the user's CPU architecture).
-        if let brewPath = resolveExecutable(named: "brew") {
+        if let brewPath = Glitcho.resolveExecutable(named: "brew") {
             do {
                 ffmpegInstallStatus = "Installing FFmpeg with Homebrew..."
                 _ = try await runProcess(executable: brewPath, arguments: ["install", "ffmpeg"])
@@ -564,7 +873,7 @@ final class RecordingManager: ObservableObject {
     }
 
     private func resolvePython3Path() -> String? {
-        resolveExecutable(named: "python3")
+        Glitcho.resolveExecutable(named: "python3")
             ?? ["/usr/bin/python3", "/opt/homebrew/bin/python3", "/usr/local/bin/python3"].first { path in
                 FileManager.default.isExecutableFile(atPath: path)
             }
@@ -599,23 +908,6 @@ final class RecordingManager: ObservableObject {
         return nil
     }
 
-    private func resolveExecutable(named name: String) -> String? {
-        let fallbackPaths = [
-            "/opt/homebrew/bin/\(name)",
-            "/usr/local/bin/\(name)",
-            "/usr/bin/\(name)"
-        ]
-        let pathEnvironment = ProcessInfo.processInfo.environment["PATH"] ?? ""
-        let pathEntries = pathEnvironment.split(separator: ":").map(String.init)
-        let searchPaths = pathEntries + fallbackPaths
-        for directory in searchPaths {
-            let candidate = URL(fileURLWithPath: directory).appendingPathComponent(name).path
-            if FileManager.default.isExecutableFile(atPath: candidate) {
-                return candidate
-            }
-        }
-        return nil
-    }
 
     struct ProcessOutput {
         let stdout: String

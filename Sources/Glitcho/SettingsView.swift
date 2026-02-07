@@ -2,6 +2,431 @@
 import AppKit
 import SwiftUI
 
+struct SettingsDetailView: View {
+    @AppStorage("liveAlertsEnabled") private var liveAlertsEnabled = true
+    @AppStorage("liveAlertsPinnedOnly") private var liveAlertsPinnedOnly = false
+    @AppStorage(SidebarTint.storageKey) private var sidebarTintHex = SidebarTint.defaultHex
+    @AppStorage("recordingsDirectory") private var recordingsDirectory = ""
+    @AppStorage("streamlinkPath") private var streamlinkPath = ""
+    @AppStorage("ffmpegPath") private var ffmpegPath = ""
+    @AppStorage("autoRecordOnLive") private var autoRecordOnLive = false
+    @AppStorage("autoRecordPinnedOnly") private var autoRecordPinnedOnly = false
+    @Environment(\.notificationManager) private var notificationManager
+    @Environment(\.openURL) private var openURL
+    @State private var testStatus: NotificationTestStatus?
+    @State private var clearTask: Task<Void, Never>?
+
+    @ObservedObject var recordingManager: RecordingManager
+    var onOpenTwitchSettings: (() -> Void)?
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 16) {
+                // Header
+                VStack(spacing: 8) {
+                    Image(systemName: "slider.horizontal.3")
+                        .font(.system(size: 32, weight: .medium))
+                        .foregroundStyle(
+                            LinearGradient(
+                                colors: [Color.purple, Color.pink.opacity(0.8)],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+
+                    Text("Settings")
+                        .font(.system(size: 24, weight: .bold))
+                        .foregroundStyle(.white)
+
+                    Text("Customize your Glitcho experience")
+                        .font(.system(size: 13))
+                        .foregroundStyle(.white.opacity(0.5))
+                }
+                .padding(.top, 24)
+                .padding(.bottom, 8)
+
+                VStack(spacing: 14) {
+                    SettingsCard(
+                        icon: "paintpalette.fill",
+                        iconColor: Color(red: 0.53, green: 0.42, blue: 0.95),
+                        title: "Appearance",
+                        subtitle: "Customize the sidebar tint"
+                    ) {
+                        HStack(spacing: 12) {
+                            ColorPicker("Sidebar tint", selection: sidebarTintBinding, supportsOpacity: false)
+                                .labelsHidden()
+
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Sidebar tint")
+                                    .font(.system(size: 12, weight: .medium))
+                                    .foregroundStyle(.white)
+                                Text(sidebarTintHex.uppercased())
+                                    .font(.system(size: 10, weight: .medium))
+                                    .foregroundStyle(.white.opacity(0.5))
+                            }
+
+                            Spacer()
+
+                            SettingsButton(
+                                title: "Reset",
+                                systemImage: "arrow.counterclockwise",
+                                style: .secondary,
+                                action: { sidebarTintHex = SidebarTint.defaultHex }
+                            )
+                        }
+                        .padding(.vertical, 4)
+                    }
+
+                    SettingsCard(
+                        icon: "bell.badge.fill",
+                        iconColor: .purple,
+                        title: "Notifications",
+                        subtitle: "Control how Glitcho alerts you"
+                    ) {
+                        SettingsToggleRow(
+                            title: "Live alerts",
+                            detail: "Show a notification when followed channels go live.",
+                            isOn: $liveAlertsEnabled
+                        )
+
+                        SettingsToggleRow(
+                            title: "Favorites only",
+                            detail: "Only notify for pinned channels with the bell enabled.",
+                            isOn: $liveAlertsPinnedOnly
+                        )
+                        .disabled(!liveAlertsEnabled)
+                        .opacity(liveAlertsEnabled ? 1 : 0.5)
+
+                        HStack(spacing: 10) {
+                            SettingsButton(
+                                title: "Test",
+                                systemImage: "bell.badge.fill",
+                                style: .primary,
+                                action: testNotification
+                            )
+                            .disabled(notificationManager == nil || !liveAlertsEnabled)
+
+                            if let testStatus {
+                                Text(testStatus.message)
+                                    .font(.system(size: 10, weight: .medium))
+                                    .foregroundStyle(testStatus.color)
+                                    .lineLimit(2)
+                            }
+
+                            Spacer()
+                        }
+                        .padding(.top, 4)
+                    }
+
+                    SettingsCard(
+                        icon: "lock.shield.fill",
+                        iconColor: .blue,
+                        title: "System Permissions",
+                        subtitle: "Allow notifications in macOS"
+                    ) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            permissionRow(
+                                icon: "bell.badge.fill",
+                                title: "Allow notifications",
+                                detail: "System Settings > Notifications"
+                            )
+                            permissionRow(
+                                icon: "rectangle.badge.plus",
+                                title: "Enable banners",
+                                detail: "For instant live alerts"
+                            )
+                        }
+
+                        HStack {
+                            Spacer()
+                            SettingsButton(
+                                title: "Open System Settings",
+                                systemImage: "gear",
+                                style: .secondary,
+                                action: openNotificationSettings
+                            )
+                        }
+                        .padding(.top, 4)
+                    }
+
+                    SettingsCard(
+                        icon: "record.circle",
+                        iconColor: .red,
+                        title: "Recording",
+                        subtitle: "Capture live streams with Streamlink"
+                    ) {
+                        VStack(alignment: .leading, spacing: 10) {
+                            SettingsToggleRow(
+                                title: "Auto-record when live",
+                                detail: "Start recording followed channels as soon as they go live.",
+                                isOn: $autoRecordOnLive
+                            )
+
+                            SettingsToggleRow(
+                                title: "Favorites only",
+                                detail: "Only auto-record pinned channels with notifications enabled.",
+                                isOn: $autoRecordPinnedOnly
+                            )
+                            .disabled(!autoRecordOnLive)
+                            .opacity(autoRecordOnLive ? 1 : 0.5)
+
+                            settingsValueRow(
+                                title: "Recordings folder",
+                                value: recordingsDirectory.isEmpty ? "Default (Downloads/Glitcho Recordings)" : recordingsDirectory
+                            )
+
+                            HStack {
+                                SettingsButton(
+                                    title: "Choose Folder",
+                                    systemImage: "folder",
+                                    style: .secondary,
+                                    action: selectRecordingsFolder
+                                )
+                                Spacer()
+                            }
+
+                            settingsValueRow(
+                                title: "Streamlink binary",
+                                value: streamlinkPath.isEmpty ? "Auto-detect (Homebrew or downloaded)" : streamlinkPath
+                            )
+
+                            HStack {
+                                SettingsButton(
+                                    title: "Choose Streamlink",
+                                    systemImage: "terminal",
+                                    style: .secondary,
+                                    action: selectStreamlinkBinary
+                                )
+                                Spacer()
+                            }
+
+                            if recordingManager.isInstalling {
+                                HStack(spacing: 8) {
+                                    ProgressView()
+                                        .scaleEffect(0.7)
+                                    Text(recordingManager.installStatus ?? "Installing Streamlink…")
+                                        .font(.system(size: 10))
+                                        .foregroundStyle(.white.opacity(0.7))
+                                    Spacer()
+                                }
+                            }
+
+                            HStack {
+                                SettingsButton(
+                                    title: recordingManager.isInstalling ? "Installing…" : "Install Streamlink",
+                                    systemImage: "arrow.down.circle",
+                                    style: .primary,
+                                    action: {
+                                        Task { await recordingManager.installStreamlink() }
+                                    }
+                                )
+                                .disabled(recordingManager.isInstalling)
+                                Spacer()
+                            }
+
+                            if !recordingManager.isInstalling, let status = recordingManager.installStatus {
+                                let lower = status.lowercased()
+                                let isSuccess = lower.contains("installed") || lower.contains("available")
+                                Text(status)
+                                    .font(.system(size: 10, weight: .medium))
+                                    .foregroundStyle(isSuccess ? Color.green.opacity(0.8) : Color.white.opacity(0.6))
+                                    .lineLimit(2)
+                            }
+
+                            if let installError = recordingManager.installError {
+                                Text(installError)
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(Color.orange.opacity(0.85))
+                                    .lineLimit(2)
+                            }
+
+                            settingsValueRow(
+                                title: "FFmpeg binary (optional)",
+                                value: ffmpegPath.isEmpty ? "Auto-detect (ffmpeg in PATH)" : ffmpegPath
+                            )
+
+                            HStack {
+                                SettingsButton(
+                                    title: "Choose FFmpeg",
+                                    systemImage: "terminal",
+                                    style: .secondary,
+                                    action: selectFFmpegBinary
+                                )
+                                Spacer()
+                            }
+
+                            if recordingManager.isInstallingFFmpeg {
+                                HStack(spacing: 8) {
+                                    ProgressView()
+                                        .scaleEffect(0.7)
+                                    Text(recordingManager.ffmpegInstallStatus ?? "Installing FFmpeg…")
+                                        .font(.system(size: 10))
+                                        .foregroundStyle(.white.opacity(0.7))
+                                    Spacer()
+                                }
+                            }
+
+                            HStack {
+                                SettingsButton(
+                                    title: recordingManager.isInstallingFFmpeg ? "Installing…" : "Install FFmpeg",
+                                    systemImage: "arrow.down.circle",
+                                    style: .primary,
+                                    action: {
+                                        Task { await recordingManager.installFFmpeg() }
+                                    }
+                                )
+                                .disabled(recordingManager.isInstallingFFmpeg)
+                                Spacer()
+                            }
+
+                            if !recordingManager.isInstallingFFmpeg, let status = recordingManager.ffmpegInstallStatus {
+                                let lower = status.lowercased()
+                                let isSuccess = lower.contains("installed") || lower.contains("available")
+                                Text(status)
+                                    .font(.system(size: 10, weight: .medium))
+                                    .foregroundStyle(isSuccess ? Color.green.opacity(0.8) : Color.white.opacity(0.6))
+                                    .lineLimit(2)
+                            }
+
+                            if let installError = recordingManager.ffmpegInstallError {
+                                Text(installError)
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(Color.orange.opacity(0.85))
+                                    .lineLimit(2)
+                            }
+                        }
+                    }
+                }
+                .padding(.horizontal, 24)
+                .padding(.bottom, 24)
+            }
+        }
+        .background(Color(red: 0.05, green: 0.05, blue: 0.07))
+    }
+
+    private var sidebarTintBinding: Binding<Color> {
+        Binding(
+            get: { SidebarTint.color(from: sidebarTintHex) },
+            set: { newValue in
+                sidebarTintHex = newValue.toHex() ?? SidebarTint.defaultHex
+            }
+        )
+    }
+
+    private func testNotification() {
+        clearTask?.cancel()
+        clearTask = nil
+
+        let channel = TwitchChannel(
+            id: "glitcho-test",
+            name: "Glitcho Test",
+            url: URL(string: "https://www.twitch.tv")!,
+            thumbnailURL: nil
+        )
+
+        guard let notificationManager else {
+            setTestStatus(.unavailable)
+            return
+        }
+
+        Task {
+            let allowed = await notificationManager.requestAuthorization()
+            if !allowed {
+                await MainActor.run {
+                    setTestStatus(.denied)
+                }
+                return
+            }
+
+            await notificationManager.notifyChannelLive(channel)
+            await MainActor.run {
+                setTestStatus(.sent)
+            }
+        }
+    }
+
+    private func setTestStatus(_ status: NotificationTestStatus) {
+        testStatus = status
+        clearTask?.cancel()
+        clearTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            testStatus = nil
+        }
+    }
+
+    private func openNotificationSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.notifications") {
+            NSWorkspace.shared.open(url)
+        } else {
+            NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/System Settings.app"))
+        }
+    }
+
+    private func selectRecordingsFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Choose"
+        if panel.runModal() == .OK, let url = panel.url {
+            recordingsDirectory = url.path
+        }
+    }
+
+    private func selectStreamlinkBinary() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Choose"
+        if panel.runModal() == .OK, let url = panel.url {
+            streamlinkPath = url.path
+        }
+    }
+
+    private func selectFFmpegBinary() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Choose"
+        if panel.runModal() == .OK, let url = panel.url {
+            ffmpegPath = url.path
+        }
+    }
+
+    private func permissionRow(icon: String, title: String, detail: String) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: icon)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.white.opacity(0.5))
+                .frame(width: 16)
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.9))
+                Text(detail)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.white.opacity(0.45))
+            }
+        }
+    }
+
+    private func settingsValueRow(title: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.white.opacity(0.9))
+            Text(value)
+                .font(.system(size: 10))
+                .foregroundStyle(.white.opacity(0.5))
+                .lineLimit(2)
+        }
+    }
+}
+
 struct SettingsModal: View {
     let onClose: () -> Void
     let recordingManager: RecordingManager
@@ -625,7 +1050,7 @@ struct SettingsCard<Content: View>: View {
     }
 }
 
-private struct SettingsButton: View {
+struct SettingsButton: View {
     enum Style {
         case primary
         case secondary
@@ -668,7 +1093,7 @@ private struct SettingsButton: View {
     }
 }
 
-private struct SettingsToggleRow: View {
+struct SettingsToggleRow: View {
     let title: String
     let detail: String
     @Binding var isOn: Bool

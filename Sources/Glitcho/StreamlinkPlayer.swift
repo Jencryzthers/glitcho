@@ -66,7 +66,6 @@ class StreamlinkManager: ObservableObject {
                     let stdoutOutput = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 
                     if process.terminationStatus == 0, let url = URL(string: stdoutOutput) {
-                        print("[Streamlink] Got stream URL: \(url)")
                         continuation.resume(returning: url)
                     } else {
                         // NOTE: streamlink often prints errors to STDOUT (not STDERR).
@@ -81,11 +80,8 @@ class StreamlinkManager: ObservableObject {
                             message = "Streamlink failed (exit code \(process.terminationStatus))."
                         }
 
-                        print("[Streamlink] Error: \(message)")
-
                         // Try TwitchNoSub fallback for subscriber-only VODs
                         if let vodId = self.extractVODId(from: resolvedTarget) {
-                            print("[TwitchNoSub] 🎯 Detected VOD failure, attempting fallback for VOD \(vodId)...")
 
                             // Use a detached task to avoid continuation issues
                             Task.detached { [weak self] in
@@ -100,10 +96,8 @@ class StreamlinkManager: ObservableObject {
 
                                 do {
                                     let mutedURL = try await self.generateMutedVODPlaylist(vodId: vodId)
-                                    print("[TwitchNoSub] ✅ Successfully generated muted VOD URL: \(mutedURL)")
                                     continuation.resume(returning: mutedURL)
                                 } catch {
-                                    print("[TwitchNoSub] ❌ Fallback failed: \(error.localizedDescription)")
                                     let fallbackError = NSError(
                                         domain: "TwitchNoSub",
                                         code: Int(process.terminationStatus),
@@ -113,7 +107,6 @@ class StreamlinkManager: ObservableObject {
                                 }
                             }
                         } else {
-                            print("[TwitchNoSub] Not a VOD URL, cannot use fallback")
                             continuation.resume(throwing: NSError(
                                 domain: "StreamlinkError",
                                 code: Int(process.terminationStatus),
@@ -122,7 +115,6 @@ class StreamlinkManager: ObservableObject {
                         }
                     }
                 } catch {
-                    print("[Streamlink] Failed to run: \(error)")
                     continuation.resume(throwing: error)
                 }
             }
@@ -152,41 +144,19 @@ class StreamlinkManager: ObservableObject {
         ]
     }
 
-    private func webKitCookies() async -> [HTTPCookie] {
-        await withCheckedContinuation { continuation in
-            DispatchQueue.main.async {
-                WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
-                    continuation.resume(returning: cookies)
-                }
-            }
-        }
-    }
 
     // MARK: - TwitchNoSub Fallback for Subscriber-Only VODs
 
     private func extractVODId(from urlString: String) -> String? {
-        print("[TwitchNoSub] 🔍 Extracting VOD ID from: \(urlString)")
-        guard let url = URL(string: urlString) else {
-            print("[TwitchNoSub] ❌ Invalid URL")
-            return nil
-        }
-        let path = url.path
-        let components = path.split(separator: "/").map(String.init)
-        print("[TwitchNoSub] Path components: \(components)")
-
-        // VOD URL format: /videos/123456789
+        guard let url = URL(string: urlString) else { return nil }
+        let components = url.path.split(separator: "/").map(String.init)
         if components.count >= 2, components[0].lowercased() == "videos" {
-            let vodId = components[1]
-            print("[TwitchNoSub] ✅ Found VOD ID: \(vodId)")
-            return vodId
+            return components[1]
         }
-
-        print("[TwitchNoSub] ❌ Not a VOD URL (doesn't match /videos/XXX format)")
         return nil
     }
 
     private func fetchTwitchVODMetadata(vodId: String) async throws -> (domain: String, vodSpecialId: String, broadcastType: String, channelLogin: String, createdAt: Date) {
-        print("[TwitchNoSub] 📡 Fetching metadata for VOD \(vodId) from Twitch GraphQL API...")
         let query = #"query { video(id: "\#(vodId)") { broadcastType, createdAt, seekPreviewsURL, owner { login } }}"#
         let body = ["query": query]
         let jsonData = try JSONSerialization.data(withJSONObject: body)
@@ -197,14 +167,8 @@ class StreamlinkManager: ObservableObject {
         request.setValue("kimne78kx3ncx6brgo4mv6wki5h1ko", forHTTPHeaderField: "Client-Id")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
-        let (data, response) = try await URLSession.shared.data(for: request)
-
-        if let httpResponse = response as? HTTPURLResponse {
-            print("[TwitchNoSub] GraphQL API response status: \(httpResponse.statusCode)")
-        }
-
+        let (data, _) = try await URLSession.shared.data(for: request)
         let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-        print("[TwitchNoSub] GraphQL response: \(String(data: data, encoding: .utf8) ?? "unable to decode")")
 
         guard let videoData = json?["data"] as? [String: Any],
               let video = videoData["video"] as? [String: Any],
@@ -232,10 +196,7 @@ class StreamlinkManager: ObservableObject {
     }
 
     private func generateMutedVODPlaylist(vodId: String) async throws -> URL {
-        print("[TwitchNoSub] 🔄 Attempting fallback for subscriber-only VOD \(vodId)...")
-
         let metadata = try await fetchTwitchVODMetadata(vodId: vodId)
-        print("[TwitchNoSub] ✅ Got VOD metadata: \(metadata.broadcastType)")
 
         let now = Date()
         let daysSinceCreation = now.timeIntervalSince(metadata.createdAt) / (24 * 3600)
@@ -261,7 +222,6 @@ class StreamlinkManager: ObservableObject {
             do {
                 let (_, response) = try await URLSession.shared.data(from: url)
                 if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 {
-                    print("[TwitchNoSub] ✅ Found working quality: \(quality) at \(playlistURL)")
                     return url
                 }
             } catch {
@@ -285,7 +245,7 @@ class StreamlinkManager: ObservableObject {
             throw streamlinkError("Streamlink not executable at \(custom). Check Settings → Streamlink Path.")
         }
 
-        if let path = resolveExecutable(named: "streamlink") {
+        if let path = Glitcho.resolveExecutable(named: "streamlink") {
             return URL(fileURLWithPath: path)
         }
 
@@ -296,29 +256,12 @@ class StreamlinkManager: ObservableObject {
         if let custom = resolvedCustomPath(forKey: ffmpegPathKey), isExecutableFile(atPath: custom) {
             return URL(fileURLWithPath: custom)
         }
-        if let path = resolveExecutable(named: "ffmpeg") {
+        if let path = Glitcho.resolveExecutable(named: "ffmpeg") {
             return URL(fileURLWithPath: path)
         }
         return nil
     }
 
-    private func resolveExecutable(named name: String) -> String? {
-        let fallbackPaths = [
-            "/opt/homebrew/bin/\(name)",
-            "/usr/local/bin/\(name)",
-            "/usr/bin/\(name)"
-        ]
-        let pathEnvironment = ProcessInfo.processInfo.environment["PATH"] ?? ""
-        let pathEntries = pathEnvironment.split(separator: ":").map(String.init)
-        let searchPaths = pathEntries + fallbackPaths
-        for directory in searchPaths {
-            let candidate = URL(fileURLWithPath: directory).appendingPathComponent(name).path
-            if isExecutableFile(atPath: candidate) {
-                return candidate
-            }
-        }
-        return nil
-    }
 
     private func resolvedCustomPath(forKey key: String) -> String? {
         let rawPath = UserDefaults.standard.string(forKey: key) ?? ""
@@ -1043,15 +986,24 @@ struct HybridTwitchView: View {
                                     .help("Picture in Picture")
                                 }
 
-                                if playback.kind == .liveChannel, playback.channelName != nil {
+                                if playback.kind == .liveChannel, let channelLogin = playback.channelName?.lowercased() {
+                                    let isLocalRecording = recordingManager.isRecording(channelLogin: channelLogin)
+                                    let isBackgroundRecording = recordingManager.isRecordingInBackgroundAgent(channelLogin: channelLogin)
+                                    let isChannelRecording = isLocalRecording || isBackgroundRecording
+                                    let badgeLabel = isLocalRecording ? "Stop" : (isBackgroundRecording ? "BG" : "Record")
                                     Button(action: { onRecordRequest?() }) {
                                         RecordingControlBadge(
-                                            isRecording: recordingManager.isRecording,
-                                            label: recordingManager.isRecording ? "Stop" : "Record"
+                                            isRecording: isChannelRecording,
+                                            label: badgeLabel
                                         )
                                     }
                                     .buttonStyle(.plain)
-                                    .help(recordingManager.isRecording ? "Stop recording" : "Start recording")
+                                    .disabled(isBackgroundRecording && !isLocalRecording)
+                                    .help(
+                                        isBackgroundRecording && !isLocalRecording
+                                            ? "Recording is active in background auto-record"
+                                            : (isLocalRecording ? "Stop recording this channel" : "Start recording this channel")
+                                    )
                                 }
 
                                 Button(action: { Task { await loadStream() } }) {
@@ -1238,9 +1190,6 @@ struct HybridTwitchView: View {
             isPlaying = false
             streamURL = nil
             closeDetachedChat()
-            if recordingManager.isRecording {
-                recordingManager.stopRecording()
-            }
         }
         .onReceive(recordingManager.$errorMessage) { error in
             if let error {
@@ -1975,7 +1924,6 @@ final class ChannelVideosStore: NSObject, ObservableObject, WKNavigationDelegate
             let itemsEmpty = (section == .videos) ? self.vods.isEmpty : self.clips.isEmpty
             if itemsEmpty {
                 self.gqlFallbackAttempts.insert(key)
-                print("[ChannelVideosStore] GQL fallback for \(channel) \(section.rawValue)")
                 Task { await self.fetchGQLFallback(channel: channel, section: section) }
             }
         }
@@ -2186,13 +2134,7 @@ final class ChannelVideosStore: NSObject, ObservableObject, WKNavigationDelegate
     }
 
     private func webKitCookies() async -> [HTTPCookie] {
-        await withCheckedContinuation { continuation in
-            DispatchQueue.main.async {
-                WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
-                    continuation.resume(returning: cookies)
-                }
-            }
-        }
+        await Glitcho.webKitCookies()
     }
 
     func reload() {
@@ -2963,7 +2905,7 @@ final class ChannelVideosStore: NSObject, ObservableObject, WKNavigationDelegate
           pauseAll();
           const observer = new MutationObserver(pauseAll);
           observer.observe(document.documentElement, { childList: true, subtree: true });
-          setInterval(pauseAll, 500);
+          setInterval(pauseAll, 2000);
         })();
         """#,
         injectionTime: .atDocumentStart,
@@ -3570,7 +3512,7 @@ struct ChannelInfoView: NSViewRepresentable {
           lastUrl = url;
           apply();
         }
-      }, 400);
+      }, 1000);
     })();
     """
 
@@ -3589,36 +3531,6 @@ struct ChannelInfoView: NSViewRepresentable {
             self.onSelectPlayback = onSelectPlayback
             self.onNotificationToggle = onNotificationToggle
             self.onRecordRequest = onRecordRequest
-        }
-
-        private func log(_ message: String) {
-            print("[ChannelInfoView] \(message)")
-        }
-
-        private func debugSnapshot(_ webView: WKWebView, label: String) {
-            let url = webView.url?.absoluteString ?? "nil"
-            log("\(label) url=\(url)")
-            let js = """
-            (function() {
-              const ready = !!(document.body && document.body.classList.contains('glitcho-ready'));
-              const root = !!document.getElementById('glitcho-about-root');
-              const lastErr = window.__glitcho_lastError || null;
-              const bodyLen = (document.body && document.body.innerText) ? document.body.innerText.length : 0;
-              const title = document.title || null;
-              return { ready, root, lastErr, bodyLen, title };
-            })();
-            """
-            webView.evaluateJavaScript(js) { [weak self] result, error in
-                if let error {
-                    self?.log("debug js error: \(error.localizedDescription)")
-                    return
-                }
-                if let dict = result as? [String: Any] {
-                    self?.log("debug state: \(dict)")
-                    return
-                }
-                self?.log("debug state: \(result ?? "nil")")
-            }
         }
 
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
@@ -3647,24 +3559,7 @@ struct ChannelInfoView: NSViewRepresentable {
             }
         }
 
-        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-            debugSnapshot(webView, label: "didFinish")
-        }
-
-        func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-            log("didFail: \(error.localizedDescription)")
-            debugSnapshot(webView, label: "didFail")
-        }
-
-        func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-            log("didFailProvisional: \(error.localizedDescription)")
-            debugSnapshot(webView, label: "didFailProvisional")
-        }
-
         func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-            log("webContentProcessDidTerminate")
-            debugSnapshot(webView, label: "didTerminate")
-
             // Twitch can occasionally crash/restart the web content process.
             // When that happens the view can remain blank (black) unless we reload.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
@@ -3744,29 +3639,6 @@ struct ChannelInfoView: NSViewRepresentable {
         contentController.add(context.coordinator, name: "channelNotification")
         contentController.add(context.coordinator, name: "recordStream")
 
-        let debugScript = WKUserScript(
-            source: """
-            (function() {
-              if (window.__glitcho_debug) { return; }
-              window.__glitcho_debug = true;
-              window.__glitcho_lastError = null;
-              window.addEventListener('error', function(e) {
-                try {
-                  window.__glitcho_lastError = (e.message || 'error') + ' @ ' + (e.filename || '') + ':' + (e.lineno || '') + ':' + (e.colno || '');
-                } catch (_) {}
-              });
-              window.addEventListener('unhandledrejection', function(e) {
-                try {
-                  var reason = e && e.reason;
-                  window.__glitcho_lastError = 'promise rejection: ' + (reason && reason.message ? reason.message : String(reason));
-                } catch (_) {}
-              });
-            })();
-            """,
-            injectionTime: .atDocumentStart,
-            forMainFrameOnly: true
-        )
-
         let blockMediaScript = WKUserScript(
             source: """
             (function() {
@@ -3799,7 +3671,7 @@ struct ChannelInfoView: NSViewRepresentable {
               pauseAll();
               const observer = new MutationObserver(pauseAll);
               observer.observe(document.documentElement, { childList: true, subtree: true });
-              setInterval(pauseAll, 500);
+              setInterval(pauseAll, 2000);
             })();
             """,
             injectionTime: .atDocumentStart,
@@ -4467,7 +4339,6 @@ struct ChannelInfoView: NSViewRepresentable {
               decorate();
               const observer = new MutationObserver(() => { decorate(); });
               observer.observe(document.documentElement, { childList: true, subtree: true });
-              setInterval(decorate, 2000);
 
               window.__glitcho_setBellState = function(loginValue, enabled) {
                 const normalized = (loginValue || '').toLowerCase();
@@ -4497,7 +4368,6 @@ struct ChannelInfoView: NSViewRepresentable {
             forMainFrameOnly: true
         )
 
-        contentController.addUserScript(debugScript)
         contentController.addUserScript(initialHideScript)
         contentController.addUserScript(blockMediaScript)
         contentController.addUserScript(aboutOnlyScript)
@@ -4551,8 +4421,6 @@ struct ChannelPageWebView: NSViewRepresentable {
         let hidePlayerScript = WKUserScript(
             source: """
             (function() {
-                console.log('[Glitcho] Starting aggressive player/chat removal');
-                
                 const css = `
                     /* Masquer SEULEMENT le player vidéo */
                     [data-a-target="video-player"],
@@ -4590,7 +4458,6 @@ struct ChannelPageWebView: NSViewRepresentable {
                 
                 // Fonction ciblée pour supprimer SEULEMENT player et chat
                 function nukePlayerAndChat() {
-                    let removed = 0;
                     
                     // 1. Supprimer le player vidéo (zone du haut)
                     const playerSelectors = [
@@ -4610,7 +4477,6 @@ struct ChannelPageWebView: NSViewRepresentable {
                                     el.querySelector('video') || 
                                     el.clientHeight > 200) {
                                     el.remove();
-                                    removed++;
                                 }
                             });
                         } catch (e) {}
@@ -4627,7 +4493,6 @@ struct ChannelPageWebView: NSViewRepresentable {
                         try {
                             document.querySelectorAll(selector).forEach(el => {
                                 el.remove();
-                                removed++;
                             });
                         } catch (e) {}
                     });
@@ -4636,30 +4501,18 @@ struct ChannelPageWebView: NSViewRepresentable {
                     document.querySelectorAll('iframe').forEach(iframe => {
                         if (iframe.src && iframe.src.includes('player')) {
                             iframe.remove();
-                            removed++;
                         }
                     });
-                    
-                    if (removed > 0) {
-                        console.log(`[Glitcho] Removed ${removed} player/chat elements`);
-                    }
                 }
                 
-                // Exécuter immédiatement
                 nukePlayerAndChat();
-                
-                // Répéter toutes les 200ms (très agressif)
-                setInterval(nukePlayerAndChat, 200);
-                
-                // Observer les mutations
+                setInterval(nukePlayerAndChat, 2000);
                 const observer = new MutationObserver(nukePlayerAndChat);
                 observer.observe(document.documentElement, { 
                     childList: true, 
                     subtree: true,
                     attributes: false 
                 });
-                
-                console.log('[Glitcho] Aggressive removal active');
             })();
             """,
             injectionTime: .atDocumentStart,

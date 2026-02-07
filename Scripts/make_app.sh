@@ -4,16 +4,22 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="$ROOT_DIR/Build"
 APP_NAME="Glitcho"
-APP_VERSION="1.0.4"
-APP_BUILD="104"
+APP_VERSION="1.1.0"
+APP_BUILD="110"
 APP_DIR="$BUILD_DIR/${APP_NAME}.app"
 
-swift build -c release --package-path "$ROOT_DIR"
+swift build -c release --package-path "$ROOT_DIR" --product "$APP_NAME"
+swift build -c release --package-path "$ROOT_DIR" --product "GlitchoRecorderAgent"
 
 BIN_PATH="$ROOT_DIR/.build/release/$APP_NAME"
+AGENT_BIN_PATH="$ROOT_DIR/.build/release/GlitchoRecorderAgent"
 
-mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
+mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources" "$APP_DIR/Contents/Helpers"
 cp "$BIN_PATH" "$APP_DIR/Contents/MacOS/$APP_NAME"
+if [ -f "$AGENT_BIN_PATH" ]; then
+    cp "$AGENT_BIN_PATH" "$APP_DIR/Contents/Helpers/GlitchoRecorderAgent"
+    chmod +x "$APP_DIR/Contents/Helpers/GlitchoRecorderAgent" || true
+fi
 if [ -f "$ROOT_DIR/Resources/AppIcon.icns" ]; then
     cp "$ROOT_DIR/Resources/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
 fi

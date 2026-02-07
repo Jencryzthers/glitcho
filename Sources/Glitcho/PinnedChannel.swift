@@ -55,9 +55,7 @@ struct PinnedChannel: Identifiable, Codable, Hashable {
 }
 
 extension TwitchChannel {
-    var login: String {
-        url.lastPathComponent.lowercased()
-    }
+    var login: String { id }
 }
 
 #endif

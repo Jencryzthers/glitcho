@@ -3,6 +3,8 @@ import XCTest
 
 @MainActor
 final class RecordingManagerTests: XCTestCase {
+    private let recoveryDefaultsKey = "recordingRecoveryIntents.v1"
+
     private func withTemporaryDirectory<T>(_ body: (URL) async throws -> T) async throws -> T {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -22,6 +24,67 @@ final class RecordingManagerTests: XCTestCase {
             data[376] = 0x47
         }
         return data
+    }
+
+    private func withRecordingsDirectory<T>(_ directory: URL, _ body: () async throws -> T) async throws -> T {
+        let defaults = UserDefaults.standard
+        let key = "recordingsDirectory"
+        let previous = defaults.string(forKey: key)
+        defaults.set(directory.path, forKey: key)
+        defer {
+            if let previous {
+                defaults.set(previous, forKey: key)
+            } else {
+                defaults.removeObject(forKey: key)
+            }
+        }
+        return try await body()
+    }
+
+    private func makeFakeStreamlinkExecutable(in directory: URL) throws -> URL {
+        let executable = directory.appendingPathComponent("fake-streamlink")
+        let script = """
+        #!/bin/sh
+        set -eu
+
+        output=""
+        while [ "$#" -gt 0 ]; do
+          if [ "$1" = "--output" ]; then
+            shift
+            output="${1:-}"
+            break
+          fi
+          shift
+        done
+
+        if [ -z "$output" ]; then
+          exit 2
+        fi
+
+        : > "$output"
+        sleep 60
+        """
+        try script.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        return executable
+    }
+
+    private func waitUntil(
+        timeout: TimeInterval = 5.0,
+        pollIntervalNanoseconds: UInt64 = 50_000_000,
+        condition: @escaping () -> Bool
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            try? await Task.sleep(nanoseconds: pollIntervalNanoseconds)
+        }
+        return condition()
+    }
+
+    private func persistedRecoveryIntents() -> [RecordingManager.RecoveryIntent] {
+        guard let data = UserDefaults.standard.data(forKey: recoveryDefaultsKey) else { return [] }
+        return (try? JSONDecoder().decode([RecordingManager.RecoveryIntent].self, from: data)) ?? []
     }
 
     func testPrepareRecordingForPlayback_RemuxesTransportStreamMP4UsingFFmpeg() async throws {
@@ -161,18 +224,129 @@ final class RecordingManagerTests: XCTestCase {
 
     func testDeleteRecording_ThrowsWhenRecordingIsInProgress() async throws {
         try await withTemporaryDirectory { dir in
-            let url = dir.appendingPathComponent("sample.mp4")
-            try Data("hello".utf8).write(to: url)
+            try await withRecordingsDirectory(dir) {
+                let fakeStreamlink = try makeFakeStreamlinkExecutable(in: dir)
+                let manager = RecordingManager()
+                manager._resolveStreamlinkPathOverride = { fakeStreamlink.path }
 
-            let manager = RecordingManager()
-            manager.isRecording = true
-            manager.lastOutputURL = url
+                let started = manager.startRecording(
+                    target: "twitch.tv/streamer1",
+                    channelName: "Streamer 1"
+                )
+                XCTAssertTrue(started)
 
-            do {
-                try manager.deleteRecording(at: url)
-                XCTFail("Expected deleteRecording() to throw when recording is in progress")
-            } catch {
-                XCTAssertTrue(error.localizedDescription.contains("still in progress"))
+                guard let outputURL = manager.lastOutputURL else {
+                    XCTFail("Expected lastOutputURL after starting recording")
+                    return
+                }
+
+                do {
+                    try manager.deleteRecording(at: outputURL)
+                    XCTFail("Expected deleteRecording() to throw when recording is in progress")
+                } catch {
+                    XCTAssertTrue(error.localizedDescription.contains("still in progress"))
+                }
+
+                manager.stopRecording()
+                XCTAssertTrue(await waitUntil { manager.activeRecordingCount == 0 })
+            }
+        }
+    }
+
+    func testStartRecording_AllowsMultipleChannelsSimultaneously() async throws {
+        try await withTemporaryDirectory { dir in
+            try await withRecordingsDirectory(dir) {
+                let fakeStreamlink = try makeFakeStreamlinkExecutable(in: dir)
+                let manager = RecordingManager()
+                manager._resolveStreamlinkPathOverride = { fakeStreamlink.path }
+
+                XCTAssertTrue(manager.startRecording(target: "twitch.tv/streamera", channelName: "Streamer A"))
+                XCTAssertTrue(manager.startRecording(target: "twitch.tv/streamerb", channelName: "Streamer B"))
+                XCTAssertEqual(manager.activeRecordingCount, 2)
+                XCTAssertTrue(manager.isRecording(channelLogin: "streamera"))
+                XCTAssertTrue(manager.isRecording(channelLogin: "streamerb"))
+
+                manager.stopRecording(channelLogin: "streamera")
+                XCTAssertTrue(await waitUntil {
+                    manager.activeRecordingCount == 1 &&
+                    !manager.isRecording(channelLogin: "streamera") &&
+                    manager.isRecording(channelLogin: "streamerb")
+                })
+
+                manager.stopRecording()
+                XCTAssertTrue(await waitUntil { manager.activeRecordingCount == 0 })
+            }
+        }
+    }
+
+    func testToggleRecording_StopsOnlyMatchingChannel() async throws {
+        try await withTemporaryDirectory { dir in
+            try await withRecordingsDirectory(dir) {
+                let fakeStreamlink = try makeFakeStreamlinkExecutable(in: dir)
+                let manager = RecordingManager()
+                manager._resolveStreamlinkPathOverride = { fakeStreamlink.path }
+
+                XCTAssertTrue(manager.startRecording(target: "twitch.tv/streamera", channelName: "Streamer A"))
+                XCTAssertTrue(manager.startRecording(target: "twitch.tv/streamerb", channelName: "Streamer B"))
+                XCTAssertEqual(manager.activeRecordingCount, 2)
+
+                manager.toggleRecording(target: "twitch.tv/streamera", channelName: "Streamer A")
+                XCTAssertTrue(await waitUntil {
+                    manager.activeRecordingCount == 1 &&
+                    !manager.isRecording(channelLogin: "streamera") &&
+                    manager.isRecording(channelLogin: "streamerb")
+                })
+
+                manager.toggleRecording(target: "twitch.tv/streamerb", channelName: "Streamer B")
+                XCTAssertTrue(await waitUntil { manager.activeRecordingCount == 0 })
+            }
+        }
+    }
+
+    func testConsumeRecoveryIntents_ReturnsPersistedValues() async throws {
+        let defaults = UserDefaults.standard
+        let intents = [
+            RecordingManager.RecoveryIntent(
+                target: "https://twitch.tv/streamera",
+                channelLogin: "streamera",
+                channelName: "Streamer A",
+                quality: "best",
+                capturedAt: Date()
+            )
+        ]
+        defaults.set(try JSONEncoder().encode(intents), forKey: recoveryDefaultsKey)
+        defer { defaults.removeObject(forKey: recoveryDefaultsKey) }
+
+        let manager = RecordingManager()
+        let restored = manager.consumeRecoveryIntents()
+        XCTAssertEqual(restored.count, 1)
+        XCTAssertEqual(restored.first?.channelLogin, "streamera")
+        XCTAssertEqual(restored.first?.target, "https://twitch.tv/streamera")
+    }
+
+    func testStartRecording_PersistsRecoveryIntentAndClearsAfterStop() async throws {
+        try await withTemporaryDirectory { dir in
+            try await withRecordingsDirectory(dir) {
+                let defaults = UserDefaults.standard
+                defaults.removeObject(forKey: recoveryDefaultsKey)
+                defer { defaults.removeObject(forKey: recoveryDefaultsKey) }
+
+                let fakeStreamlink = try makeFakeStreamlinkExecutable(in: dir)
+                let manager = RecordingManager()
+                manager._resolveStreamlinkPathOverride = { fakeStreamlink.path }
+
+                XCTAssertTrue(manager.startRecording(target: "twitch.tv/streamera", channelName: "Streamer A"))
+                XCTAssertTrue(await waitUntil { manager.activeRecordingCount == 1 })
+
+                let persistedWhileActive = persistedRecoveryIntents()
+                XCTAssertEqual(persistedWhileActive.count, 1)
+                XCTAssertEqual(persistedWhileActive.first?.channelLogin, "streamera")
+
+                manager.stopRecording()
+                XCTAssertTrue(await waitUntil { manager.activeRecordingCount == 0 })
+
+                let persistedAfterStop = persistedRecoveryIntents()
+                XCTAssertTrue(persistedAfterStop.isEmpty)
             }
         }
     }

@@ -35,6 +35,12 @@ struct ChannelNotificationToggle: Equatable {
     let enabled: Bool
 }
 
+struct ChannelPinRequest: Equatable {
+    let login: String
+    let displayName: String
+    let nonce: UUID
+}
+
 final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WKNavigationDelegate, WKUIDelegate {
     let webView: WKWebView
     let homeURL: URL
@@ -46,23 +52,64 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
     @Published var pageTitle = "Twitch"
     @Published var pageURL: String = "twitch.tv"
     @Published var followedLive: [TwitchChannel] = []
+    @Published var followedChannelLogins: [String] = []
     @Published var profileName: String?
     @Published var profileLogin: String?
     @Published var profileAvatarURL: URL?
     @Published var isLoggedIn = false
     @Published var shouldSwitchToNativePlayback: NativePlaybackRequest? = nil
     @Published var channelNotificationToggle: ChannelNotificationToggle? = nil
+    @Published var channelPinRequest: ChannelPinRequest? = nil
 
     private var observations: [NSKeyValueObservation] = []
     private var backgroundWebView: WKWebView?
     private var followedRefreshTimer: Timer?
     private var followActionWebView: WKWebView?
+    private var followActionTeardownWork: DispatchWorkItem?
+    private weak var mainMessageController: WKUserContentController?
+    private weak var backgroundMessageController: WKUserContentController?
     private let followActionDelegate = FollowActionDelegate()
     private var wasLoggedIn = false
     private var lastNonChannelURL: URL?
     private var followedWarmupAttempts = 0
+    private var lastFollowedLiveUpdateAt = Date.distantPast
+    private var lastFollowedChannelsSyncAt = Date.distantPast
 
     private static let sharedProcessPool = WKProcessPool()
+    private static let twitchWebClientID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
+    private static let followedChannelsCacheKey = "webview.followedChannelLogins.v1"
+
+    private struct HelixUsersResponse: Decodable {
+        let data: [HelixUser]
+    }
+
+    private struct HelixUser: Decodable {
+        let id: String
+    }
+
+    private struct HelixFollowedStreamsResponse: Decodable {
+        let data: [HelixFollowedStream]
+        let pagination: HelixPagination?
+    }
+
+    private struct HelixFollowedChannelsResponse: Decodable {
+        let data: [HelixFollowedChannel]
+        let pagination: HelixPagination?
+    }
+
+    private struct HelixPagination: Decodable {
+        let cursor: String?
+    }
+
+    private struct HelixFollowedStream: Decodable {
+        let user_login: String
+        let user_name: String
+        let thumbnail_url: String?
+    }
+
+    private struct HelixFollowedChannel: Decodable {
+        let broadcaster_login: String
+    }
 
 
     init(url: URL) {
@@ -70,6 +117,7 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
 
         let config = WKWebViewConfiguration()
         let contentController = WKUserContentController()
+        mainMessageController = contentController
         config.userContentController = contentController
         config.websiteDataStore = .default()
         config.defaultWebpagePreferences.allowsContentJavaScript = true
@@ -85,6 +133,7 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
         self.webView = webView
 
         super.init()
+        followedChannelLogins = loadCachedFollowedChannelLogins()
         followActionDelegate.onDidFinish = { [weak self] webView in
             self?.runFollowScript(in: webView)
         }
@@ -92,6 +141,7 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
         contentController.add(self, name: "followedLive")
         contentController.add(self, name: "profile")
         contentController.add(self, name: "channelNotification")
+        contentController.add(self, name: "channelPin")
         contentController.add(self, name: "consoleLog")
         contentController.add(self, name: "vodThumbnailRequest")
         contentController.addUserScript(Self.initialHideScript)
@@ -100,6 +150,7 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
         contentController.addUserScript(Self.twitchNoSubScript)
         contentController.addUserScript(Self.hideChromeScript)
         contentController.addUserScript(Self.channelActionsScript)
+        contentController.addUserScript(Self.channelPinContextMenuScript)
         contentController.addUserScript(Self.ensureLiveStreamScript)
         contentController.addUserScript(Self.followedLiveScript)
         contentController.addUserScript(Self.profileScript)
@@ -160,6 +211,12 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
         ]
     }
 
+    deinit {
+        followedRefreshTimer?.invalidate()
+        followActionTeardownWork?.cancel()
+        observations.forEach { $0.invalidate() }
+    }
+
     func goBack() {
         webView.goBack()
     }
@@ -182,34 +239,181 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
 
     func followChannel(login: String) {
         let normalized = login.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !normalized.isEmpty else {
-            print("[Follow] ❌ Empty login")
-            return
-        }
-        print("[Follow] 🎯 Toggle follow for: \(normalized)")
+        guard !normalized.isEmpty else { return }
         let view = ensureFollowActionWebView()
         let url = URL(string: "https://www.twitch.tv/\(normalized)")!
         view.load(URLRequest(url: url))
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self, weak view] in
-            guard let view else {
-                print("[Follow] ❌ WebView is nil")
-                return
-            }
-            print("[Follow] 📜 Running follow script...")
+            guard let view else { return }
             self?.runFollowScript(in: view)
 
             // Refresh followed list after action completes
             DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-                print("[Follow] 🔄 Refreshing followed list...")
                 self?.refreshFollowedList()
+                self?.scheduleFollowActionTeardown()
             }
         }
     }
 
     /// Force refresh of the followed channels list
     func refreshFollowedList() {
-        print("[Follow] 🔄 Reloading background webview")
         backgroundWebView?.reload()
+        Task {
+            _ = await refreshFollowedLiveUsingAPI()
+        }
+    }
+
+    private func refreshFollowedLiveUsingAPI() async -> Bool {
+        guard isLoggedIn else { return false }
+        guard let login = profileLogin?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !login.isEmpty else { return false }
+        guard let authToken = await twitchAuthToken() else { return false }
+
+        do {
+            let userID = try await fetchHelixUserID(login: login, authToken: authToken)
+            let channels = try await fetchFollowedLiveHelixStreams(userID: userID, authToken: authToken)
+            let now = Date()
+            if now.timeIntervalSince(lastFollowedChannelsSyncAt) > 600 || followedChannelLogins.isEmpty {
+                if let followedLogins = try? await fetchFollowedChannelsLogins(userID: userID, authToken: authToken) {
+                    await MainActor.run {
+                        if self.followedChannelLogins != followedLogins {
+                            self.followedChannelLogins = followedLogins
+                            self.persistFollowedChannelLogins(followedLogins)
+                        }
+                        self.lastFollowedChannelsSyncAt = now
+                    }
+                }
+            }
+            await MainActor.run {
+                self.lastFollowedLiveUpdateAt = now
+                if self.followedLive != channels {
+                    self.followedLive = channels
+                }
+            }
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private func fetchHelixUserID(login: String, authToken: String) async throws -> String {
+        var components = URLComponents(string: "https://api.twitch.tv/helix/users")!
+        components.queryItems = [URLQueryItem(name: "login", value: login)]
+
+        var request = URLRequest(url: components.url!)
+        request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
+        request.setValue(Self.twitchWebClientID, forHTTPHeaderField: "Client-Id")
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse,
+              (200...299).contains(httpResponse.statusCode) else {
+            throw URLError(.badServerResponse)
+        }
+
+        let decoded = try JSONDecoder().decode(HelixUsersResponse.self, from: data)
+        guard let userID = decoded.data.first?.id, !userID.isEmpty else {
+            throw URLError(.cannotParseResponse)
+        }
+        return userID
+    }
+
+    private func fetchFollowedLiveHelixStreams(userID: String, authToken: String) async throws -> [TwitchChannel] {
+        var cursor: String?
+        var channels: [TwitchChannel] = []
+
+        repeat {
+            var components = URLComponents(string: "https://api.twitch.tv/helix/streams/followed")!
+            var queryItems: [URLQueryItem] = [
+                URLQueryItem(name: "user_id", value: userID),
+                URLQueryItem(name: "first", value: "100")
+            ]
+            if let cursor, !cursor.isEmpty {
+                queryItems.append(URLQueryItem(name: "after", value: cursor))
+            }
+            components.queryItems = queryItems
+
+            var request = URLRequest(url: components.url!)
+            request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
+            request.setValue(Self.twitchWebClientID, forHTTPHeaderField: "Client-Id")
+
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse,
+                  (200...299).contains(httpResponse.statusCode) else {
+                throw URLError(.badServerResponse)
+            }
+
+            let decoded = try JSONDecoder().decode(HelixFollowedStreamsResponse.self, from: data)
+            let pageChannels = decoded.data.compactMap { stream -> TwitchChannel? in
+                let login = stream.user_login.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                guard !login.isEmpty else { return nil }
+                let name = stream.user_name.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard let url = URL(string: "https://www.twitch.tv/\(login)") else { return nil }
+
+                let thumbnailURL = stream.thumbnail_url
+                    .map { value in
+                        value
+                            .replacingOccurrences(of: "{width}", with: "320")
+                            .replacingOccurrences(of: "{height}", with: "180")
+                    }
+                    .flatMap(URL.init(string:))
+
+                return TwitchChannel(
+                    id: login,
+                    name: name.isEmpty ? login : name,
+                    url: url,
+                    thumbnailURL: thumbnailURL
+                )
+            }
+            channels.append(contentsOf: pageChannels)
+            cursor = decoded.pagination?.cursor
+        } while cursor?.isEmpty == false
+
+        return channels.deduplicatedByLogin()
+    }
+
+    private func fetchFollowedChannelsLogins(userID: String, authToken: String) async throws -> [String] {
+        var cursor: String?
+        var logins: [String] = []
+
+        repeat {
+            var components = URLComponents(string: "https://api.twitch.tv/helix/channels/followed")!
+            var queryItems: [URLQueryItem] = [
+                URLQueryItem(name: "user_id", value: userID),
+                URLQueryItem(name: "first", value: "100")
+            ]
+            if let cursor, !cursor.isEmpty {
+                queryItems.append(URLQueryItem(name: "after", value: cursor))
+            }
+            components.queryItems = queryItems
+
+            var request = URLRequest(url: components.url!)
+            request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
+            request.setValue(Self.twitchWebClientID, forHTTPHeaderField: "Client-Id")
+
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse,
+                  (200...299).contains(httpResponse.statusCode) else {
+                throw URLError(.badServerResponse)
+            }
+
+            let decoded = try JSONDecoder().decode(HelixFollowedChannelsResponse.self, from: data)
+            let pageLogins = decoded.data
+                .map { $0.broadcaster_login.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+                .filter { !$0.isEmpty }
+            logins.append(contentsOf: pageLogins)
+            cursor = decoded.pagination?.cursor
+        } while cursor?.isEmpty == false
+
+        var seen = Set<String>()
+        return logins.filter { seen.insert($0).inserted }.sorted()
+    }
+
+    private func twitchAuthToken() async -> String? {
+        let cookies = await webKitCookies()
+        let names: Set<String> = ["auth-token", "auth_token", "auth-token-next", "auth_token_next"]
+        return cookies.first(where: {
+            names.contains($0.name.lowercased()) && $0.domain.lowercased().contains("twitch.tv")
+        })?.value
     }
 
     /// Stoppe toute lecture (vidéo/audio) dans le WebView et retourne à la dernière page non-channel.
@@ -254,6 +458,8 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
                     self?.isLoggedIn = false
                     self?.wasLoggedIn = false
                     self?.followedLive = []
+                    self?.followedChannelLogins = []
+                    self?.persistFollowedChannelLogins([])
                     self?.webView.load(URLRequest(url: URL(string: "https://www.twitch.tv")!))
                     self?.backgroundWebView?.load(URLRequest(url: URL(string: "https://www.twitch.tv/following")!))
                 }
@@ -332,17 +538,34 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
         case "followedLive":
             guard let items = message.body as? [[String: String]] else { return }
 
-            let channels = items.compactMap { item -> TwitchChannel? in
+            let parsedChannels = items.compactMap { item -> TwitchChannel? in
                 guard let urlString = item["url"], let url = URL(string: urlString) else { return nil }
                 let normalizedURL = normalizedTwitchURL(url)
                 let name = item["name"]?.trimmingCharacters(in: .whitespacesAndNewlines)
                 let displayName = (name?.isEmpty == false) ? name! : normalizedURL.lastPathComponent
                 let thumb = item["thumbnail"].flatMap { URL(string: $0) }
-                return TwitchChannel(id: urlString, name: displayName, url: normalizedURL, thumbnailURL: thumb)
+                let login = normalizedURL.lastPathComponent.lowercased()
+                return TwitchChannel(id: login, name: displayName, url: normalizedURL, thumbnailURL: thumb)
             }
 
-            if !channels.isEmpty {
-                DispatchQueue.main.async {
+            let channels = parsedChannels.deduplicatedByLogin()
+
+            let isFromBackground = (userContentController === backgroundMessageController)
+            // The main webview often posts empty snapshots while navigating non-following pages.
+            // Ignore those so they do not erase the authoritative background/API live list.
+            if channels.isEmpty && !isFromBackground {
+                return
+            }
+            // Background DOM scraping can transiently return an empty list while Twitch rewrites the page.
+            // Keep current state in that case and ask API refresh for an authoritative value.
+            if channels.isEmpty && isFromBackground && !followedLive.isEmpty {
+                Task { _ = await self.refreshFollowedLiveUsingAPI() }
+                return
+            }
+
+            DispatchQueue.main.async {
+                self.lastFollowedLiveUpdateAt = Date()
+                if self.followedLive != channels {
                     self.followedLive = channels
                 }
             }
@@ -353,28 +576,40 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
             let avatarString = dict["avatar"]?.trimmingCharacters(in: .whitespacesAndNewlines)
             let avatar = (avatarString?.isEmpty == false) ? URL(string: avatarString!) : nil
             let loggedIn = dict["loggedIn"] == "true"
+            let isFromBackground = (userContentController === backgroundMessageController)
             DispatchQueue.main.async {
+                // Prevent background-webview profile polling from forcing transient logged-out states.
+                if isFromBackground && !loggedIn && self.isLoggedIn {
+                    return
+                }
                 if loggedIn {
                     if !self.wasLoggedIn {
                         self.profileName = nil
                         self.profileLogin = nil
                         self.profileAvatarURL = nil
                     }
-                    if let name, !name.isEmpty {
+                    if let name, !name.isEmpty, self.profileName != name {
                         self.profileName = name
                     }
-                    if let login, !login.isEmpty {
+                    if let login, !login.isEmpty, self.profileLogin != login {
                         self.profileLogin = login
                     }
-                    if let avatar {
+                    if let avatar, self.profileAvatarURL != avatar {
                         self.profileAvatarURL = avatar
                     }
                 } else {
-                    self.profileName = nil
-                    self.profileLogin = nil
-                    self.profileAvatarURL = nil
+                    if self.profileName != nil { self.profileName = nil }
+                    if self.profileLogin != nil { self.profileLogin = nil }
+                    if self.profileAvatarURL != nil { self.profileAvatarURL = nil }
+                    if !self.followedChannelLogins.isEmpty {
+                        self.followedChannelLogins = []
+                        self.persistFollowedChannelLogins([])
+                    }
+                    self.lastFollowedChannelsSyncAt = .distantPast
                 }
-                self.isLoggedIn = loggedIn
+                if self.isLoggedIn != loggedIn {
+                    self.isLoggedIn = loggedIn
+                }
                 if loggedIn && !self.wasLoggedIn {
                     self.loadFollowedLiveInBackground()
                 }
@@ -396,10 +631,22 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
             DispatchQueue.main.async {
                 self.channelNotificationToggle = ChannelNotificationToggle(login: login, enabled: enabled)
             }
-        case "consoleLog":
-            if let logMessage = message.body as? String {
-                print("🌐 [WebView Console] \(logMessage)")
+        case "channelPin":
+            guard let dict = message.body as? [String: Any] else { return }
+            guard let loginValue = dict["login"] as? String else { return }
+            let login = loginValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !login.isEmpty else { return }
+            let displayValue = (dict["displayName"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let displayName = (displayValue?.isEmpty == false) ? displayValue! : login
+            DispatchQueue.main.async {
+                self.channelPinRequest = ChannelPinRequest(
+                    login: login,
+                    displayName: displayName,
+                    nonce: UUID()
+                )
             }
+        case "consoleLog":
+            break
         case "vodThumbnailRequest":
             guard let dict = message.body as? [String: String],
                   let vodId = dict["vodId"],
@@ -412,6 +659,22 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
         }
     }
 
+    private func loadCachedFollowedChannelLogins() -> [String] {
+        guard let stored = UserDefaults.standard.array(forKey: Self.followedChannelsCacheKey) as? [String] else {
+            return []
+        }
+
+        var seen = Set<String>()
+        return stored
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            .filter { !$0.isEmpty }
+            .filter { seen.insert($0).inserted }
+    }
+
+    private func persistFollowedChannelLogins(_ logins: [String]) {
+        UserDefaults.standard.set(logins, forKey: Self.followedChannelsCacheKey)
+    }
+
     func setChannelNotificationState(login: String, enabled: Bool) {
         let normalized = login.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !normalized.isEmpty else { return }
@@ -422,14 +685,7 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
     // MARK: - VOD Thumbnail Fetching (Swift-side TwitchNoSub)
 
     private func handleVODThumbnailRequest(vodId: String, imgId: String) async {
-        print("[TwitchNoSub Swift] 📷 Fetching thumbnail for VOD \(vodId)")
-
-        guard let thumbnailURL = await fetchVODThumbnailURL(vodId: vodId) else {
-            print("[TwitchNoSub Swift] ❌ Failed to get thumbnail for VOD \(vodId)")
-            return
-        }
-
-        print("[TwitchNoSub Swift] ✅ Got thumbnail: \(thumbnailURL)")
+        guard let thumbnailURL = await fetchVODThumbnailURL(vodId: vodId) else { return }
 
         // Inject the thumbnail into the page
         let js = """
@@ -438,8 +694,6 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
             if (img) {
                 img.src = '\(thumbnailURL)';
                 img.srcset = '';
-                img.style.border = '2px solid lime';
-                console.log('[TNS] Replaced thumbnail for \(vodId)');
             }
         })();
         """
@@ -472,43 +726,39 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
                 return nil
             }
 
-            print("[TwitchNoSub Swift] seekPreviewsURL: \(seekPreviewsURL)")
-
             // Convert storyboard URL to thumbnail URL
             // .../storyboards/xxx-strip-0.jpg -> .../thumb/thumb0-320x180.jpg
             let thumbnailURL = seekPreviewsURL
                 .replacingOccurrences(of: #"\/storyboards\/.*$"#, with: "/thumb/thumb0-320x180.jpg", options: .regularExpression)
 
-            // Test if thumbnail exists
-            if let testURL = URL(string: thumbnailURL) {
-                var testRequest = URLRequest(url: testURL)
-                testRequest.httpMethod = "HEAD"
-                if let (_, response) = try? await URLSession.shared.data(for: testRequest),
-                   let httpResponse = response as? HTTPURLResponse,
-                   httpResponse.statusCode == 200 {
-                    return thumbnailURL
-                }
-            }
-
-            // Try 640x360
+            // Test both thumbnail sizes in parallel
             let thumbnailURL640 = seekPreviewsURL
                 .replacingOccurrences(of: #"\/storyboards\/.*$"#, with: "/thumb/thumb0-640x360.jpg", options: .regularExpression)
 
-            if let testURL = URL(string: thumbnailURL640) {
-                var testRequest = URLRequest(url: testURL)
-                testRequest.httpMethod = "HEAD"
-                if let (_, response) = try? await URLSession.shared.data(for: testRequest),
-                   let httpResponse = response as? HTTPURLResponse,
-                   httpResponse.statusCode == 200 {
-                    return thumbnailURL640
-                }
-            }
+            async let check320: Bool = {
+                guard let testURL = URL(string: thumbnailURL) else { return false }
+                var req = URLRequest(url: testURL)
+                req.httpMethod = "HEAD"
+                guard let (_, resp) = try? await URLSession.shared.data(for: req),
+                      let http = resp as? HTTPURLResponse else { return false }
+                return http.statusCode == 200
+            }()
 
-            // Fallback to storyboard
+            async let check640: Bool = {
+                guard let testURL = URL(string: thumbnailURL640) else { return false }
+                var req = URLRequest(url: testURL)
+                req.httpMethod = "HEAD"
+                guard let (_, resp) = try? await URLSession.shared.data(for: req),
+                      let http = resp as? HTTPURLResponse else { return false }
+                return http.statusCode == 200
+            }()
+
+            let (ok320, ok640) = await (check320, check640)
+            if ok320 { return thumbnailURL }
+            if ok640 { return thumbnailURL640 }
             return seekPreviewsURL
 
         } catch {
-            print("[TwitchNoSub Swift] Error: \(error)")
             return nil
         }
     }
@@ -542,7 +792,6 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
         }
         
         if let request = nativePlaybackRequestIfNeeded(url: url) {
-            print("❌ [Glitcho] Detected playback: \(request.kind.rawValue) - Switching to native player")
             prepareWebViewForNativePlayer()
             DispatchQueue.main.async {
                 self.shouldSwitchToNativePlayback = request
@@ -569,6 +818,7 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
     private func makeBackgroundWebView() -> WKWebView {
         let config = WKWebViewConfiguration()
         let contentController = WKUserContentController()
+        backgroundMessageController = contentController
         config.processPool = Self.sharedProcessPool
         config.userContentController = contentController
         config.websiteDataStore = .default()
@@ -577,10 +827,6 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
 
         contentController.add(self, name: "followedLive")
         contentController.add(self, name: "profile")
-        contentController.addUserScript(Self.adBlockScript)
-        contentController.addUserScript(Self.codecWorkaroundScript)
-        contentController.addUserScript(Self.twitchNoSubScript)
-        contentController.addUserScript(Self.ensureLiveStreamScript)
         contentController.addUserScript(Self.followedLiveScript)
         contentController.addUserScript(Self.profileScript)
 
@@ -619,6 +865,15 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
         webView.evaluateJavaScript(Self.followActionScript, completionHandler: nil)
     }
 
+    private func scheduleFollowActionTeardown() {
+        followActionTeardownWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.followActionWebView = nil
+        }
+        followActionTeardownWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: work)
+    }
+
     private final class FollowActionDelegate: NSObject, WKNavigationDelegate {
         var onDidFinish: ((WKWebView) -> Void)?
 
@@ -630,12 +885,24 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
     private func loadFollowedLiveInBackground() {
         guard let backgroundWebView else { return }
         followedWarmupAttempts = 0
+        lastFollowedLiveUpdateAt = Date()
         let url = URL(string: "https://www.twitch.tv/following")!
         backgroundWebView.load(URLRequest(url: url))
+        Task {
+            _ = await refreshFollowedLiveUsingAPI()
+        }
 
         followedRefreshTimer?.invalidate()
-        followedRefreshTimer = Timer.scheduledTimer(withTimeInterval: 120, repeats: true) { [weak self] _ in
-            self?.backgroundWebView?.reload()
+        followedRefreshTimer = Timer.scheduledTimer(withTimeInterval: 45, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            Task {
+                let didRefreshViaAPI = await self.refreshFollowedLiveUsingAPI()
+                if !didRefreshViaAPI {
+                    _ = await MainActor.run {
+                        self.backgroundWebView?.reload()
+                    }
+                }
+            }
         }
 
         scheduleFollowedWarmupReload()
@@ -854,22 +1121,25 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
             document.body.classList.add('glitcho-ready');
           });
 
+          // Throttled observer: merge nav hiding + SPA URL detection into one observer
+          let _hideQueued = false;
+          let _lastUrl = location.href;
           const observer = new MutationObserver(() => {
-            hideNavigation();
-          });
-          observer.observe(document.documentElement, { childList: true, subtree: true });
-
-          // Détecter les changements d'URL (navigation SPA)
-          let lastUrl = location.href;
-          new MutationObserver(() => {
             const url = location.href;
-            if (url !== lastUrl) {
-              lastUrl = url;
+            if (url !== _lastUrl) {
+              _lastUrl = url;
               updatePageType();
-              // Re-reveal after SPA navigation
               document.body.classList.add('glitcho-ready');
             }
-          }).observe(document, { subtree: true, childList: true });
+            if (!_hideQueued) {
+              _hideQueued = true;
+              requestAnimationFrame(() => {
+                _hideQueued = false;
+                hideNavigation();
+              });
+            }
+          });
+          observer.observe(document.documentElement, { childList: true, subtree: true });
         })();
         """
 
@@ -978,7 +1248,6 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
           decorate();
           const observer = new MutationObserver(() => { decorate(); });
           observer.observe(document.documentElement, { childList: true, subtree: true });
-          setInterval(decorate, 2000);
 
           window.__glitcho_setBellState = function(login, enabled) {
             const current = channelLogin();
@@ -992,12 +1261,156 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
         forMainFrameOnly: true
     )
 
+    private static let channelPinContextMenuScript = WKUserScript(
+        source: """
+        (function() {
+          if (window.__glitcho_channel_pin_menu) { return; }
+          window.__glitcho_channel_pin_menu = true;
+
+          const reserved = new Set([
+            'directory', 'downloads', 'login', 'logout', 'search', 'settings', 'signup', 'p',
+            'following', 'browse', 'drops', 'subs', 'inventory', 'videos', 'clip', 'turbo', 'wallet'
+          ]);
+          let menu = null;
+
+          function removeMenu() {
+            if (menu && menu.parentNode) {
+              menu.parentNode.removeChild(menu);
+            }
+            menu = null;
+          }
+
+          function parseChannelFromHref(href) {
+            if (!href) { return null; }
+            try {
+              const url = new URL(href, window.location.origin);
+              const host = (url.host || '').toLowerCase();
+              if (!host.endsWith('twitch.tv') || host === 'clips.twitch.tv') { return null; }
+
+              const parts = (url.pathname || '').split('/').filter(Boolean);
+              if (!parts.length) { return null; }
+              const login = (parts[0] || '').toLowerCase();
+              if (!login || reserved.has(login)) { return null; }
+
+              if (parts.length > 1) {
+                const next = (parts[1] || '').toLowerCase();
+                if (next !== 'home') { return null; }
+              }
+
+              return { login: login, displayName: parts[0] || login };
+            } catch (_) {
+              return null;
+            }
+          }
+
+          function channelFromTarget(target) {
+            let el = target instanceof Element ? target : null;
+            while (el) {
+              if (el.tagName === 'A') {
+                const channel = parseChannelFromHref(el.getAttribute('href') || el.href);
+                if (channel) { return channel; }
+              }
+              el = el.parentElement;
+            }
+            return null;
+          }
+
+          function showMenu(x, y, channel) {
+            removeMenu();
+            const wrap = document.createElement('div');
+            wrap.style.position = 'fixed';
+            wrap.style.zIndex = '2147483647';
+            wrap.style.top = y + 'px';
+            wrap.style.left = x + 'px';
+            wrap.style.minWidth = '210px';
+            wrap.style.padding = '6px';
+            wrap.style.borderRadius = '8px';
+            wrap.style.background = 'rgba(18,18,22,0.96)';
+            wrap.style.border = '1px solid rgba(255,255,255,0.14)';
+            wrap.style.boxShadow = '0 12px 24px rgba(0,0,0,0.38)';
+            wrap.style.backdropFilter = 'blur(10px)';
+
+            const item = document.createElement('button');
+            item.type = 'button';
+            item.textContent = 'Pin ' + channel.displayName + ' to Sidebar';
+            item.style.display = 'block';
+            item.style.width = '100%';
+            item.style.border = 'none';
+            item.style.background = 'transparent';
+            item.style.color = '#f3f5ff';
+            item.style.font = '500 13px -apple-system, BlinkMacSystemFont, sans-serif';
+            item.style.padding = '7px 10px';
+            item.style.textAlign = 'left';
+            item.style.borderRadius = '6px';
+            item.style.cursor = 'pointer';
+            item.addEventListener('mouseenter', function() {
+              item.style.background = 'rgba(255,255,255,0.12)';
+            });
+            item.addEventListener('mouseleave', function() {
+              item.style.background = 'transparent';
+            });
+            item.addEventListener('click', function(e) {
+              e.preventDefault();
+              e.stopPropagation();
+              try {
+                window.webkit.messageHandlers.channelPin.postMessage({
+                  login: channel.login,
+                  displayName: channel.displayName
+                });
+              } catch (_) {}
+              removeMenu();
+            });
+
+            wrap.appendChild(item);
+            document.documentElement.appendChild(wrap);
+            menu = wrap;
+
+            const rect = wrap.getBoundingClientRect();
+            let left = x;
+            let top = y;
+            if (rect.right > window.innerWidth - 8) {
+              left = Math.max(8, x - rect.width);
+            }
+            if (rect.bottom > window.innerHeight - 8) {
+              top = Math.max(8, y - rect.height);
+            }
+            wrap.style.left = left + 'px';
+            wrap.style.top = top + 'px';
+          }
+
+          document.addEventListener('contextmenu', function(e) {
+            const channel = channelFromTarget(e.target);
+            if (!channel) {
+              removeMenu();
+              return;
+            }
+            e.preventDefault();
+            e.stopPropagation();
+            showMenu(e.clientX, e.clientY, channel);
+          }, true);
+
+          document.addEventListener('click', function(e) {
+            if (!menu) { return; }
+            const target = e.target;
+            if (target instanceof Node && menu.contains(target)) {
+              return;
+            }
+            removeMenu();
+          }, true);
+          document.addEventListener('scroll', removeMenu, true);
+          window.addEventListener('blur', removeMenu);
+          document.addEventListener('keydown', function(e) {
+            if (e.key === 'Escape') { removeMenu(); }
+          }, true);
+        })();
+        """,
+        injectionTime: .atDocumentEnd,
+        forMainFrameOnly: true
+    )
+
     private static let followActionScript = #"""
     (function() {
-      console.log('[Follow Script] Starting...');
-
       if (window.__glitcho_follow_click) {
-        console.log('[Follow Script] Already initialized, calling click...');
         try { window.__glitcho_follow_click(); } catch (_) {}
         return;
       }
@@ -1033,30 +1446,24 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
         // First try the specific data-a-target
         const direct = document.querySelector('[data-a-target="follow-button"], [data-a-target="unfollow-button"], [data-a-target="follow-button__text"]');
         if (direct) {
-          console.log('[Follow Script] Found button via data-a-target:', direct.textContent);
           return direct.closest('button,[role="button"],a') || direct;
         }
-        // Then search by label
         const buttons = Array.from(document.querySelectorAll('button,[role="button"],a'));
         for (const el of buttons) {
           const label = el.getAttribute('aria-label') || el.getAttribute('title') || el.textContent || '';
           if (isFollowOrUnfollowLabel(label)) {
-            console.log('[Follow Script] Found button via label:', label);
             return el;
           }
         }
-        console.log('[Follow Script] No button found!');
         return null;
       }
 
       function clickFollow() {
         const button = findFollowButton();
         if (button && typeof button.click === 'function') {
-          console.log('[Follow Script] Clicking button...');
           button.click();
           return true;
         }
-        console.log('[Follow Script] Click failed - no button');
         return false;
       }
 
@@ -1284,13 +1691,19 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
             // Also extract from sidebar "Followed Channels" section (main webview)
             // This section only shows LIVE followed channels
             extractFromSideNav(map);
-            if (map.size > 0) {
-              window.webkit.messageHandlers.followedLive.postMessage(Array.from(map.values()));
-            }
+            window.webkit.messageHandlers.followedLive.postMessage(Array.from(map.values()));
           }
 
           extract();
-          setInterval(extract, 5000);
+          setInterval(() => {
+            // Only run periodic extraction if on a /following page (background webview)
+            // or if the side nav is visible (main webview). Skip otherwise to save CPU.
+            const path = location.pathname || '';
+            if (path.includes('/following') || path.includes('/directory/following') ||
+                document.querySelector('[data-a-target*="side-nav"]')) {
+              extract();
+            }
+          }, 5000);
         })();
         """,
         injectionTime: .atDocumentEnd,
@@ -1305,95 +1718,29 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
           if (window.__purple_adblock) { return; }
           window.__purple_adblock = true;
 
-          console.log('[Enhanced Adblock] Initializing with uBlock-inspired rules...');
-
           // Enhanced Adblock - Network request blocking (inspired by uBlock Origin)
-          const blockedDomains = [
-            // Ad servers
-            'doubleclick.net',
-            'googlesyndication.com',
-            'googleadservices.com',
-            'amazon-adsystem.com',
-            'advertising.amazon.com',
-            'pubads.g.doubleclick.net',
-            'adservice.google.com',
-            'ads.twitch.tv',
-            'ads-api.twitter.com',
-            'ads-twitter.com',
-            'criteo.com',
-            'criteo.net',
-            'taboola.com',
-            'outbrain.com',
-            'smartadserver.com',
-            'adform.net',
-            'adsrvr.org',
-            'pubmatic.com',
-            'openx.net',
-            'doubleverify.com',
-            // Analytics & tracking
-            'google-analytics.com',
-            'analytics.google.com',
-            'googletagmanager.com',
-            'googletagservices.com',
-            'stats.g.doubleclick.net',
-            'facebook.com/tr',
-            'connect.facebook.net',
-            'pixel.facebook.com',
-            'scorecardresearch.com',
-            'comscore.com',
-            // Twitch-specific ad domains
-            'pubads.twitch.tv',
-            'ttvnw.net/ads',
-            'video-weaver.twitch.tv/ads',
-            // Common ad/tracking patterns
-            'adnxs.com',
-            'rubiconproject.com',
-            'indexww.com',
-            'casalemedia.com',
-            'adsafeprotected.com',
-            'moatads.com',
-            'krxd.net'
-          ];
+          const blockedDomains = new Set([
+            'doubleclick.net','googlesyndication.com','googleadservices.com',
+            'amazon-adsystem.com','advertising.amazon.com','pubads.g.doubleclick.net',
+            'adservice.google.com','ads.twitch.tv','ads-api.twitter.com','ads-twitter.com',
+            'criteo.com','criteo.net','taboola.com','outbrain.com','smartadserver.com',
+            'adform.net','adsrvr.org','pubmatic.com','openx.net','doubleverify.com',
+            'google-analytics.com','analytics.google.com','googletagmanager.com',
+            'googletagservices.com','stats.g.doubleclick.net','facebook.com/tr',
+            'connect.facebook.net','pixel.facebook.com','scorecardresearch.com',
+            'comscore.com','pubads.twitch.tv','ttvnw.net/ads','video-weaver.twitch.tv/ads',
+            'adnxs.com','rubiconproject.com','indexww.com','casalemedia.com',
+            'adsafeprotected.com','moatads.com','krxd.net'
+          ]);
+          const _adPatternRe = new RegExp('/ads?/|/advert|/banner|/sponsor|/tracking|/analytics|/pixel|/beacon|utm_source=|utm_medium=|_ads?\\.|ads?_', 'i');
 
           function shouldBlockRequest(url) {
             if (!url || typeof url !== 'string') return false;
             const lowerUrl = url.toLowerCase();
-            
-            // Check against blocked domains
             for (const domain of blockedDomains) {
-              if (lowerUrl.includes(domain)) {
-                console.log('[Enhanced Adblock] Blocked domain:', domain, 'in', url);
-                return true;
-              }
+              if (lowerUrl.includes(domain)) { return true; }
             }
-            
-            // Block common ad patterns in URLs
-            const adPatterns = [
-              '/ad/',
-              '/ads/',
-              '/advert',
-              '/banner',
-              '/sponsor',
-              '/tracking',
-              '/analytics',
-              '/pixel',
-              '/beacon',
-              'utm_source=',
-              'utm_medium=',
-              '_ad.',
-              '_ads.',
-              'ad_',
-              'ads_'
-            ];
-            
-            for (const pattern of adPatterns) {
-              if (lowerUrl.includes(pattern)) {
-                console.log('[Enhanced Adblock] Blocked pattern:', pattern, 'in', url);
-                return true;
-              }
-            }
-            
-            return false;
+            return _adPatternRe.test(lowerUrl);
           }
 
           // Purple Adblock - Playlist filtering
@@ -1418,14 +1765,12 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
                    line.includes('AMAZON') || 
                    line.includes('AD-') ||
                    line.includes('commercial'))) {
-                console.log('[Purple Adblock] Filtered ad marker:', line);
                 skipNext = true;
                 continue;
               }
               
               // Skip the segment URL after an ad marker
               if (skipNext && !line.startsWith('#')) {
-                console.log('[Purple Adblock] Skipped ad segment:', line);
                 skipNext = false;
                 continue;
               }
@@ -1448,14 +1793,12 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
             
             // Block ad/tracking requests
             if (shouldBlockRequest(url)) {
-              console.log('[Enhanced Adblock] Fetch blocked:', url);
               return Promise.reject(new Error('Blocked by Enhanced Adblock'));
             }
             
             try {
               // Intercept playlist requests
               if (url && (url.includes('.m3u8') || url.includes('playlist'))) {
-                console.log('[Purple Adblock] Intercepting playlist:', url);
                 
                 const response = await originalFetch.apply(this, arguments);
                 
@@ -1490,15 +1833,12 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
                     });
                     
                     if (filtered.length !== body.length) {
-                      console.log('[Purple Adblock] Filtered GraphQL ad operations');
                       init.body = JSON.stringify(filtered);
                     }
                   }
                 } catch (e) {}
               }
-            } catch (e) {
-              console.error('[Purple Adblock] Error:', e);
-            }
+            } catch (e) {}
             
             return originalFetch.apply(this, arguments);
           };
@@ -1510,7 +1850,6 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
             
             // Block ad/tracking requests
             if (shouldBlockRequest(url)) {
-              console.log('[Enhanced Adblock] XHR blocked:', url);
               this.__purple_blocked = true;
             }
             
@@ -1523,7 +1862,6 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
             
             // Block if flagged
             if (this.__purple_blocked) {
-              console.log('[Enhanced Adblock] XHR send blocked:', url);
               return;
             }
             
@@ -1677,11 +2015,9 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
             mutations.forEach((mutation) => {
               mutation.addedNodes.forEach((node) => {
                 if (node.tagName === 'SCRIPT' && node.src && shouldBlockRequest(node.src)) {
-                  console.log('[Enhanced Adblock] Blocked script:', node.src);
                   node.remove();
                 }
                 if (node.tagName === 'IFRAME' && node.src && shouldBlockRequest(node.src)) {
-                  console.log('[Enhanced Adblock] Blocked iframe:', node.src);
                   node.remove();
                 }
               });
@@ -1692,7 +2028,6 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
           // Remove existing ad scripts
           document.querySelectorAll('script').forEach((script) => {
             if (script.src && shouldBlockRequest(script.src)) {
-              console.log('[Enhanced Adblock] Removed existing script:', script.src);
               script.remove();
             }
           });
@@ -1700,7 +2035,6 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
           // Remove existing ad iframes
           document.querySelectorAll('iframe').forEach((iframe) => {
             if (iframe.src && shouldBlockRequest(iframe.src)) {
-              console.log('[Enhanced Adblock] Removed existing iframe:', iframe.src);
               iframe.remove();
             }
           });
@@ -1710,8 +2044,7 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
           if (originalImageSrc && originalImageSrc.set) {
             Object.defineProperty(Image.prototype, 'src', {
               set: function(value) {
-                if (shouldBlockRequest(value)) {
-                  console.log('[Enhanced Adblock] Blocked image:', value);
+              if (shouldBlockRequest(value)) {
                   return;
                 }
                 originalImageSrc.set.call(this, value);
@@ -1731,7 +2064,6 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
               );
               
               if (adIndicators.length > 0) {
-                console.log('[Purple Adblock] Ad overlay detected, hiding...');
                 adIndicators.forEach(el => {
                   el.style.display = 'none';
                   el.style.visibility = 'hidden';
@@ -1742,7 +2074,7 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
 
           startAdMonitoring();
           
-          // Aggressively remove ad elements every second
+          // Aggressively remove ad elements periodically (MutationObserver handles new nodes)
           setInterval(() => {
             function normalize(s) {
               return (s || '').toLowerCase().replace(/\\s+/g, ' ').trim();
@@ -1902,9 +2234,7 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
                 });
               any.forEach(node => { removeLikelyAdContainer(node); });
             } catch (e) {}
-          }, 1000);
-
-          console.log('[Enhanced Adblock] Initialized successfully with uBlock-inspired rules');
+          }, 10000);
         })();
         """,
         injectionTime: .atDocumentStart,
@@ -1971,14 +2301,6 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
         (function() {
           'use strict';
 
-          // Helper to send logs to both console and Swift
-          function logToSwift(msg) {
-            console.log(msg);
-            try {
-              window.webkit?.messageHandlers?.consoleLog?.postMessage(msg);
-            } catch(e) {}
-          }
-
           // Inject script into page context (not isolated world) so it can intercept Worker
           const script = document.createElement('script');
           script.textContent = `
@@ -1987,9 +2309,6 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
 
               if (window.__glitcho_twitchnosub) { return; }
               window.__glitcho_twitchnosub = true;
-
-              console.log('[TwitchNoSub] Initializing in page context...');
-              try { window.webkit?.messageHandlers?.consoleLog?.postMessage('[TwitchNoSub] Initializing in page context...'); } catch(e) {}
 
               // Amazon Worker Patch - This needs to run in the Web Worker context
               const amazonWorkerPatchScript = \`
@@ -2055,41 +2374,29 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
             }
 
             const oldFetch = self.fetch;
-            console.log('[TNS] Fetch override installed in worker');
 
             self.fetch = async function(input, opt) {
               let url = input instanceof Request ? input.url : input.toString();
-
-              // Log interesting requests
-              if (url.includes('usher') || url.includes('.m3u8')) {
-                console.log('[TNS] Intercepting request:', url);
-              }
 
               let response = await oldFetch(input, opt);
 
               // Patch playlist from unmuted to muted segments
               if (url.includes("cloudfront") && url.includes(".m3u8")) {
-                console.log('[TNS] Patching cloudfront playlist (unmuted->muted)');
                 const body = await response.text();
                 return new Response(body.replace(/-unmuted/g, "-muted"), { status: 200 });
               }
 
               if (url.startsWith("https://usher.ttvnw.net/vod/")) {
-                console.log('[TNS] Usher VOD request, status:', response.status);
                 if (response.status != 200) {
                   const isUsherV2 = url.includes("/vod/v2");
-                  console.log('[TNS] ⚠️ Detected failed usher request (subscriber-only?), generating fake playlist...', isUsherV2 ? 'v2' : 'v1');
 
                   const splitUsher = url.split(".m3u8")[0].split("/");
                   const vodId = splitUsher.at(-1);
                   const data = await fetchTwitchDataGQL(vodId);
 
                   if (!data || !data?.data.video) {
-                    console.log("[TNS] Unable to fetch twitch data API");
                     return new Response("Unable to fetch twitch data API", { status: 403 });
                   }
-
-                  console.log('[TNS] Found data for VOD', vodId);
                   const vodData = data.data.video;
                   const channelData = vodData.owner;
                   const currentURL = new URL(vodData.seekPreviewsURL);
@@ -2120,7 +2427,6 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
                     const result = await isValidQuality(playlistUrl);
 
                     if (result) {
-                      console.log('[TNS] Found quality', resKey);
                       if (isUsherV2) {
                         const variantSource = resKey == "chunked" ? "source" : "transcode";
                         fakePlaylist += '\\n#EXT-X-STREAM-INF:BANDWIDTH=' + startQuality + ',CODECS="' + result.codec + ',mp4a.40.2",RESOLUTION=' + resValue.resolution + ',FRAME-RATE=' + resValue.frameRate + ',STABLE-VARIANT-ID="' + resKey + '",IVS-NAME="' + resValue.name + '",IVS-VARIANT-SOURCE="' + variantSource + '"\\n' + playlistUrl;
@@ -2143,54 +2449,32 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
 
               // Get Worker.js content from Twitch blob URL
               function getWasmWorkerJs(twitchBlobUrl) {
-                console.log('[TwitchNoSub] Fetching worker from:', twitchBlobUrl);
                 try {
                   var req = new XMLHttpRequest();
                   req.open('GET', twitchBlobUrl, false);
                   req.overrideMimeType("text/javascript");
                   req.send();
-                  console.log('[TwitchNoSub] Worker fetched, status:', req.status);
                   return req.responseText;
                 } catch (e) {
-                  console.error('[TwitchNoSub] Failed to fetch worker:', e);
                   throw e;
                 }
               }
 
               // Override Worker constructor to inject our patch
               const oldWorker = window.Worker;
-              const logMsg1 = '[TwitchNoSub] Overriding Worker constructor, original: ' + typeof oldWorker;
-              console.log(logMsg1);
-              try { window.webkit?.messageHandlers?.consoleLog?.postMessage(logMsg1); } catch(e) {}
 
               window.Worker = class Worker extends oldWorker {
                 constructor(twitchBlobUrl) {
-                  const logMsg2 = '[TwitchNoSub] 🎯 Worker constructor called with: ' + twitchBlobUrl;
-                  console.log(logMsg2);
-                  try { window.webkit?.messageHandlers?.consoleLog?.postMessage(logMsg2); } catch(e) {}
                   try {
                     var workerString = getWasmWorkerJs(twitchBlobUrl.toString().replaceAll("'", "%27"));
-                    console.log('[TwitchNoSub] Worker code length:', workerString.length);
-                    console.log('[TwitchNoSub] Patch code length:', amazonWorkerPatchScript.length);
                     const patchedCode = amazonWorkerPatchScript + '\n' + workerString;
                     const blobUrl = URL.createObjectURL(new Blob([patchedCode], { type: 'application/javascript' }));
-                    console.log('[TwitchNoSub] Created patched blob URL:', blobUrl);
                     super(blobUrl);
-                    const logMsg3 = '[TwitchNoSub] ✅ Worker patched successfully!';
-                    console.log(logMsg3);
-                    try { window.webkit?.messageHandlers?.consoleLog?.postMessage(logMsg3); } catch(e) {}
                   } catch (e) {
-                    const logMsg4 = '[TwitchNoSub] ❌ Error patching worker: ' + e;
-                    console.error(logMsg4);
-                    try { window.webkit?.messageHandlers?.consoleLog?.postMessage(logMsg4); } catch(e) {}
                     throw e;
                   }
                 }
               };
-
-              const logMsg5 = '[TwitchNoSub] Worker constructor override complete';
-              console.log(logMsg5);
-              try { window.webkit?.messageHandlers?.consoleLog?.postMessage(logMsg5); } catch(e) {}
 
               // Restriction Remover - Remove subscriber-only badges/overlays
               class RestrictionRemover {
@@ -2278,11 +2562,11 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
                 }
 
                 startContinuousCleanup() {
-                  // Aggressive cleanup every 200ms to catch Twitch re-applying blur
+                  // Periodic cleanup to catch Twitch re-applying blur
                   setInterval(() => {
                     this.removeExistingRestrictions();
                     this.removeBlurOverlays();
-                  }, 200);
+                  }, 2000);
 
                   // Replace subscriber-only thumbnails with real ones (less frequently)
                   setInterval(() => {
@@ -2362,16 +2646,6 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
                   // Find ALL links to videos
                   const vodLinks = document.querySelectorAll('a[href*="/videos/"]');
 
-                  // Debug: show count
-                  if (!window.__tnsDebugShown && vodLinks.length > 0) {
-                    window.__tnsDebugShown = true;
-                    const debug = document.createElement('div');
-                    debug.style.cssText = 'position:fixed;bottom:10px;right:10px;background:green;color:white;padding:8px;border-radius:4px;z-index:999999;font-size:11px;';
-                    debug.textContent = 'TNS: Found ' + vodLinks.length + ' VOD links';
-                    document.body.appendChild(debug);
-                    setTimeout(() => debug.remove(), 3000);
-                  }
-
                   for (const link of vodLinks) {
                     const href = link.getAttribute('href') || '';
                     // Use RegExp constructor with string to avoid escaping issues
@@ -2397,14 +2671,9 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
                       if (!isRealThumb && src) {
                         const realThumb = await this.fetchRealThumbnail(vodId);
                         if (realThumb) {
-                          // Debug: show replacement
-                          img.style.border = '3px solid lime';
                           img.src = realThumb;
                           img.srcset = '';
                           img.style.objectFit = 'cover';
-                        } else {
-                          // Debug: show failure
-                          img.style.border = '3px solid red';
                         }
                       }
                       img.dataset.tnsProcessed = vodId;
@@ -2496,24 +2765,11 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
               }
 
               new RestrictionRemover();
-              const logMsg6 = '[TwitchNoSub] ✅ Initialized successfully in page context';
-              console.log(logMsg6);
-              try { window.webkit?.messageHandlers?.consoleLog?.postMessage(logMsg6); } catch(e) {}
             })();
           \`;
 
           // Inject into page context by adding script tag to DOM
           (document.head || document.documentElement).appendChild(script);
-          logToSwift('[TwitchNoSub] Script injected into page context');
-
-          // Add visual confirmation badge
-          setTimeout(() => {
-            const badge = document.createElement('div');
-            badge.style.cssText = 'position:fixed;top:10px;right:10px;background:#9147ff;color:white;padding:8px 12px;border-radius:8px;z-index:999999;font-size:12px;font-family:sans-serif;box-shadow:0 2px 8px rgba(0,0,0,0.3);';
-            badge.textContent = '✅ TwitchNoSub Active';
-            document.body.appendChild(badge);
-            setTimeout(() => badge.remove(), 5000);
-          }, 1000);
         })();
         """#,
         injectionTime: .atDocumentStart,

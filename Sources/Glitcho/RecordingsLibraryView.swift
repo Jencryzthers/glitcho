@@ -71,7 +71,7 @@ struct RecordingsLibraryView: View {
                                         .padding(.horizontal, 16)
 
                                     ForEach(group.items) { recording in
-                                        let isDeleteDisabled = recordingManager.isRecording && recordingManager.lastOutputURL == recording.url
+                                        let isDeleteDisabled = recordingManager.isRecording(outputURL: recording.url)
 
                                         RecordingRow(
                                             recording: recording,
@@ -277,7 +277,7 @@ struct RecordingsLibraryView: View {
         playbackURL = nil
         playbackError = nil
 
-        if recordingManager.isRecording, recordingManager.lastOutputURL == url {
+        if recordingManager.isRecording(outputURL: url) {
             isPreparingPlayback = false
             playbackError = "This recording is still in progress. Stop recording before playing it."
             return
