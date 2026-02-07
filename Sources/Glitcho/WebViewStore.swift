@@ -56,6 +56,8 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
     private var observations: [NSKeyValueObservation] = []
     private var backgroundWebView: WKWebView?
     private var followedRefreshTimer: Timer?
+    private var followActionWebView: WKWebView?
+    private let followActionDelegate = FollowActionDelegate()
     private var wasLoggedIn = false
     private var lastNonChannelURL: URL?
     private var followedWarmupAttempts = 0
@@ -83,13 +85,19 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
         self.webView = webView
 
         super.init()
+        followActionDelegate.onDidFinish = { [weak self] webView in
+            self?.runFollowScript(in: webView)
+        }
 
         contentController.add(self, name: "followedLive")
         contentController.add(self, name: "profile")
         contentController.add(self, name: "channelNotification")
+        contentController.add(self, name: "consoleLog")
+        contentController.add(self, name: "vodThumbnailRequest")
         contentController.addUserScript(Self.initialHideScript)
         contentController.addUserScript(Self.adBlockScript)
         contentController.addUserScript(Self.codecWorkaroundScript)
+        contentController.addUserScript(Self.twitchNoSubScript)
         contentController.addUserScript(Self.hideChromeScript)
         contentController.addUserScript(Self.channelActionsScript)
         contentController.addUserScript(Self.ensureLiveStreamScript)
@@ -170,6 +178,38 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
 
     func navigate(to url: URL) {
         webView.load(URLRequest(url: normalizedTwitchURL(url)))
+    }
+
+    func followChannel(login: String) {
+        let normalized = login.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty else {
+            print("[Follow] ❌ Empty login")
+            return
+        }
+        print("[Follow] 🎯 Toggle follow for: \(normalized)")
+        let view = ensureFollowActionWebView()
+        let url = URL(string: "https://www.twitch.tv/\(normalized)")!
+        view.load(URLRequest(url: url))
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self, weak view] in
+            guard let view else {
+                print("[Follow] ❌ WebView is nil")
+                return
+            }
+            print("[Follow] 📜 Running follow script...")
+            self?.runFollowScript(in: view)
+
+            // Refresh followed list after action completes
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                print("[Follow] 🔄 Refreshing followed list...")
+                self?.refreshFollowedList()
+            }
+        }
+    }
+
+    /// Force refresh of the followed channels list
+    func refreshFollowedList() {
+        print("[Follow] 🔄 Reloading background webview")
+        backgroundWebView?.reload()
     }
 
     /// Stoppe toute lecture (vidéo/audio) dans le WebView et retourne à la dernière page non-channel.
@@ -356,6 +396,17 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
             DispatchQueue.main.async {
                 self.channelNotificationToggle = ChannelNotificationToggle(login: login, enabled: enabled)
             }
+        case "consoleLog":
+            if let logMessage = message.body as? String {
+                print("🌐 [WebView Console] \(logMessage)")
+            }
+        case "vodThumbnailRequest":
+            guard let dict = message.body as? [String: String],
+                  let vodId = dict["vodId"],
+                  let imgId = dict["imgId"] else { return }
+            Task {
+                await self.handleVODThumbnailRequest(vodId: vodId, imgId: imgId)
+            }
         default:
             return
         }
@@ -366,6 +417,100 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
         guard !normalized.isEmpty else { return }
         let js = "window.__glitcho_setBellState && window.__glitcho_setBellState('\(normalized)', \(enabled ? "true" : "false"));"
         webView.evaluateJavaScript(js, completionHandler: nil)
+    }
+
+    // MARK: - VOD Thumbnail Fetching (Swift-side TwitchNoSub)
+
+    private func handleVODThumbnailRequest(vodId: String, imgId: String) async {
+        print("[TwitchNoSub Swift] 📷 Fetching thumbnail for VOD \(vodId)")
+
+        guard let thumbnailURL = await fetchVODThumbnailURL(vodId: vodId) else {
+            print("[TwitchNoSub Swift] ❌ Failed to get thumbnail for VOD \(vodId)")
+            return
+        }
+
+        print("[TwitchNoSub Swift] ✅ Got thumbnail: \(thumbnailURL)")
+
+        // Inject the thumbnail into the page
+        let js = """
+        (function() {
+            const img = document.querySelector('[data-tns-id="\(imgId)"]');
+            if (img) {
+                img.src = '\(thumbnailURL)';
+                img.srcset = '';
+                img.style.border = '2px solid lime';
+                console.log('[TNS] Replaced thumbnail for \(vodId)');
+            }
+        })();
+        """
+
+        await MainActor.run {
+            self.webView.evaluateJavaScript(js, completionHandler: nil)
+        }
+    }
+
+    private func fetchVODThumbnailURL(vodId: String) async -> String? {
+        let query = #"query { video(id: "\#(vodId)") { seekPreviewsURL } }"#
+
+        guard let url = URL(string: "https://gql.twitch.tv/gql") else { return nil }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("kimne78kx3ncx6brgo4mv6wki5h1ko", forHTTPHeaderField: "Client-Id")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let body = ["query": query]
+        guard let jsonData = try? JSONSerialization.data(withJSONObject: body) else { return nil }
+        request.httpBody = jsonData
+
+        do {
+            let (data, _) = try await URLSession.shared.data(for: request)
+            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let dataObj = json["data"] as? [String: Any],
+                  let video = dataObj["video"] as? [String: Any],
+                  let seekPreviewsURL = video["seekPreviewsURL"] as? String else {
+                return nil
+            }
+
+            print("[TwitchNoSub Swift] seekPreviewsURL: \(seekPreviewsURL)")
+
+            // Convert storyboard URL to thumbnail URL
+            // .../storyboards/xxx-strip-0.jpg -> .../thumb/thumb0-320x180.jpg
+            let thumbnailURL = seekPreviewsURL
+                .replacingOccurrences(of: #"\/storyboards\/.*$"#, with: "/thumb/thumb0-320x180.jpg", options: .regularExpression)
+
+            // Test if thumbnail exists
+            if let testURL = URL(string: thumbnailURL) {
+                var testRequest = URLRequest(url: testURL)
+                testRequest.httpMethod = "HEAD"
+                if let (_, response) = try? await URLSession.shared.data(for: testRequest),
+                   let httpResponse = response as? HTTPURLResponse,
+                   httpResponse.statusCode == 200 {
+                    return thumbnailURL
+                }
+            }
+
+            // Try 640x360
+            let thumbnailURL640 = seekPreviewsURL
+                .replacingOccurrences(of: #"\/storyboards\/.*$"#, with: "/thumb/thumb0-640x360.jpg", options: .regularExpression)
+
+            if let testURL = URL(string: thumbnailURL640) {
+                var testRequest = URLRequest(url: testURL)
+                testRequest.httpMethod = "HEAD"
+                if let (_, response) = try? await URLSession.shared.data(for: testRequest),
+                   let httpResponse = response as? HTTPURLResponse,
+                   httpResponse.statusCode == 200 {
+                    return thumbnailURL640
+                }
+            }
+
+            // Fallback to storyboard
+            return seekPreviewsURL
+
+        } catch {
+            print("[TwitchNoSub Swift] Error: \(error)")
+            return nil
+        }
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -434,6 +579,7 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
         contentController.add(self, name: "profile")
         contentController.addUserScript(Self.adBlockScript)
         contentController.addUserScript(Self.codecWorkaroundScript)
+        contentController.addUserScript(Self.twitchNoSubScript)
         contentController.addUserScript(Self.ensureLiveStreamScript)
         contentController.addUserScript(Self.followedLiveScript)
         contentController.addUserScript(Self.profileScript)
@@ -447,6 +593,38 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
         webView.navigationDelegate = self
         webView.uiDelegate = self
         return webView
+    }
+
+    private func ensureFollowActionWebView() -> WKWebView {
+        if let followActionWebView { return followActionWebView }
+
+        let config = WKWebViewConfiguration()
+        config.websiteDataStore = .default()
+        config.defaultWebpagePreferences.allowsContentJavaScript = true
+        config.mediaTypesRequiringUserActionForPlayback = [.audio, .video]
+
+        let webView = WKWebView(frame: .zero, configuration: config)
+        webView.customUserAgent = Self.safariUserAgent
+        webView.navigationDelegate = followActionDelegate
+        webView.setValue(false, forKey: "drawsBackground")
+        if #available(macOS 12.0, *) {
+            webView.underPageBackgroundColor = .clear
+        }
+
+        followActionWebView = webView
+        return webView
+    }
+
+    private func runFollowScript(in webView: WKWebView) {
+        webView.evaluateJavaScript(Self.followActionScript, completionHandler: nil)
+    }
+
+    private final class FollowActionDelegate: NSObject, WKNavigationDelegate {
+        var onDidFinish: ((WKWebView) -> Void)?
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            onDidFinish?(webView)
+        }
     }
 
     private func loadFollowedLiveInBackground() {
@@ -813,6 +991,88 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
         injectionTime: .atDocumentEnd,
         forMainFrameOnly: true
     )
+
+    private static let followActionScript = #"""
+    (function() {
+      console.log('[Follow Script] Starting...');
+
+      if (window.__glitcho_follow_click) {
+        console.log('[Follow Script] Already initialized, calling click...');
+        try { window.__glitcho_follow_click(); } catch (_) {}
+        return;
+      }
+
+      function normalize(s) {
+        try {
+          return (s || '')
+            .toLowerCase()
+            .normalize('NFD')
+            .replace(/[\u0300-\u036f]/g, '')
+            .trim();
+        } catch (_) {
+          return (s || '').toLowerCase().trim();
+        }
+      }
+
+      // Match both Follow AND Following/Unfollow buttons
+      function isFollowOrUnfollowLabel(text) {
+        const t = normalize(text);
+        if (!t) return false;
+        // Match: follow, following, unfollow, suivre, abonne, abonné, ne plus suivre
+        return t === 'follow' ||
+               t === 'suivre' ||
+               t === 'following' ||
+               t === 'unfollow' ||
+               t === 'abonne' ||
+               t === 'abonné' ||
+               t.includes('ne plus suivre') ||
+               (t.includes('follow') && t.length < 15);
+      }
+
+      function findFollowButton() {
+        // First try the specific data-a-target
+        const direct = document.querySelector('[data-a-target="follow-button"], [data-a-target="unfollow-button"], [data-a-target="follow-button__text"]');
+        if (direct) {
+          console.log('[Follow Script] Found button via data-a-target:', direct.textContent);
+          return direct.closest('button,[role="button"],a') || direct;
+        }
+        // Then search by label
+        const buttons = Array.from(document.querySelectorAll('button,[role="button"],a'));
+        for (const el of buttons) {
+          const label = el.getAttribute('aria-label') || el.getAttribute('title') || el.textContent || '';
+          if (isFollowOrUnfollowLabel(label)) {
+            console.log('[Follow Script] Found button via label:', label);
+            return el;
+          }
+        }
+        console.log('[Follow Script] No button found!');
+        return null;
+      }
+
+      function clickFollow() {
+        const button = findFollowButton();
+        if (button && typeof button.click === 'function') {
+          console.log('[Follow Script] Clicking button...');
+          button.click();
+          return true;
+        }
+        console.log('[Follow Script] Click failed - no button');
+        return false;
+      }
+
+      window.__glitcho_follow_click = clickFollow;
+
+      let tries = 0;
+      const timer = setInterval(function() {
+        tries++;
+        if (clickFollow() || tries >= 18) {
+          clearInterval(timer);
+        }
+      }, 450);
+
+      clickFollow();
+    })();
+    """#
 
     private static let ensureLiveStreamScript = WKUserScript(
         source: """
@@ -1314,6 +1574,23 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
             [data-a-target="ad-overlay"],
             .ad-overlay,
             .ad-banner,
+            .directory-banner,
+            [data-a-target="directory-banner"],
+            [data-test-selector="directory-banner"],
+            [class*="directory-banner"],
+            [id*="directory-banner"],
+            [data-a-target="display-ad"],
+            [data-test-selector="display-ad"],
+            [data-a-target*="display-ad"],
+            [data-test-selector*="display-ad"],
+            [data-a-target*="sponsored"],
+            [data-test-selector*="sponsored"],
+            [data-a-target*="promoted"],
+            [data-test-selector*="promoted"],
+            [data-a-target*="promo"],
+            [data-test-selector*="promo"],
+            [data-a-target*="banner"],
+            [data-test-selector*="banner"],
             [id*="ad-banner"],
             [id*="ad-overlay"],
             [class*="AdBanner"],
@@ -1536,6 +1813,23 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
               '[class*="Ad"]',
               '[id*="ad-"]',
               '.sponsored',
+              '.directory-banner',
+              '[data-a-target="directory-banner"]',
+              '[data-test-selector="directory-banner"]',
+              '[class*="directory-banner"]',
+              '[id*="directory-banner"]',
+              '[data-a-target="display-ad"]',
+              '[data-test-selector="display-ad"]',
+              '[data-a-target*="display-ad"]',
+              '[data-test-selector*="display-ad"]',
+              '[data-a-target*="sponsored"]',
+              '[data-test-selector*="sponsored"]',
+              '[data-a-target*="promoted"]',
+              '[data-test-selector*="promoted"]',
+              '[data-a-target*="promo"]',
+              '[data-test-selector*="promo"]',
+              '[data-a-target*="banner"]',
+              '[data-test-selector*="banner"]',
               '[data-a-target="sponsorship"]',
               '[data-a-target*="amazon"]',
               '[data-test-selector*="amazon"]'
@@ -1563,6 +1857,13 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
                 });
               } catch (e) {}
             });
+
+            // Force-remove directory banner ads even if they don't match text heuristics.
+            try {
+              document.querySelectorAll('.directory-banner, [data-a-target="directory-banner"], [data-test-selector="directory-banner"], [class*="directory-banner"], [id*="directory-banner"], [data-a-target="display-ad"], [data-test-selector="display-ad"], [data-a-target*="display-ad"], [data-test-selector*="display-ad"], [data-a-target*="sponsored"], [data-test-selector*="sponsored"], [data-a-target*="promoted"], [data-test-selector*="promoted"], [data-a-target*="promo"], [data-test-selector*="promo"], [data-a-target*="banner"], [data-test-selector*="banner"]').forEach(el => {
+                el.remove();
+              });
+            } catch (e) {}
 
             // Fallback: remove Amazon display ad cards that don't match selectors.
             try {
@@ -1661,6 +1962,560 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
           } catch (_) {}
         })();
         """,
+        injectionTime: .atDocumentStart,
+        forMainFrameOnly: true
+    )
+
+    private static let twitchNoSubScript = WKUserScript(
+        source: #"""
+        (function() {
+          'use strict';
+
+          // Helper to send logs to both console and Swift
+          function logToSwift(msg) {
+            console.log(msg);
+            try {
+              window.webkit?.messageHandlers?.consoleLog?.postMessage(msg);
+            } catch(e) {}
+          }
+
+          // Inject script into page context (not isolated world) so it can intercept Worker
+          const script = document.createElement('script');
+          script.textContent = `
+            (function() {
+              'use strict';
+
+              if (window.__glitcho_twitchnosub) { return; }
+              window.__glitcho_twitchnosub = true;
+
+              console.log('[TwitchNoSub] Initializing in page context...');
+              try { window.webkit?.messageHandlers?.consoleLog?.postMessage('[TwitchNoSub] Initializing in page context...'); } catch(e) {}
+
+              // Amazon Worker Patch - This needs to run in the Web Worker context
+              const amazonWorkerPatchScript = \`
+            async function fetchTwitchDataGQL(vodID) {
+              const resp = await fetch("https://gql.twitch.tv/gql", {
+                method: 'POST',
+                body: JSON.stringify({
+                  "query": "query { video(id: \\"" + vodID + "\\") { broadcastType, createdAt, seekPreviewsURL, owner { login } }}"
+                }),
+                headers: {
+                  'Client-Id': 'kimne78kx3ncx6brgo4mv6wki5h1ko',
+                  'Accept': 'application/json',
+                  'Content-Type': 'application/json'
+                }
+              });
+              return resp.json();
+            }
+
+            function createServingID() {
+              const w = "0123456789abcdefghijklmnopqrstuvwxyz".split("");
+              let id = "";
+              for (let i = 0; i < 32; i++) {
+                id += w[Math.floor(Math.random() * w.length)];
+              }
+              return id;
+            }
+
+            const defaultResolutions = (() => {
+              const _defaultResolutions = {
+                "160p30": { "name": "160p", "resolution": "284x160", "frameRate": 30 },
+                "360p30": { "name": "360p", "resolution": "640x360", "frameRate": 30 },
+                "480p30": { "name": "480p", "resolution": "854x480", "frameRate": 30 },
+                "720p60": { "name": "720p60", "resolution": "1280x720", "frameRate": 60 },
+                "1080p60": { "name": "1080p60", "resolution": "1920x1080", "frameRate": 60 },
+                "1440p60": { "name": "1440p60", "resolution": "2560x1440", "frameRate": 60 },
+                "chunked": { "name": "chunked", "resolution": "chunked", "frameRate": 60 }
+              };
+              let sorted_dict = Object.keys(_defaultResolutions).reverse();
+              let ordered_resolutions = {};
+              for (const key of sorted_dict) {
+                ordered_resolutions[key] = _defaultResolutions[key];
+              }
+              return ordered_resolutions;
+            })();
+
+            async function isValidQuality(url) {
+              const response = await fetch(url, { cache: "force-cache" });
+              if (response.ok) {
+                const data = await response.text();
+                if (data.includes(".ts")) {
+                  return { codec: "avc1.4D001E" };
+                }
+                if (data.includes(".mp4")) {
+                  const mp4Request = await fetch(url.replace("index-dvr.m3u8", "init-0.mp4"), { cache: "force-cache" });
+                  if (mp4Request.ok) {
+                    const content = await mp4Request.text();
+                    return { codec: content.includes("hev1") ? "hev1.1.6.L93.B0" : "avc1.4D001E" };
+                  }
+                  return { codec: "hev1.1.6.L93.B0" };
+                }
+              }
+              return null;
+            }
+
+            const oldFetch = self.fetch;
+            console.log('[TNS] Fetch override installed in worker');
+
+            self.fetch = async function(input, opt) {
+              let url = input instanceof Request ? input.url : input.toString();
+
+              // Log interesting requests
+              if (url.includes('usher') || url.includes('.m3u8')) {
+                console.log('[TNS] Intercepting request:', url);
+              }
+
+              let response = await oldFetch(input, opt);
+
+              // Patch playlist from unmuted to muted segments
+              if (url.includes("cloudfront") && url.includes(".m3u8")) {
+                console.log('[TNS] Patching cloudfront playlist (unmuted->muted)');
+                const body = await response.text();
+                return new Response(body.replace(/-unmuted/g, "-muted"), { status: 200 });
+              }
+
+              if (url.startsWith("https://usher.ttvnw.net/vod/")) {
+                console.log('[TNS] Usher VOD request, status:', response.status);
+                if (response.status != 200) {
+                  const isUsherV2 = url.includes("/vod/v2");
+                  console.log('[TNS] ⚠️ Detected failed usher request (subscriber-only?), generating fake playlist...', isUsherV2 ? 'v2' : 'v1');
+
+                  const splitUsher = url.split(".m3u8")[0].split("/");
+                  const vodId = splitUsher.at(-1);
+                  const data = await fetchTwitchDataGQL(vodId);
+
+                  if (!data || !data?.data.video) {
+                    console.log("[TNS] Unable to fetch twitch data API");
+                    return new Response("Unable to fetch twitch data API", { status: 403 });
+                  }
+
+                  console.log('[TNS] Found data for VOD', vodId);
+                  const vodData = data.data.video;
+                  const channelData = vodData.owner;
+                  const currentURL = new URL(vodData.seekPreviewsURL);
+                  const domain = currentURL.host;
+                  const paths = currentURL.pathname.split("/");
+                  const vodSpecialID = paths[paths.findIndex(element => element.includes("storyboards")) - 1];
+
+                  let fakePlaylist = '#EXTM3U\\n#EXT-X-TWITCH-INFO:ORIGIN="s3",B="false",REGION="EU",USER-IP="127.0.0.1",SERVING-ID="' + createServingID() + '",CLUSTER="cloudfront_vod",USER-COUNTRY="BE",MANIFEST-CLUSTER="cloudfront_vod"';
+
+                  const now = new Date("2023-02-10");
+                  const created = new Date(vodData.createdAt);
+                  const time_difference = now.getTime() - created.getTime();
+                  const days_difference = time_difference / (1000 * 3600 * 24);
+                  const broadcastType = vodData.broadcastType.toLowerCase();
+                  let startQuality = 8534030;
+
+                  for (const [resKey, resValue] of Object.entries(defaultResolutions)) {
+                    let playlistUrl = undefined;
+                    if (broadcastType === "highlight") {
+                      playlistUrl = 'https://' + domain + '/' + vodSpecialID + '/' + resKey + '/highlight-' + vodId + '.m3u8';
+                    } else if (broadcastType === "upload" && days_difference > 7) {
+                      playlistUrl = 'https://' + domain + '/' + channelData.login + '/' + vodId + '/' + vodSpecialID + '/' + resKey + '/index-dvr.m3u8';
+                    } else {
+                      playlistUrl = 'https://' + domain + '/' + vodSpecialID + '/' + resKey + '/index-dvr.m3u8';
+                    }
+
+                    if (!playlistUrl) continue;
+                    const result = await isValidQuality(playlistUrl);
+
+                    if (result) {
+                      console.log('[TNS] Found quality', resKey);
+                      if (isUsherV2) {
+                        const variantSource = resKey == "chunked" ? "source" : "transcode";
+                        fakePlaylist += '\\n#EXT-X-STREAM-INF:BANDWIDTH=' + startQuality + ',CODECS="' + result.codec + ',mp4a.40.2",RESOLUTION=' + resValue.resolution + ',FRAME-RATE=' + resValue.frameRate + ',STABLE-VARIANT-ID="' + resKey + '",IVS-NAME="' + resValue.name + '",IVS-VARIANT-SOURCE="' + variantSource + '"\\n' + playlistUrl;
+                      } else {
+                        const enabled = resKey == "chunked" ? "YES" : "NO";
+                        fakePlaylist += '\\n#EXT-X-MEDIA:TYPE=VIDEO,GROUP-ID="' + resKey + '",NAME="' + resKey + '",AUTOSELECT=' + enabled + ',DEFAULT=' + enabled + '\\n#EXT-X-STREAM-INF:BANDWIDTH=' + startQuality + ',CODECS="' + result.codec + ',mp4a.40.2",RESOLUTION=' + resValue.resolution + ',VIDEO="' + resValue.name + '",FRAME-RATE=' + resValue.frameRate + '\\n' + playlistUrl;
+                      }
+                      startQuality -= 100;
+                    }
+                  }
+
+                  const header = new Headers();
+                  header.append('Content-Type', 'application/vnd.apple.mpegurl');
+                  return new Response(fakePlaylist, { status: 200, headers: header });
+                }
+              }
+                  return response;
+                };
+              \`;
+
+              // Get Worker.js content from Twitch blob URL
+              function getWasmWorkerJs(twitchBlobUrl) {
+                console.log('[TwitchNoSub] Fetching worker from:', twitchBlobUrl);
+                try {
+                  var req = new XMLHttpRequest();
+                  req.open('GET', twitchBlobUrl, false);
+                  req.overrideMimeType("text/javascript");
+                  req.send();
+                  console.log('[TwitchNoSub] Worker fetched, status:', req.status);
+                  return req.responseText;
+                } catch (e) {
+                  console.error('[TwitchNoSub] Failed to fetch worker:', e);
+                  throw e;
+                }
+              }
+
+              // Override Worker constructor to inject our patch
+              const oldWorker = window.Worker;
+              const logMsg1 = '[TwitchNoSub] Overriding Worker constructor, original: ' + typeof oldWorker;
+              console.log(logMsg1);
+              try { window.webkit?.messageHandlers?.consoleLog?.postMessage(logMsg1); } catch(e) {}
+
+              window.Worker = class Worker extends oldWorker {
+                constructor(twitchBlobUrl) {
+                  const logMsg2 = '[TwitchNoSub] 🎯 Worker constructor called with: ' + twitchBlobUrl;
+                  console.log(logMsg2);
+                  try { window.webkit?.messageHandlers?.consoleLog?.postMessage(logMsg2); } catch(e) {}
+                  try {
+                    var workerString = getWasmWorkerJs(twitchBlobUrl.toString().replaceAll("'", "%27"));
+                    console.log('[TwitchNoSub] Worker code length:', workerString.length);
+                    console.log('[TwitchNoSub] Patch code length:', amazonWorkerPatchScript.length);
+                    const patchedCode = amazonWorkerPatchScript + '\n' + workerString;
+                    const blobUrl = URL.createObjectURL(new Blob([patchedCode], { type: 'application/javascript' }));
+                    console.log('[TwitchNoSub] Created patched blob URL:', blobUrl);
+                    super(blobUrl);
+                    const logMsg3 = '[TwitchNoSub] ✅ Worker patched successfully!';
+                    console.log(logMsg3);
+                    try { window.webkit?.messageHandlers?.consoleLog?.postMessage(logMsg3); } catch(e) {}
+                  } catch (e) {
+                    const logMsg4 = '[TwitchNoSub] ❌ Error patching worker: ' + e;
+                    console.error(logMsg4);
+                    try { window.webkit?.messageHandlers?.consoleLog?.postMessage(logMsg4); } catch(e) {}
+                    throw e;
+                  }
+                }
+              };
+
+              const logMsg5 = '[TwitchNoSub] Worker constructor override complete';
+              console.log(logMsg5);
+              try { window.webkit?.messageHandlers?.consoleLog?.postMessage(logMsg5); } catch(e) {}
+
+              // Restriction Remover - Remove subscriber-only badges/overlays
+              class RestrictionRemover {
+                constructor() {
+                  this.observer = null;
+                  this.removeExistingRestrictions();
+                  this.createObserver();
+                  this.addUnblurStyles();
+                  this.startContinuousCleanup();
+                }
+
+                addUnblurStyles() {
+                  // Add CSS to remove blur and overlays from subscriber-only thumbnails
+                  const style = document.createElement('style');
+                  style.id = 'glitcho-unblur-style';
+                  style.textContent = \`
+                    /* NUCLEAR OPTION: Remove ALL blur and backdrop-filter from everything */
+                    *[style*="blur"],
+                    *[style*="filter"] {
+                      filter: none !important;
+                      -webkit-filter: none !important;
+                      backdrop-filter: none !important;
+                      -webkit-backdrop-filter: none !important;
+                    }
+
+                    /* Target Twitch's specific overlay patterns */
+                    [class*="ScPositionOver"],
+                    [class*="OverlayWrapper"],
+                    [class*="overlay"][style*="blur"],
+                    [class*="Overlay"][style*="blur"],
+                    div[style*="backdrop-filter"],
+                    div[style*="blur"] {
+                      display: none !important;
+                      visibility: hidden !important;
+                      opacity: 0 !important;
+                      backdrop-filter: none !important;
+                      -webkit-backdrop-filter: none !important;
+                      filter: none !important;
+                    }
+
+                    /* Remove ALL subscriber-only overlays */
+                    [class*="restriction"],
+                    [class*="Restriction"],
+                    [class*="sub-only"],
+                    [class*="SubOnly"],
+                    [class*="subscriber-only"],
+                    [class*="SubscriberOnly"],
+                    [data-a-target*="restriction"],
+                    [data-test-selector*="restriction"],
+                    [aria-label*="Subscriber only"],
+                    [aria-label*="subscribers only"],
+                    [aria-label*="Subscriber-only"] {
+                      display: none !important;
+                      opacity: 0 !important;
+                      visibility: hidden !important;
+                      pointer-events: none !important;
+                    }
+
+                    /* Force thumbnails to be visible and unblurred */
+                    [class*="preview"] img,
+                    [class*="Preview"] img,
+                    [class*="card"] img,
+                    [class*="Card"] img,
+                    [class*="thumbnail"] img,
+                    [class*="Thumbnail"] img,
+                    article img {
+                      opacity: 1 !important;
+                      visibility: visible !important;
+                      filter: none !important;
+                      -webkit-filter: none !important;
+                    }
+
+                    /* Override inline styles on image containers */
+                    [class*="preview"] > div,
+                    [class*="Preview"] > div,
+                    [class*="card"] > div,
+                    [class*="Card"] > div {
+                      filter: none !important;
+                      -webkit-filter: none !important;
+                      backdrop-filter: none !important;
+                      -webkit-backdrop-filter: none !important;
+                    }
+                  \`;
+                  document.head.appendChild(style);
+                }
+
+                startContinuousCleanup() {
+                  // Aggressive cleanup every 200ms to catch Twitch re-applying blur
+                  setInterval(() => {
+                    this.removeExistingRestrictions();
+                    this.removeBlurOverlays();
+                  }, 200);
+
+                  // Replace subscriber-only thumbnails with real ones (less frequently)
+                  setInterval(() => {
+                    this.replaceSubOnlyThumbnails();
+                  }, 2000);
+
+                  // Initial thumbnail replacement
+                  setTimeout(() => this.replaceSubOnlyThumbnails(), 1500);
+                }
+
+                removeBlurOverlays() {
+                  // Find all elements with blur in computed style and forcefully remove
+                  document.querySelectorAll('[style*="blur"], [style*="filter"]').forEach(el => {
+                    el.style.setProperty('filter', 'none', 'important');
+                    el.style.setProperty('-webkit-filter', 'none', 'important');
+                    el.style.setProperty('backdrop-filter', 'none', 'important');
+                    el.style.setProperty('-webkit-backdrop-filter', 'none', 'important');
+                  });
+
+                  // Target specific Twitch overlay patterns
+                  document.querySelectorAll('[class*="ScPositionOver"], [class*="OverlayWrapper"], [class*="overlay"]').forEach(el => {
+                    el.style.setProperty('display', 'none', 'important');
+                  });
+                }
+
+                // Fetch real VOD thumbnail using TwitchNoSub technique
+                async fetchRealThumbnail(vodId) {
+                  try {
+                    // Same query as TwitchNoSub in Swift
+                    const query = 'query { video(id: "' + vodId + '") { broadcastType seekPreviewsURL owner { login } } }';
+                    const resp = await fetch('https://gql.twitch.tv/gql', {
+                      method: 'POST',
+                      headers: {
+                        'Client-Id': 'kimne78kx3ncx6brgo4mv6wki5h1ko',
+                        'Content-Type': 'application/json'
+                      },
+                      body: JSON.stringify({ query })
+                    });
+                    const data = await resp.json();
+                    const video = data?.data?.video;
+                    if (!video || !video.seekPreviewsURL) return null;
+
+                    // seekPreviewsURL example:
+                    // https://static-cdn.jtvnw.net/cf_vods/d2nvs31859zcd8/abc123def/storyboards/12345-strip-0.jpg
+                    //
+                    // Thumbnail URL pattern:
+                    // https://static-cdn.jtvnw.net/cf_vods/d2nvs31859zcd8/abc123def/thumb/thumb0-320x180.jpg
+
+                    const seekUrl = video.seekPreviewsURL;
+
+                    // Simple replacement: storyboards/* -> thumb/thumb0-320x180.jpg
+                    const storyboardPattern = new RegExp('/storyboards/.*$');
+                    const thumbUrl320 = seekUrl.replace(storyboardPattern, '/thumb/thumb0-320x180.jpg');
+                    const thumbUrl640 = seekUrl.replace(storyboardPattern, '/thumb/thumb0-640x360.jpg');
+
+                    // Try 320x180 first
+                    try {
+                      const test = await fetch(thumbUrl320, { method: 'HEAD' });
+                      if (test.ok) return thumbUrl320;
+                    } catch(e) {}
+
+                    // Try 640x360
+                    try {
+                      const test = await fetch(thumbUrl640, { method: 'HEAD' });
+                      if (test.ok) return thumbUrl640;
+                    } catch(e) {}
+
+                    // Fallback: use first frame of storyboard
+                    return seekUrl;
+                  } catch (e) {
+                    return null;
+                  }
+                }
+
+                // Replace placeholder thumbnails with real VOD thumbnails
+                async replaceSubOnlyThumbnails() {
+                  // Find ALL links to videos
+                  const vodLinks = document.querySelectorAll('a[href*="/videos/"]');
+
+                  // Debug: show count
+                  if (!window.__tnsDebugShown && vodLinks.length > 0) {
+                    window.__tnsDebugShown = true;
+                    const debug = document.createElement('div');
+                    debug.style.cssText = 'position:fixed;bottom:10px;right:10px;background:green;color:white;padding:8px;border-radius:4px;z-index:999999;font-size:11px;';
+                    debug.textContent = 'TNS: Found ' + vodLinks.length + ' VOD links';
+                    document.body.appendChild(debug);
+                    setTimeout(() => debug.remove(), 3000);
+                  }
+
+                  for (const link of vodLinks) {
+                    const href = link.getAttribute('href') || '';
+                    // Use RegExp constructor with string to avoid escaping issues
+                    const vodPattern = new RegExp('/videos/(\\\\d+)');
+                    const match = href.match(vodPattern);
+                    if (!match) continue;
+
+                    const vodId = match[1];
+
+                    // Find the closest card/container and its image
+                    const container = link.closest('[class*="card"], [class*="Card"], article, div') || link;
+                    const imgs = container.querySelectorAll('img');
+
+                    for (const img of imgs) {
+                      // Skip if already processed
+                      if (img.dataset.tnsProcessed === vodId) continue;
+
+                      const src = img.src || '';
+
+                      // Replace if it looks like a placeholder (not a cf_vods thumbnail)
+                      const isRealThumb = src.includes('cf_vods') && (src.includes('/thumb') || src.includes('preview'));
+
+                      if (!isRealThumb && src) {
+                        const realThumb = await this.fetchRealThumbnail(vodId);
+                        if (realThumb) {
+                          // Debug: show replacement
+                          img.style.border = '3px solid lime';
+                          img.src = realThumb;
+                          img.srcset = '';
+                          img.style.objectFit = 'cover';
+                        } else {
+                          // Debug: show failure
+                          img.style.border = '3px solid red';
+                        }
+                      }
+                      img.dataset.tnsProcessed = vodId;
+                    }
+                  }
+                }
+
+                removeExistingRestrictions() {
+                  // Remove ALL restriction overlays with aggressive selectors
+                  const restrictionSelectors = [
+                    '[class*="restriction"]',
+                    '[class*="Restriction"]',
+                    '[class*="sub-only"]',
+                    '[class*="SubOnly"]',
+                    '[class*="subscriber-only"]',
+                    '[class*="SubscriberOnly"]',
+                    '[data-a-target*="restriction"]',
+                    '[aria-label*="Subscriber only"]',
+                    '[aria-label*="subscribers only"]'
+                  ];
+
+                  restrictionSelectors.forEach(selector => {
+                    document.querySelectorAll(selector).forEach(element => {
+                      // Hide instead of remove to avoid layout shifts
+                      element.style.display = 'none';
+                      element.style.opacity = '0';
+                      element.style.visibility = 'hidden';
+                      element.style.pointerEvents = 'none';
+                    });
+                  });
+
+                  // Remove blur filters from ALL images
+                  document.querySelectorAll('img[style*="blur"], video[style*="blur"]').forEach(media => {
+                    media.style.filter = 'none';
+                    media.style.webkitFilter = 'none';
+                  });
+
+                  // Also check parent divs with blur
+                  document.querySelectorAll('div[style*="blur"]').forEach(div => {
+                    div.style.filter = 'none';
+                    div.style.webkitFilter = 'none';
+                  });
+                }
+
+                createObserver() {
+                  this.observer = new MutationObserver((mutations) => {
+                    mutations.forEach(mutation => {
+                      mutation.addedNodes.forEach(node => {
+                        if (node.nodeType === Node.ELEMENT_NODE) {
+                          this.processNode(node);
+                        }
+                      });
+                    });
+                  });
+
+                  this.observer.observe(document.body, {
+                    childList: true,
+                    subtree: true,
+                    attributes: false,
+                    characterData: false
+                  });
+                }
+
+                processNode(node) {
+                  // Remove restriction overlays
+                  if (node.classList && (node.classList.contains('video-preview-card-restriction') ||
+                      node.className.includes('VideoPreviewCardRestriction') ||
+                      node.className.includes('sub-only-overlay'))) {
+                    node.remove();
+                    return;
+                  }
+
+                  // Remove blur from images
+                  if (node.tagName === 'IMG' && node.style && node.style.filter && node.style.filter.includes('blur')) {
+                    node.style.filter = 'none';
+                  }
+
+                  // Process children
+                  if (node.querySelectorAll) {
+                    node.querySelectorAll('.video-preview-card-restriction, [class*="VideoPreviewCardRestriction"], [class*="sub-only-overlay"]').forEach(restriction => {
+                      restriction.remove();
+                    });
+
+                    node.querySelectorAll('img[style*="blur"]').forEach(img => {
+                      img.style.filter = 'none';
+                    });
+                  }
+                }
+              }
+
+              new RestrictionRemover();
+              const logMsg6 = '[TwitchNoSub] ✅ Initialized successfully in page context';
+              console.log(logMsg6);
+              try { window.webkit?.messageHandlers?.consoleLog?.postMessage(logMsg6); } catch(e) {}
+            })();
+          \`;
+
+          // Inject into page context by adding script tag to DOM
+          (document.head || document.documentElement).appendChild(script);
+          logToSwift('[TwitchNoSub] Script injected into page context');
+
+          // Add visual confirmation badge
+          setTimeout(() => {
+            const badge = document.createElement('div');
+            badge.style.cssText = 'position:fixed;top:10px;right:10px;background:#9147ff;color:white;padding:8px 12px;border-radius:8px;z-index:999999;font-size:12px;font-family:sans-serif;box-shadow:0 2px 8px rgba(0,0,0,0.3);';
+            badge.textContent = '✅ TwitchNoSub Active';
+            document.body.appendChild(badge);
+            setTimeout(() => badge.remove(), 5000);
+          }, 1000);
+        })();
+        """#,
         injectionTime: .atDocumentStart,
         forMainFrameOnly: true
     )

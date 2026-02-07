@@ -20,6 +20,14 @@ class StreamlinkManager: ObservableObject {
     }
 
     func getStreamURL(target: String, quality: String = "best") async throws -> URL {
+        let resolvedTarget: String = {
+            let t = target.trimmingCharacters(in: .whitespacesAndNewlines)
+            if t.hasPrefix("http://") || t.hasPrefix("https://") { return t }
+            return "https://\(t)"
+        }()
+
+        let authArgs = await streamlinkAuthArgumentsIfAvailable(for: resolvedTarget)
+
         return try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 let streamlinkExecutable: URL
@@ -33,44 +41,85 @@ class StreamlinkManager: ObservableObject {
                 let process = Process()
                 let pipe = Pipe()
                 let errorPipe = Pipe()
-                
+
                 process.executableURL = streamlinkExecutable
-                let resolvedTarget: String = {
-                    let t = target.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if t.hasPrefix("http://") || t.hasPrefix("https://") { return t }
-                    return "https://\(t)"
-                }()
+
+                // Streamlink options first, then URL + quality.
                 process.arguments = [
-                    resolvedTarget,
-                    quality,
                     "--stream-url",
                     "--twitch-disable-ads",
                     "--twitch-low-latency"
+                ] + authArgs + [
+                    resolvedTarget,
+                    quality
                 ]
-                
+
                 process.standardOutput = pipe
                 process.standardError = errorPipe
-                
+
                 do {
                     self.process = process
                     try process.run()
                     process.waitUntilExit()
-                    
+
                     let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                    let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                    
-                    if process.terminationStatus == 0, let url = URL(string: output) {
+                    let stdoutOutput = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+                    if process.terminationStatus == 0, let url = URL(string: stdoutOutput) {
                         print("[Streamlink] Got stream URL: \(url)")
                         continuation.resume(returning: url)
                     } else {
+                        // NOTE: streamlink often prints errors to STDOUT (not STDERR).
                         let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
-                        let errorOutput = String(data: errorData, encoding: .utf8) ?? "Unknown error"
-                        print("[Streamlink] Error: \(errorOutput)")
-                        continuation.resume(throwing: NSError(
-                            domain: "StreamlinkError",
-                            code: Int(process.terminationStatus),
-                            userInfo: [NSLocalizedDescriptionKey: errorOutput]
-                        ))
+                        let stderrOutput = String(data: errorData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+                        var message = stderrOutput
+                        if message.isEmpty {
+                            message = stdoutOutput
+                        }
+                        if message.isEmpty {
+                            message = "Streamlink failed (exit code \(process.terminationStatus))."
+                        }
+
+                        print("[Streamlink] Error: \(message)")
+
+                        // Try TwitchNoSub fallback for subscriber-only VODs
+                        if let vodId = self.extractVODId(from: resolvedTarget) {
+                            print("[TwitchNoSub] 🎯 Detected VOD failure, attempting fallback for VOD \(vodId)...")
+
+                            // Use a detached task to avoid continuation issues
+                            Task.detached { [weak self] in
+                                guard let self = self else {
+                                    continuation.resume(throwing: NSError(
+                                        domain: "StreamlinkError",
+                                        code: Int(process.terminationStatus),
+                                        userInfo: [NSLocalizedDescriptionKey: message]
+                                    ))
+                                    return
+                                }
+
+                                do {
+                                    let mutedURL = try await self.generateMutedVODPlaylist(vodId: vodId)
+                                    print("[TwitchNoSub] ✅ Successfully generated muted VOD URL: \(mutedURL)")
+                                    continuation.resume(returning: mutedURL)
+                                } catch {
+                                    print("[TwitchNoSub] ❌ Fallback failed: \(error.localizedDescription)")
+                                    let fallbackError = NSError(
+                                        domain: "TwitchNoSub",
+                                        code: Int(process.terminationStatus),
+                                        userInfo: [NSLocalizedDescriptionKey: "Streamlink failed and TwitchNoSub fallback also failed: \(error.localizedDescription)"]
+                                    )
+                                    continuation.resume(throwing: fallbackError)
+                                }
+                            }
+                        } else {
+                            print("[TwitchNoSub] Not a VOD URL, cannot use fallback")
+                            continuation.resume(throwing: NSError(
+                                domain: "StreamlinkError",
+                                code: Int(process.terminationStatus),
+                                userInfo: [NSLocalizedDescriptionKey: message]
+                            ))
+                        }
                     }
                 } catch {
                     print("[Streamlink] Failed to run: \(error)")
@@ -79,7 +128,150 @@ class StreamlinkManager: ObservableObject {
             }
         }
     }
-    
+
+    private func streamlinkAuthArgumentsIfAvailable(for resolvedTarget: String) async -> [String] {
+        guard let url = URL(string: resolvedTarget) else { return [] }
+        let host = (url.host ?? "").lowercased()
+        let isTwitch = host.hasSuffix("twitch.tv") || host == "clips.twitch.tv"
+        guard isTwitch else { return [] }
+
+        let cookies = await webKitCookies()
+        let authTokenCookieNames: Set<String> = ["auth-token", "auth_token", "auth-token-next", "auth_token_next"]
+        let token = cookies.first(where: {
+            authTokenCookieNames.contains($0.name.lowercased()) && $0.domain.lowercased().contains("twitch.tv")
+        })?.value
+
+        guard let token, !token.isEmpty else {
+            return []
+        }
+
+        // Twitch web uses an OAuth token (stored in cookies when logged in). Streamlink can forward this via API headers.
+        return [
+            "--twitch-api-header",
+            "Authorization=OAuth \(token)",
+        ]
+    }
+
+    private func webKitCookies() async -> [HTTPCookie] {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async {
+                WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
+                    continuation.resume(returning: cookies)
+                }
+            }
+        }
+    }
+
+    // MARK: - TwitchNoSub Fallback for Subscriber-Only VODs
+
+    private func extractVODId(from urlString: String) -> String? {
+        print("[TwitchNoSub] 🔍 Extracting VOD ID from: \(urlString)")
+        guard let url = URL(string: urlString) else {
+            print("[TwitchNoSub] ❌ Invalid URL")
+            return nil
+        }
+        let path = url.path
+        let components = path.split(separator: "/").map(String.init)
+        print("[TwitchNoSub] Path components: \(components)")
+
+        // VOD URL format: /videos/123456789
+        if components.count >= 2, components[0].lowercased() == "videos" {
+            let vodId = components[1]
+            print("[TwitchNoSub] ✅ Found VOD ID: \(vodId)")
+            return vodId
+        }
+
+        print("[TwitchNoSub] ❌ Not a VOD URL (doesn't match /videos/XXX format)")
+        return nil
+    }
+
+    private func fetchTwitchVODMetadata(vodId: String) async throws -> (domain: String, vodSpecialId: String, broadcastType: String, channelLogin: String, createdAt: Date) {
+        print("[TwitchNoSub] 📡 Fetching metadata for VOD \(vodId) from Twitch GraphQL API...")
+        let query = #"query { video(id: "\#(vodId)") { broadcastType, createdAt, seekPreviewsURL, owner { login } }}"#
+        let body = ["query": query]
+        let jsonData = try JSONSerialization.data(withJSONObject: body)
+
+        var request = URLRequest(url: URL(string: "https://gql.twitch.tv/gql")!)
+        request.httpMethod = "POST"
+        request.httpBody = jsonData
+        request.setValue("kimne78kx3ncx6brgo4mv6wki5h1ko", forHTTPHeaderField: "Client-Id")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+
+        if let httpResponse = response as? HTTPURLResponse {
+            print("[TwitchNoSub] GraphQL API response status: \(httpResponse.statusCode)")
+        }
+
+        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        print("[TwitchNoSub] GraphQL response: \(String(data: data, encoding: .utf8) ?? "unable to decode")")
+
+        guard let videoData = json?["data"] as? [String: Any],
+              let video = videoData["video"] as? [String: Any],
+              let seekPreviewsURL = video["seekPreviewsURL"] as? String,
+              let broadcastType = video["broadcastType"] as? String,
+              let createdAtString = video["createdAt"] as? String,
+              let owner = video["owner"] as? [String: Any],
+              let channelLogin = owner["login"] as? String,
+              let previewURL = URL(string: seekPreviewsURL) else {
+            throw NSError(domain: "TwitchNoSub", code: 1, userInfo: [NSLocalizedDescriptionKey: "Unable to fetch VOD metadata"])
+        }
+
+        let domain = previewURL.host ?? ""
+        let pathComponents = previewURL.pathComponents
+        guard let storyboardIndex = pathComponents.firstIndex(where: { $0.contains("storyboards") }),
+              storyboardIndex > 0 else {
+            throw NSError(domain: "TwitchNoSub", code: 2, userInfo: [NSLocalizedDescriptionKey: "Unable to parse VOD URL structure"])
+        }
+        let vodSpecialId = pathComponents[storyboardIndex - 1]
+
+        let formatter = ISO8601DateFormatter()
+        let createdAt = formatter.date(from: createdAtString) ?? Date()
+
+        return (domain, vodSpecialId, broadcastType, channelLogin, createdAt)
+    }
+
+    private func generateMutedVODPlaylist(vodId: String) async throws -> URL {
+        print("[TwitchNoSub] 🔄 Attempting fallback for subscriber-only VOD \(vodId)...")
+
+        let metadata = try await fetchTwitchVODMetadata(vodId: vodId)
+        print("[TwitchNoSub] ✅ Got VOD metadata: \(metadata.broadcastType)")
+
+        let now = Date()
+        let daysSinceCreation = now.timeIntervalSince(metadata.createdAt) / (24 * 3600)
+        let broadcastType = metadata.broadcastType.lowercased()
+
+        // Try to find the best available quality
+        let qualities = ["chunked", "1080p60", "720p60", "480p30", "360p30"]
+
+        for quality in qualities {
+            let playlistURL: String
+
+            if broadcastType == "highlight" {
+                playlistURL = "https://\(metadata.domain)/\(metadata.vodSpecialId)/\(quality)/highlight-\(vodId).m3u8"
+            } else if broadcastType == "upload" && daysSinceCreation > 7 {
+                playlistURL = "https://\(metadata.domain)/\(metadata.channelLogin)/\(vodId)/\(metadata.vodSpecialId)/\(quality)/index-dvr.m3u8"
+            } else {
+                playlistURL = "https://\(metadata.domain)/\(metadata.vodSpecialId)/\(quality)/index-dvr.m3u8"
+            }
+
+            // Test if the quality exists
+            guard let url = URL(string: playlistURL) else { continue }
+
+            do {
+                let (_, response) = try await URLSession.shared.data(from: url)
+                if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 {
+                    print("[TwitchNoSub] ✅ Found working quality: \(quality) at \(playlistURL)")
+                    return url
+                }
+            } catch {
+                continue
+            }
+        }
+
+        throw NSError(domain: "TwitchNoSub", code: 3, userInfo: [NSLocalizedDescriptionKey: "No working quality found for VOD"])
+    }
+
     func stopStream() {
         process?.terminate()
         process = nil
@@ -142,6 +334,70 @@ class StreamlinkManager: ObservableObject {
     private func streamlinkError(_ message: String) -> Error {
         NSError(domain: "StreamlinkError", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
     }
+}
+
+private struct NativeHoverPlayerView: NSViewRepresentable {
+    let url: URL
+
+    final class Coordinator {
+        let player = AVPlayer()
+        let view = AVPlayerView()
+    }
+
+    func makeCoordinator() -> Coordinator {
+        let coordinator = Coordinator()
+        coordinator.view.controlsStyle = .none
+        coordinator.view.showsFullScreenToggleButton = false
+        coordinator.view.player = coordinator.player
+        coordinator.view.videoGravity = .resizeAspectFill
+        return coordinator
+    }
+
+    func makeNSView(context: Context) -> AVPlayerView {
+        let view = context.coordinator.view
+        view.player = context.coordinator.player
+        context.coordinator.player.isMuted = true
+        context.coordinator.player.volume = 0
+        context.coordinator.player.replaceCurrentItem(with: AVPlayerItem(url: url))
+        context.coordinator.player.play()
+        return view
+    }
+
+    func updateNSView(_ nsView: AVPlayerView, context: Context) {
+        let current = (context.coordinator.player.currentItem?.asset as? AVURLAsset)?.url
+        if current != url {
+            context.coordinator.player.replaceCurrentItem(with: AVPlayerItem(url: url))
+        }
+        context.coordinator.player.isMuted = true
+        context.coordinator.player.volume = 0
+        context.coordinator.player.play()
+    }
+
+    static func dismantleNSView(_ nsView: AVPlayerView, coordinator: Coordinator) {
+        coordinator.player.pause()
+        coordinator.player.replaceCurrentItem(with: nil)
+    }
+}
+
+private func isStreamOfflineErrorMessage(_ message: String) -> Bool {
+    let s = message.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    if s.isEmpty { return false }
+
+    // Streamlink commonly returns something like:
+    // "error: No playable streams found on this URL"
+    // when a Twitch channel is offline.
+    let offlineMarkers: [String] = [
+        "no playable streams found",
+        "no streams found",
+        "the channel is offline",
+        "is offline",
+        "not live",
+        "not currently live",
+        "stream is offline",
+        "hors ligne"
+    ]
+
+    return offlineMarkers.contains(where: { s.contains($0) })
 }
 
 /// Vue player vidéo natif avec AVPlayer
@@ -435,6 +691,7 @@ struct StreamlinkPlayerView: View {
     @State private var streamURL: URL?
     @State private var isPlaying = true
     @State private var showError = false
+    @State private var isStreamOffline = false
     
     var body: some View {
         VStack(spacing: 0) {
@@ -465,10 +722,11 @@ struct StreamlinkPlayerView: View {
                         .font(.title2)
                         .fontWeight(.bold)
                         .foregroundColor(.white)
-                    Text("Cliquez pour charger le stream")
+                    Text(isStreamOffline ? "Le stream est hors ligne" : "Cliquez pour charger le stream")
                         .font(.headline)
                         .foregroundColor(.white.opacity(0.7))
-                    Button("Charger avec Streamlink") {
+
+                    Button(isStreamOffline ? "Réessayer" : "Charger avec Streamlink") {
                         Task {
                             await loadStream()
                         }
@@ -554,19 +812,33 @@ struct StreamlinkPlayerView: View {
     }
     
     private func loadStream() async {
-        streamlink.isLoading = true
-        streamURL = nil
+        await MainActor.run {
+            showError = false
+            isStreamOffline = false
+            streamlink.error = nil
+            streamlink.isLoading = true
+            streamURL = nil
+        }
+
         do {
             let url = try await streamlink.getStreamURL(for: channelName)
             await MainActor.run {
                 self.streamURL = url
                 streamlink.isLoading = false
+                isStreamOffline = false
             }
         } catch {
+            let message = error.localizedDescription
+            let offline = isStreamOfflineErrorMessage(message)
             await MainActor.run {
-                streamlink.error = error.localizedDescription
+                streamlink.error = message
                 streamlink.isLoading = false
-                showError = true
+                if offline {
+                    isStreamOffline = true
+                    showError = false
+                } else {
+                    showError = true
+                }
             }
         }
     }
@@ -578,6 +850,8 @@ struct HybridTwitchView: View {
     @ObservedObject var recordingManager: RecordingManager
     var onOpenSubscription: ((String) -> Void)?
     var onOpenGiftSub: ((String) -> Void)?
+    var onFollowChannel: ((String) -> Void)?
+    var followedChannels: [TwitchChannel] = []
     var notificationEnabled: Bool = true
     var onNotificationToggle: ((Bool) -> Void)?
     var isRecording: Bool = false
@@ -588,6 +862,8 @@ struct HybridTwitchView: View {
     @State private var streamURL: URL?
     @State private var isPlaying = true
     @State private var showError = false
+    @State private var isStreamOffline = false
+    @State private var playbackInlineError: String?
     @State private var showChat = true
     @State private var isChatDetached = false
     @State private var detachedChannelName: String?
@@ -600,6 +876,14 @@ struct HybridTwitchView: View {
     @State private var videoZoom: CGFloat = 1.0
     @State private var videoPan: CGSize = .zero
     @StateObject private var aboutStore = ChannelAboutStore()
+    @StateObject private var videosStore = ChannelVideosStore()
+
+    private enum ChannelDetailsTab: String, CaseIterable {
+        case about = "About"
+        case videos = "Videos"
+    }
+
+    @State private var detailsTab: ChannelDetailsTab = .about
 
     private enum ChatDisplayMode: String {
         case inline
@@ -645,8 +929,23 @@ struct HybridTwitchView: View {
                                         Image(systemName: "play.circle")
                                             .font(.system(size: 48, weight: .thin))
                                             .foregroundColor(.white.opacity(0.3))
+
+                                        if isStreamOffline {
+                                            Text("Stream is offline")
+                                                .font(.system(size: 12, weight: .medium))
+                                                .foregroundColor(.white.opacity(0.5))
+                                        } else if let inline = playbackInlineError, !inline.isEmpty {
+                                            Text(inline)
+                                                .font(.system(size: 12, weight: .medium))
+                                                .foregroundColor(.white.opacity(0.55))
+                                                .multilineTextAlignment(.center)
+                                                .fixedSize(horizontal: false, vertical: true)
+                                                .padding(.horizontal, 18)
+                                        }
+
                                         Button(action: { Task { await loadStream() } }) {
-                                            Text("Load Stream")
+                                            let base = (playback.kind == .liveChannel) ? "Stream" : "Video"
+                                            Text((isStreamOffline || playbackInlineError != nil) ? "Retry" : "Load \(base)")
                                                 .font(.system(size: 12, weight: .medium))
                                                 .foregroundStyle(.white)
                                                 .padding(.horizontal, 16)
@@ -797,13 +1096,79 @@ struct HybridTwitchView: View {
                         )
 
                     if let channel = playback.channelName {
-                        ChannelAboutPanelView(
-                            channelName: channel,
-                            store: aboutStore,
-                            onOpenSubscription: { onOpenSubscription?(channel) },
-                            onOpenGiftSub: { onOpenGiftSub?(channel) }
+                        VStack(spacing: 0) {
+                            HStack(spacing: 12) {
+                                TwitchUnderlineTabs(tabs: ChannelDetailsTab.allCases, selection: $detailsTab) { $0.rawValue }
+                                    .frame(width: 220, alignment: .leading)
+
+                                Spacer()
+
+                                if detailsTab == .videos {
+                                    Button(action: { videosStore.reload() }) {
+                                        Image(systemName: "arrow.clockwise")
+                                            .font(.system(size: 12, weight: .semibold))
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .controlSize(.small)
+                                    .help("Reload videos")
+                                }
+                                if let onFollowChannel {
+                                    let isFollowing = followedChannels.contains { $0.login.lowercased() == channel.lowercased() }
+                                    Button(isFollowing ? "Following" : "Follow") { onFollowChannel(channel) }
+                                        .buttonStyle(.bordered)
+                                        .controlSize(.small)
+                                        .tint(isFollowing ? .purple : nil)
+                                }
+
+                                if let onOpenSubscription {
+                                    Button("Subscribe") { onOpenSubscription(channel) }
+                                        .buttonStyle(.bordered)
+                                        .controlSize(.small)
+                                }
+
+                                if let onOpenGiftSub {
+                                    Button("Gift Sub") { onOpenGiftSub(channel) }
+                                        .buttonStyle(.bordered)
+                                        .controlSize(.small)
+                                }
+                            }
+                            .padding(.horizontal, 16)
+                            .padding(.top, 12)
+                            .padding(.bottom, 10)
+
+                            Rectangle()
+                                .fill(Color.white.opacity(0.06))
+                                .frame(height: 1)
+
+                            Group {
+                                switch detailsTab {
+                                case .about:
+                                    ChannelAboutPanelView(
+                                        channelName: channel,
+                                        store: aboutStore
+                                    )
+                                case .videos:
+                                    ChannelVideosPanelView(
+                                        channelName: channel,
+                                        store: videosStore,
+                                        onSelectPlayback: { request in
+                                            playback = request
+                                        }
+                                    )
+                                }
+                            }
+                            .padding(16)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                        }
+                        .background(
+                            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                                .fill(Color.white.opacity(0.04))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                                        .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                                )
                         )
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                         .layoutPriority(0)
                     }
                 }
@@ -849,6 +1214,7 @@ struct HybridTwitchView: View {
             // Si on change de chaîne, reset les onglets du bas.
             if newValue.channelName != lastChannelName {
                 lastChannelName = newValue.channelName
+                detailsTab = .about
                 if newValue.kind == .liveChannel, let channel = newValue.channelName {
                     applyChatPreference(for: channel)
                     aboutStore.load(channelName: channel)
@@ -906,17 +1272,56 @@ struct HybridTwitchView: View {
     }
     
     private func loadStream() async {
-        streamlink.isLoading = true
+        await MainActor.run {
+            showError = false
+            isStreamOffline = false
+            playbackInlineError = nil
+            streamlink.error = nil
+            streamlink.isLoading = true
+            streamURL = nil
+        }
+
         do {
             let url = try await streamlink.getStreamURL(target: playback.streamlinkTarget)
             await MainActor.run {
                 self.streamURL = url
                 streamlink.isLoading = false
+                isStreamOffline = false
+                playbackInlineError = nil
             }
         } catch {
+            let message = error.localizedDescription
+            let noPlayable = isStreamOfflineErrorMessage(message)
+            let offline = (playback.kind == .liveChannel) && noPlayable
+
             await MainActor.run {
-                streamlink.error = error.localizedDescription
+                streamlink.error = message
                 streamlink.isLoading = false
+
+                if offline {
+                    isStreamOffline = true
+                    playbackInlineError = nil
+                    showError = false
+                    return
+                }
+
+                // For VODs/clips, Streamlink often reports "No playable streams" when the manifest is restricted.
+                if noPlayable {
+                    isStreamOffline = false
+                    switch playback.kind {
+                    case .vod:
+                        playbackInlineError = "This video is restricted (sub-only / login required) or unavailable."
+                    case .clip:
+                        playbackInlineError = "This clip is restricted (login required) or unavailable."
+                    case .liveChannel:
+                        playbackInlineError = message
+                    }
+                    showError = false
+                    return
+                }
+
+                // Unexpected error: show modal.
+                playbackInlineError = message
                 showError = true
             }
         }
@@ -1088,15 +1493,32 @@ struct TwitchChatView: NSViewRepresentable {
 }
 
 struct ChannelAboutPanel: Identifiable, Hashable {
-    let id = UUID()
+    let id: String
     let title: String
     let body: String
     let imageURL: URL?
     let links: [ChannelAboutLink]
+
+    init(title: String, body: String, imageURL: URL?, links: [ChannelAboutLink]) {
+        self.title = title
+        self.body = body
+        self.imageURL = imageURL
+        self.links = links
+        self.id = ChannelAboutPanel.makeStableID(title: title, body: body, imageURL: imageURL, links: links)
+    }
+
+    private static func makeStableID(title: String, body: String, imageURL: URL?, links: [ChannelAboutLink]) -> String {
+        let normalizedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let normalizedBody = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        let image = imageURL?.absoluteString ?? ""
+        let bodyHash = String(normalizedBody.hashValue)
+        let linkIDs = links.map { $0.id }.joined(separator: ",")
+        return [normalizedTitle, image, bodyHash, linkIDs].joined(separator: "|")
+    }
 }
 
 struct ChannelAboutLink: Identifiable, Hashable {
-    let id = UUID()
+    var id: String { url.absoluteString }
     let title: String
     let url: URL
     let imageURL: URL?
@@ -1109,6 +1531,7 @@ final class ChannelAboutStore: NSObject, ObservableObject, WKNavigationDelegate,
 
     private var webView: WKWebView?
     private var currentChannel: String?
+    private var loadingDeadlineWorkItem: DispatchWorkItem?
 
     override init() {
         super.init()
@@ -1127,12 +1550,33 @@ final class ChannelAboutStore: NSObject, ObservableObject, WKNavigationDelegate,
         guard !normalized.isEmpty else { return }
         guard normalized != currentChannel else { return }
         currentChannel = normalized
+
+        loadingDeadlineWorkItem?.cancel()
         isLoading = true
         lastError = nil
         panels = []
+
+        scheduleLoadingDeadline(for: normalized)
+
         let url = URL(string: "https://www.twitch.tv/\(normalized)/about")!
         webView?.load(URLRequest(url: url))
     }
+
+    private func scheduleLoadingDeadline(for channel: String) {
+        loadingDeadlineWorkItem?.cancel()
+
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            guard self.currentChannel == channel else { return }
+            if self.isLoading && self.panels.isEmpty {
+                self.isLoading = false
+            }
+        }
+
+        loadingDeadlineWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6.0, execute: work)
+    }
+
 
     private func makeWebView() -> WKWebView {
         let config = WKWebViewConfiguration()
@@ -1156,13 +1600,13 @@ final class ChannelAboutStore: NSObject, ObservableObject, WKNavigationDelegate,
     }
 
     private static let scrapePanelsScript = WKUserScript(
-        source: """
+        source: #"""
         (function() {
           if (window.__glitcho_about_scrape) { return; }
           window.__glitcho_about_scrape = true;
 
           function trim(s) {
-            return (s || '').replace(/\\s+/g, ' ').trim();
+            return (s || '').replace(/\s+/g, ' ').trim();
           }
 
           function findContainer() {
@@ -1220,24 +1664,41 @@ final class ChannelAboutStore: NSObject, ObservableObject, WKNavigationDelegate,
             return panels;
           }
 
-          function postPanels() {
+          let lastSent = null;
+          let pending = false;
+
+          function postPanelsIfChanged() {
             const panels = extractPanels();
+            let serialized = null;
+            try { serialized = JSON.stringify(panels); } catch (_) { serialized = null; }
+            if (serialized === lastSent) { return; }
+            lastSent = serialized;
             try {
               window.webkit.messageHandlers.aboutPanels.postMessage({ panels: panels });
             } catch (_) {}
           }
 
-          postPanels();
-          const observer = new MutationObserver(postPanels);
+          function schedulePost() {
+            if (pending) { return; }
+            pending = true;
+            setTimeout(function() {
+              pending = false;
+              postPanelsIfChanged();
+            }, 350);
+          }
+
+          postPanelsIfChanged();
+          const observer = new MutationObserver(schedulePost);
           observer.observe(document.documentElement, { childList: true, subtree: true });
-          setTimeout(postPanels, 1000);
-          setTimeout(postPanels, 2000);
-          setTimeout(postPanels, 4000);
+          setTimeout(postPanelsIfChanged, 1000);
+          setTimeout(postPanelsIfChanged, 2000);
+          setTimeout(postPanelsIfChanged, 4000);
         })();
-        """,
+        """#,
         injectionTime: .atDocumentEnd,
         forMainFrameOnly: true
     )
+
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         webView.evaluateJavaScript("window.__glitcho_about_scrape && true;", completionHandler: nil)
@@ -1266,7 +1727,21 @@ final class ChannelAboutStore: NSObject, ObservableObject, WKNavigationDelegate,
         }
 
         DispatchQueue.main.async {
-            self.panels = panels
+            // Avoid flicker: Twitch mutates the DOM frequently and we can temporarily scrape 0 panels.
+            if panels.isEmpty {
+                if !self.panels.isEmpty {
+                    return
+                }
+                // Keep the loading state until the timeout fires.
+                return
+            }
+
+            self.loadingDeadlineWorkItem?.cancel()
+            self.loadingDeadlineWorkItem = nil
+
+            if self.panels != panels {
+                self.panels = panels
+            }
             self.isLoading = false
         }
     }
@@ -1278,21 +1753,20 @@ struct ChannelAboutScraperView: NSViewRepresentable {
     func makeNSView(context: Context) -> WKWebView {
         let view = store.attachWebView()
         view.isHidden = false
-        view.alphaValue = 0.0
+        // Keep a tiny non-zero alpha so WebKit doesn’t treat it as fully invisible/offscreen.
+        view.alphaValue = 0.01
         return view
     }
 
     func updateNSView(_ nsView: WKWebView, context: Context) {
         nsView.isHidden = false
-        nsView.alphaValue = 0.0
+        nsView.alphaValue = 0.01
     }
 }
 
 struct ChannelAboutPanelView: View {
     let channelName: String
     @ObservedObject var store: ChannelAboutStore
-    let onOpenSubscription: () -> Void
-    let onOpenGiftSub: () -> Void
 
     private let gridColumns = [
         GridItem(.adaptive(minimum: 240, maximum: 360), spacing: 16, alignment: .top)
@@ -1301,19 +1775,6 @@ struct ChannelAboutPanelView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                HStack {
-                    Text("About \(channelName)")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundColor(.white.opacity(0.9))
-                    Spacer()
-                    Button("Subscribe", action: onOpenSubscription)
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                    Button("Gift Sub", action: onOpenGiftSub)
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                }
-
                 if store.isLoading && store.panels.isEmpty {
                     HStack(spacing: 8) {
                         ProgressView()
@@ -1387,26 +1848,1457 @@ struct ChannelAboutPanelView: View {
                     }
                 }
             }
-            .padding(16)
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
-        .background(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .fill(Color.white.opacity(0.04))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .stroke(Color.white.opacity(0.08), lineWidth: 1)
-                )
-        )
         .overlay(
             ChannelAboutScraperView(store: store)
-                .frame(width: 0, height: 0)
+                .frame(width: 800, height: 600)
+                .allowsHitTesting(false)
+                .opacity(0.001)
         )
         .onAppear {
             store.load(channelName: channelName)
         }
         .onChange(of: channelName) { newValue in
             store.load(channelName: newValue)
+        }
+    }
+}
+
+struct ChannelVideoItem: Identifiable, Hashable {
+    let id: String
+    let title: String
+    let url: URL
+    let thumbnailURL: URL?
+    let subtitle: String?
+    let duration: String?
+    let kind: NativePlaybackRequest.Kind
+}
+
+final class ChannelVideosStore: NSObject, ObservableObject, WKNavigationDelegate, WKScriptMessageHandler {
+    enum Section: String, CaseIterable {
+        case videos = "Videos"
+        case clips = "Clips"
+    }
+    private struct GQLConfig {
+        static let endpoint = URL(string: "https://gql.twitch.tv/gql")!
+        static let clientID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
+    }
+
+    @Published var isLoading = false
+    @Published var lastError: String?
+    @Published var vods: [ChannelVideoItem] = []
+    @Published var clips: [ChannelVideoItem] = []
+    @Published var section: Section = .videos
+
+    private var webView: WKWebView?
+    private var currentChannel: String?
+    private var loadingDeadlineWorkItem: DispatchWorkItem?
+    private var gqlFallbackAttempts: Set<String> = []
+
+    override init() {
+        super.init()
+        webView = makeWebView()
+    }
+
+    func attachWebView() -> WKWebView {
+        if let webView { return webView }
+        let view = makeWebView()
+        webView = view
+        return view
+    }
+
+    func load(channelName: String, section: Section) {
+        let normalized = channelName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return }
+
+        let didChangeChannel = (normalized != currentChannel)
+        currentChannel = normalized
+        self.section = section
+
+        lastError = nil
+        loadingDeadlineWorkItem?.cancel()
+        isLoading = true
+
+        if didChangeChannel {
+            vods = []
+            clips = []
+            gqlFallbackAttempts.removeAll()
+        }
+
+        scheduleLoadingDeadline(for: normalized, section: section)
+        scheduleGQLFallback(for: normalized, section: section)
+
+        let url: URL = {
+            switch section {
+            case .videos:
+                return URL(string: "https://www.twitch.tv/\(normalized)/videos")!
+            case .clips:
+                return URL(string: "https://www.twitch.tv/\(normalized)/clips")!
+            }
+        }()
+
+        let current = webView?.url?.absoluteString ?? ""
+        let expects = section == .videos ? "/videos" : "/clips"
+        if current.contains("/\(normalized)/") && current.contains(expects) {
+            webView?.evaluateJavaScript("window.__glitcho_scrapeChannelVideos && window.__glitcho_scrapeChannelVideos();", completionHandler: nil)
+        } else {
+            webView?.load(URLRequest(url: url))
+        }
+    }
+
+    private func scheduleLoadingDeadline(for channel: String, section: Section) {
+        loadingDeadlineWorkItem?.cancel()
+
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            guard self.currentChannel == channel else { return }
+            guard self.section == section else { return }
+            if self.isLoading {
+                self.isLoading = false
+            }
+        }
+
+        loadingDeadlineWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6.0, execute: work)
+    }
+
+    private func scheduleGQLFallback(for channel: String, section: Section) {
+        let key = "\(channel.lowercased())|\(section.rawValue)"
+        guard !gqlFallbackAttempts.contains(key) else { return }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.2) { [weak self] in
+            guard let self else { return }
+            guard self.currentChannel == channel else { return }
+            guard self.section == section else { return }
+
+            let itemsEmpty = (section == .videos) ? self.vods.isEmpty : self.clips.isEmpty
+            if itemsEmpty {
+                self.gqlFallbackAttempts.insert(key)
+                print("[ChannelVideosStore] GQL fallback for \(channel) \(section.rawValue)")
+                Task { await self.fetchGQLFallback(channel: channel, section: section) }
+            }
+        }
+    }
+
+    private func fetchGQLFallback(channel: String, section: Section) async {
+        let token = await twitchAuthToken()
+        do {
+            let items: [ChannelVideoItem]
+            switch section {
+            case .videos:
+                items = try await fetchGQLVideos(channel: channel, token: token)
+            case .clips:
+                items = try await fetchGQLClips(channel: channel, token: token)
+            }
+
+            guard !items.isEmpty else { return }
+
+            DispatchQueue.main.async {
+                guard self.currentChannel == channel else { return }
+                guard self.section == section else { return }
+                switch section {
+                case .videos:
+                    if self.vods.isEmpty {
+                        self.vods = items
+                    }
+                case .clips:
+                    if self.clips.isEmpty {
+                        self.clips = items
+                    }
+                }
+                self.isLoading = false
+            }
+        } catch {
+            DispatchQueue.main.async {
+                if self.lastError == nil || self.lastError?.isEmpty == true {
+                    self.lastError = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    private func fetchGQLVideos(channel: String, token: String?) async throws -> [ChannelVideoItem] {
+        let query = """
+        query($login: String!, $first: Int!) {
+          user(login: $login) {
+            videos(first: $first) {
+              edges {
+                node {
+                  id
+                  title
+                  lengthSeconds
+                  previewThumbnailURL(width: 320, height: 180)
+                  game { displayName name }
+                }
+              }
+            }
+          }
+        }
+        """
+
+        let variables: [String: Any] = ["login": channel, "first": 40]
+        let json = try await performGQLRequest(query: query, variables: variables, token: token)
+        return parseGQLVideos(json: json)
+    }
+
+    private func fetchGQLClips(channel: String, token: String?) async throws -> [ChannelVideoItem] {
+        let query = """
+        query($login: String!, $first: Int!, $criteria: UserClipsInput) {
+          user(login: $login) {
+            clips(first: $first, criteria: $criteria) {
+              edges {
+                node {
+                  id
+                  slug
+                  title
+                  durationSeconds
+                  thumbnailURL(width: 320, height: 180)
+                  game { displayName name }
+                }
+              }
+            }
+          }
+        }
+        """
+
+        let criteria: [String: Any] = [
+            "period": "ALL_TIME",
+            "sort": "VIEWS_DESC"
+        ]
+        let variables: [String: Any] = [
+            "login": channel,
+            "first": 40,
+            "criteria": criteria
+        ]
+        let json = try await performGQLRequest(query: query, variables: variables, token: token)
+        return parseGQLClips(json: json)
+    }
+
+    private func performGQLRequest(query: String, variables: [String: Any], token: String?) async throws -> [String: Any] {
+        var request = URLRequest(url: GQLConfig.endpoint)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(GQLConfig.clientID, forHTTPHeaderField: "Client-Id")
+        if let token, !token.isEmpty {
+            request.setValue("OAuth \(token)", forHTTPHeaderField: "Authorization")
+        }
+        let payload: [String: Any] = [
+            "query": query,
+            "variables": variables
+        ]
+        request.httpBody = try JSONSerialization.data(withJSONObject: payload, options: [])
+
+        let (data, _) = try await URLSession.shared.data(for: request)
+        let obj = try JSONSerialization.jsonObject(with: data, options: [])
+        return obj as? [String: Any] ?? [:]
+    }
+
+    private func parseGQLVideos(json: [String: Any]) -> [ChannelVideoItem] {
+        guard let data = json["data"] as? [String: Any],
+              let user = data["user"] as? [String: Any],
+              let videos = user["videos"] as? [String: Any],
+              let edges = videos["edges"] as? [[String: Any]] else {
+            return []
+        }
+
+        return edges.compactMap { edge in
+            guard let node = edge["node"] as? [String: Any] else { return nil }
+            let id = String(describing: node["id"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !id.isEmpty else { return nil }
+
+            let title = (node["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let length = node["lengthSeconds"] as? Int
+            let thumb = node["previewThumbnailURL"] as? String
+
+            var subtitle: String?
+            if let game = node["game"] as? [String: Any] {
+                subtitle = (game["displayName"] as? String) ?? (game["name"] as? String)
+            }
+
+            let url = URL(string: "https://www.twitch.tv/videos/\(id)")!
+            return ChannelVideoItem(
+                id: id,
+                title: title?.isEmpty == false ? title! : "Video \(id)",
+                url: url,
+                thumbnailURL: thumb.flatMap { URL(string: $0) },
+                subtitle: subtitle,
+                duration: formatDuration(length),
+                kind: .vod
+            )
+        }
+    }
+
+    private func parseGQLClips(json: [String: Any]) -> [ChannelVideoItem] {
+        guard let data = json["data"] as? [String: Any],
+              let user = data["user"] as? [String: Any],
+              let clips = user["clips"] as? [String: Any],
+              let edges = clips["edges"] as? [[String: Any]] else {
+            return []
+        }
+
+        return edges.compactMap { edge in
+            guard let node = edge["node"] as? [String: Any] else { return nil }
+            let slug = (node["slug"] as? String) ?? (node["id"] as? String) ?? ""
+            let id = slug.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !id.isEmpty else { return nil }
+
+            let title = (node["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let length = node["durationSeconds"] as? Int
+            let thumb = node["thumbnailURL"] as? String
+
+            var subtitle: String?
+            if let game = node["game"] as? [String: Any] {
+                subtitle = (game["displayName"] as? String) ?? (game["name"] as? String)
+            }
+
+            let url = URL(string: "https://clips.twitch.tv/\(id)")!
+            return ChannelVideoItem(
+                id: id,
+                title: title?.isEmpty == false ? title! : "Clip \(id)",
+                url: url,
+                thumbnailURL: thumb.flatMap { URL(string: $0) },
+                subtitle: subtitle,
+                duration: formatDuration(length),
+                kind: .clip
+            )
+        }
+    }
+
+    private func formatDuration(_ seconds: Int?) -> String? {
+        guard let seconds else { return nil }
+        let s = max(0, seconds)
+        let h = s / 3600
+        let m = (s % 3600) / 60
+        let sec = s % 60
+        if h > 0 {
+            return String(format: "%d:%02d:%02d", h, m, sec)
+        }
+        return String(format: "%d:%02d", m, sec)
+    }
+
+    private func twitchAuthToken() async -> String? {
+        let cookies = await webKitCookies()
+        let names: Set<String> = ["auth-token", "auth_token", "auth-token-next", "auth_token_next"]
+        return cookies.first(where: {
+            names.contains($0.name.lowercased()) && $0.domain.lowercased().contains("twitch.tv")
+        })?.value
+    }
+
+    private func webKitCookies() async -> [HTTPCookie] {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async {
+                WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
+                    continuation.resume(returning: cookies)
+                }
+            }
+        }
+    }
+
+    func reload() {
+        webView?.reload()
+    }
+
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        DispatchQueue.main.async {
+            self.isLoading = true
+            if let channel = self.currentChannel {
+                self.scheduleLoadingDeadline(for: channel, section: self.section)
+            }
+        }
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        webView.evaluateJavaScript("window.__glitcho_scrapeChannelVideos && window.__glitcho_scrapeChannelVideos();", completionHandler: nil)
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        DispatchQueue.main.async {
+            self.loadingDeadlineWorkItem?.cancel()
+            self.loadingDeadlineWorkItem = nil
+            self.lastError = error.localizedDescription
+            self.isLoading = false
+        }
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        DispatchQueue.main.async {
+            self.loadingDeadlineWorkItem?.cancel()
+            self.loadingDeadlineWorkItem = nil
+            self.lastError = error.localizedDescription
+            self.isLoading = false
+        }
+    }
+
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard message.name == "channelVideos" else { return }
+        guard let dict = message.body as? [String: Any] else { return }
+        guard let sectionString = (dict["section"] as? String)?.lowercased() else { return }
+        guard let items = dict["items"] as? [[String: Any]] else { return }
+
+        let section: Section = (sectionString == "clips") ? .clips : .videos
+
+        let parsed = items.compactMap { item -> ChannelVideoItem? in
+            guard let id = item["id"] as? String, !id.isEmpty else { return nil }
+            guard let urlString = item["url"] as? String, let url = URL(string: urlString) else { return nil }
+            let title = (item["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? urlString
+
+            let thumbString = (item["thumbnailURL"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let thumb = thumbString.isEmpty ? nil : URL(string: thumbString)
+
+            let subtitle = (item["subtitle"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let duration = (item["duration"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            let kindRaw = (item["kind"] as? String)?.lowercased() ?? ""
+            let kind: NativePlaybackRequest.Kind = (kindRaw == "clip") ? .clip : .vod
+
+            return ChannelVideoItem(
+                id: id,
+                title: title,
+                url: url,
+                thumbnailURL: thumb,
+                subtitle: subtitle,
+                duration: duration,
+                kind: kind
+            )
+        }
+
+        DispatchQueue.main.async {
+            if parsed.isEmpty {
+                // Avoid flicker (Twitch mutates DOM a lot).
+                let existing = (section == .clips) ? self.clips : self.vods
+                if !existing.isEmpty {
+                    return
+                }
+                // Keep loading state until the timeout fires.
+                return
+            }
+
+            self.loadingDeadlineWorkItem?.cancel()
+            self.loadingDeadlineWorkItem = nil
+
+            switch section {
+            case .videos:
+                if self.vods != parsed {
+                    self.vods = parsed
+                }
+            case .clips:
+                if self.clips != parsed {
+                    self.clips = parsed
+                }
+            }
+
+            self.isLoading = false
+        }
+    }
+
+    private func makeWebView() -> WKWebView {
+        let config = WKWebViewConfiguration()
+        let contentController = WKUserContentController()
+        config.userContentController = contentController
+        config.websiteDataStore = .default()
+        config.defaultWebpagePreferences.allowsContentJavaScript = true
+        config.mediaTypesRequiringUserActionForPlayback = [.audio, .video]
+
+        contentController.add(self, name: "channelVideos")
+        contentController.addUserScript(Self.blockMediaScript)
+        contentController.addUserScript(Self.scrapeVideosScript)
+
+        let webView = WKWebView(frame: .zero, configuration: config)
+        webView.navigationDelegate = self
+        webView.setValue(false, forKey: "drawsBackground")
+        if #available(macOS 12.0, *) {
+            webView.underPageBackgroundColor = .clear
+        }
+        webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15"
+        return webView
+    }
+
+    private static let scrapeVideosScript = WKUserScript(
+        source: #"""
+        (function() {
+          if (window.__glitcho_channel_videos_scrape) { return; }
+          window.__glitcho_channel_videos_scrape = true;
+
+          function trim(s) {
+            return (s || '').replace(/\s+/g, ' ').trim();
+          }
+
+          function absURL(href) {
+            try {
+              if (!href) return '';
+              if (href.startsWith('http://') || href.startsWith('https://')) return href;
+              return (new URL(href, window.location.origin)).toString();
+            } catch (_) {
+              return '';
+            }
+          }
+
+          function currentSection() {
+            try {
+              const p = (window.location.pathname || '').toLowerCase();
+              if (p.includes('/clips')) return 'clips';
+              return 'videos';
+            } catch (_) {
+              return 'videos';
+            }
+          }
+
+          function currentChannelLogin() {
+            try {
+              const parts = (window.location.pathname || '').split('/').filter(Boolean);
+              if (!parts.length) return '';
+              const first = (parts[0] || '').toLowerCase();
+              if (first === 'videos' || first === 'clip') return '';
+              return first;
+            } catch (_) {
+              return '';
+            }
+          }
+
+          function normalizeText(s) {
+            try {
+              return (s || '')
+                .toString()
+                .toLowerCase()
+                .normalize('NFD')
+                .replace(/[\\u0300-\\u036f]/g, '')
+                .trim();
+            } catch (_) {
+              return (s || '').toString().toLowerCase().trim();
+            }
+          }
+
+          function clickIfMatch(el, needles) {
+            if (!el) return false;
+            const text = normalizeText(el.textContent || el.getAttribute('aria-label') || el.getAttribute('title') || '');
+            if (!text) return false;
+            for (const n of needles) {
+              if (text.includes(n)) {
+                try { el.click(); return true; } catch (_) { return false; }
+              }
+            }
+            return false;
+          }
+
+          function ensureFilters(section) {
+            try {
+              const key = '__glitcho_filters_' + section;
+              const attemptsKey = key + '_attempts';
+              const attempts = window[attemptsKey] || 0;
+              if (attempts >= 3) return false;
+
+              const buttons = Array.from(document.querySelectorAll('button,[role="button"],a'));
+              if (!buttons.length) return false;
+
+              if (section === 'clips') {
+                const needles = ['all time', 'all-time', 'tout le temps'];
+                for (const el of buttons) {
+                  if (clickIfMatch(el, needles)) {
+                    window[attemptsKey] = attempts + 1;
+                    return true;
+                  }
+                }
+              } else {
+                const needles = ['all videos', 'past broadcasts', 'archives', 'highlights', 'uploads'];
+                for (const el of buttons) {
+                  if (clickIfMatch(el, needles)) {
+                    window[attemptsKey] = attempts + 1;
+                    return true;
+                  }
+                }
+              }
+            } catch (_) {}
+            return false;
+          }
+
+          function nudgeScroll() {
+            try {
+              const key = '__glitcho_scroll_nudge';
+              const attempts = window[key] || 0;
+              if (attempts >= 4) return;
+              window[key] = attempts + 1;
+
+              const scroller = document.scrollingElement || document.documentElement || document.body;
+              if (!scroller) return;
+              const max = scroller.scrollHeight || 0;
+              const target = Math.min(900, max);
+              scroller.scrollTop = target;
+              setTimeout(function() {
+                scroller.scrollTop = 0;
+              }, 220);
+            } catch (_) {}
+          }
+
+          function dismissGates() {
+            try {
+              const buttons = Array.from(document.querySelectorAll('button,[role="button"],a'));
+              const acceptWords = [
+                'accept', 'accept all', 'agree', 'i agree', 'got it', 'ok', 'okay',
+                'accepter', 'tout accepter', 'j accepte', "j'accepte", "d'accord", 'ok',
+              ];
+              const matureWords = [
+                'start watching', 'i understand', 'i understand and wish to proceed', 'watch anyway', 'continue',
+                'commencer a regarder', 'commencer a visionner', 'je comprends', 'je comprends et je souhaite continuer',
+                'continuer', 'regarder quand meme'
+              ];
+
+              for (const el of buttons) {
+                if (clickIfMatch(el, acceptWords)) return true;
+              }
+              for (const el of buttons) {
+                if (clickIfMatch(el, matureWords)) return true;
+              }
+            } catch (_) {}
+            return false;
+          }
+
+          function safeText(el) {
+            try { return trim(el && el.textContent ? el.textContent : ''); } catch (_) { return ''; }
+          }
+
+          function resolveRef(state, ref) {
+            if (!state || !ref) return null;
+            if (typeof ref === 'string') return state[ref] || null;
+            return ref;
+          }
+          function getApolloState() {
+            try {
+              if (window.__APOLLO_STATE__ && Object.keys(window.__APOLLO_STATE__).length) {
+                return window.__APOLLO_STATE__;
+              }
+            } catch (_) {}
+            try {
+              if (window.__INITIAL_STATE__ && window.__INITIAL_STATE__.apolloState) {
+                return window.__INITIAL_STATE__.apolloState;
+              }
+            } catch (_) {}
+            try {
+              if (window.__APOLLO_CLIENT__ && window.__APOLLO_CLIENT__.cache && typeof window.__APOLLO_CLIENT__.cache.extract === 'function') {
+                const extracted = window.__APOLLO_CLIENT__.cache.extract();
+                if (extracted && Object.keys(extracted).length) {
+                  return extracted;
+                }
+              }
+            } catch (_) {}
+            return null;
+          }
+
+          function formatDuration(totalSeconds) {
+            try {
+              const s = Math.max(0, Math.floor(Number(totalSeconds) || 0));
+              const h = Math.floor(s / 3600);
+              const m = Math.floor((s % 3600) / 60);
+              const sec = s % 60;
+              if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
+              return `${m}:${String(sec).padStart(2, '0')}`;
+            } catch (_) {
+              return '';
+            }
+          }
+
+          function bestImageURL(img) {
+            try {
+              if (!img) return '';
+              const u = (img.currentSrc || img.src || img.getAttribute('src') || '').trim();
+              if (!u) return '';
+              if (u.startsWith('data:')) return '';
+              return u;
+            } catch (_) {
+              return '';
+            }
+          }
+
+          function videoIDFromHref(href) {
+            try {
+              const u = href.startsWith('http') ? new URL(href) : new URL(href, window.location.origin);
+              const m = (u.pathname || '').match(/\/videos\/(\d+)/);
+              return m ? m[1] : '';
+            } catch (_) {
+              const m = (href || '').match(/\/videos\/(\d+)/);
+              return m ? m[1] : '';
+            }
+          }
+
+          function canonicalVideoURL(id) {
+            return 'https://www.twitch.tv/videos/' + id;
+          }
+
+          function clipSlugFromHref(href) {
+            try {
+              const u = href.startsWith('http') ? new URL(href) : new URL(href, window.location.origin);
+              const host = (u.host || '').toLowerCase();
+              if (host === 'clips.twitch.tv') {
+                const parts = (u.pathname || '').split('/').filter(Boolean);
+                return parts[0] || '';
+              }
+              const parts = (u.pathname || '').split('/').filter(Boolean);
+              const idx = parts.findIndex(p => (p || '').toLowerCase() === 'clip');
+              if (idx >= 0 && parts[idx + 1]) return parts[idx + 1];
+            } catch (_) {}
+            const m = (href || '').match(/\/clip\/([^/?#]+)/i);
+            return m ? m[1] : '';
+          }
+
+          function canonicalClipURL(slug) {
+            return 'https://clips.twitch.tv/' + slug;
+          }
+
+          function pickTitle(anchor, card, img, fallback) {
+            const candidates = [];
+            try { candidates.push(trim(anchor.getAttribute('title') || '')); } catch (_) {}
+            try { candidates.push(trim(anchor.getAttribute('aria-label') || '')); } catch (_) {}
+            try { candidates.push(trim(safeText(anchor))); } catch (_) {}
+            try { candidates.push(trim(img ? (img.getAttribute('alt') || '') : '')); } catch (_) {}
+
+            try {
+              const titleEl = card && (card.querySelector('[data-a-target*="title"]') || card.querySelector('h3,h2,[role="heading"]'));
+              if (titleEl) { candidates.push(safeText(titleEl)); }
+            } catch (_) {}
+
+            try {
+              const ps = card ? Array.from(card.querySelectorAll('p')).slice(0, 4) : [];
+              for (const p of ps) { candidates.push(safeText(p)); }
+            } catch (_) {}
+
+            for (const c of candidates) {
+              const t = trim(c);
+              if (!t) continue;
+              if (t.length < 3) continue;
+              const lower = t.toLowerCase();
+              if (lower === 'stream') continue;
+              if (t.length > 140) return t.slice(0, 140);
+              return t;
+            }
+            return fallback;
+          }
+
+          function findDurationIn(card) {
+            if (!card) { return ''; }
+            try {
+              const nodes = Array.from(card.querySelectorAll('span,div')).slice(0, 120);
+              for (const el of nodes) {
+                const t = safeText(el);
+                if (!t) continue;
+                if (/^\d+:\d{2}(:\d{2})?$/.test(t)) {
+                  return t;
+                }
+              }
+            } catch (_) {}
+            return '';
+          }
+
+          function findSubtitleIn(card, title, duration) {
+            if (!card) { return ''; }
+            try {
+              const nodes = Array.from(card.querySelectorAll('p,span')).slice(0, 120);
+              const candidates = [];
+              for (const el of nodes) {
+                const t = safeText(el);
+                if (!t) continue;
+                if (t === title) continue;
+                if (duration && t === duration) continue;
+                if (t.length < 3) continue;
+                const lower = t.toLowerCase();
+                if (lower === 'stream') continue;
+                candidates.push(t);
+              }
+              return candidates.slice(0, 2).join(' • ');
+            } catch (_) {}
+            return '';
+          }
+
+          function extractVods() {
+            const items = [];
+            const seen = {};
+            function extractFromApollo() {
+              try {
+                const state = getApolloState();
+                if (!state) return false;
+                const login = currentChannelLogin();
+                const videoKeys = Object.keys(state).filter(k => {
+                  const n = state[k];
+                  return n && n.__typename === 'Video';
+                });
+                if (!videoKeys.length) return false;
+
+                for (const key of videoKeys) {
+                  const node = state[key];
+                  if (!node || node.__typename !== 'Video') continue;
+                  const owner = resolveRef(state, node.owner);
+                  const ownerLogin = (owner && (owner.login || owner.displayName) || '').toString().toLowerCase();
+                  if (login && ownerLogin && ownerLogin !== login) continue;
+
+                  const id = String(node.id || '').trim();
+                  if (!id || seen[id]) continue;
+                  seen[id] = true;
+
+                  const game = resolveRef(state, node.game);
+                  const gameName = (game && (game.displayName || game.name)) ? (game.displayName || game.name) : '';
+
+                  let thumb = node.previewThumbnailURL || node.thumbnailURL || '';
+                  if (typeof thumb === 'string') {
+                    thumb = thumb.replace('%{width}', '640').replace('%{height}', '360');
+                  } else {
+                    thumb = '';
+                  }
+
+                  const duration = formatDuration(node.lengthSeconds || node.durationSeconds || node.duration || 0);
+                  const title = trim(node.title || `Video ${id}`);
+                  const subtitle = gameName ? gameName : '';
+
+                  items.push({
+                    id: id,
+                    kind: 'vod',
+                    url: canonicalVideoURL(id),
+                    title: title || (`Video ${id}`),
+                    thumbnailURL: thumb,
+                    duration: duration,
+                    subtitle: subtitle
+                  });
+                }
+
+                return items.length > 0;
+              } catch (_) {
+                return false;
+              }
+            }
+
+            if (extractFromApollo()) {
+              return items.slice(0, 80);
+            }
+
+            function pushFromCard(card) {
+              try {
+                if (!card) return;
+                const a = card.querySelector('a[href*="/videos/"]');
+                if (!a) return;
+
+                const href = a.getAttribute('href') || '';
+                const id = videoIDFromHref(href);
+                if (!id) return;
+                if (seen[id]) return;
+                seen[id] = true;
+
+                const img = card.querySelector('img') || a.querySelector('img');
+                const thumb = bestImageURL(img);
+                const title = pickTitle(a, card, img, 'Video ' + id);
+                const duration = findDurationIn(card);
+                const subtitle = findSubtitleIn(card, title, duration);
+
+                items.push({
+                  id: id,
+                  kind: 'vod',
+                  url: canonicalVideoURL(id),
+                  title: title,
+                  thumbnailURL: thumb,
+                  duration: duration,
+                  subtitle: subtitle
+                });
+              } catch (_) {}
+            }
+
+            // Prefer actual cards (Twitch uses virtualized grids).
+            try {
+              const cards = Array.from(document.querySelectorAll('article')).slice(0, 250);
+              for (const card of cards) {
+                pushFromCard(card);
+              }
+            } catch (_) {}
+
+            if (items.length) {
+              return items.slice(0, 80);
+            }
+
+            // Fallback: scan anchors.
+            try {
+              const anchors = Array.from(document.querySelectorAll('a[href*="/videos/"]')).slice(0, 600);
+              for (const a of anchors) {
+                const href = a.getAttribute('href') || '';
+                const id = videoIDFromHref(href);
+                if (!id) continue;
+                if (seen[id]) continue;
+
+                const card = a.closest('article') || a.closest('div') || a;
+                const img = (card && card.querySelector('img')) || a.querySelector('img');
+                const thumb = bestImageURL(img);
+                const title = pickTitle(a, card, img, 'Video ' + id);
+                const duration = findDurationIn(card);
+                const subtitle = findSubtitleIn(card, title, duration);
+
+                seen[id] = true;
+                items.push({
+                  id: id,
+                  kind: 'vod',
+                  url: canonicalVideoURL(id),
+                  title: title,
+                  thumbnailURL: thumb,
+                  duration: duration,
+                  subtitle: subtitle
+                });
+
+                if (items.length >= 80) break;
+              }
+            } catch (_) {}
+
+            return items;
+          }
+
+          function extractClips() {
+            const items = [];
+            const seen = {};
+            function extractFromApollo() {
+              try {
+                const state = window.__APOLLO_STATE__ || null;
+                if (!state) return false;
+                const login = currentChannelLogin();
+                const clipKeys = Object.keys(state).filter(k => {
+                  const n = state[k];
+                  return n && n.__typename === 'Clip';
+                });
+                if (!clipKeys.length) return false;
+
+                for (const key of clipKeys) {
+                  const node = state[key];
+                  if (!node || node.__typename !== 'Clip') continue;
+                  const broadcaster = resolveRef(state, node.broadcaster);
+                  const broadcasterLogin = (broadcaster && (broadcaster.login || broadcaster.displayName) || '').toString().toLowerCase();
+                  if (login && broadcasterLogin && broadcasterLogin !== login) continue;
+
+                  const slug = String(node.slug || node.id || '').trim();
+                  if (!slug || seen[slug]) continue;
+                  seen[slug] = true;
+
+                  let thumb = node.thumbnailURL || node.previewImageURL || node.tinyThumbnailURL || '';
+                  if (typeof thumb === 'string') {
+                    thumb = thumb.replace('%{width}', '640').replace('%{height}', '360');
+                  } else {
+                    thumb = '';
+                  }
+
+                  const duration = formatDuration(node.durationSeconds || node.duration || 0);
+                  const title = trim(node.title || `Clip ${slug}`);
+
+                  const game = resolveRef(state, node.game);
+                  const gameName = (game && (game.displayName || game.name)) ? (game.displayName || game.name) : '';
+                  const subtitle = gameName ? gameName : '';
+
+                  items.push({
+                    id: slug,
+                    kind: 'clip',
+                    url: canonicalClipURL(slug),
+                    title: title || (`Clip ${slug}`),
+                    thumbnailURL: thumb,
+                    duration: duration,
+                    subtitle: subtitle
+                  });
+                }
+
+                return items.length > 0;
+              } catch (_) {
+                return false;
+              }
+            }
+
+            if (extractFromApollo()) {
+              return items.slice(0, 80);
+            }
+
+            function pushFromCard(card) {
+              try {
+                if (!card) return;
+                const a = card.querySelector('a[href*="/clip/"], a[href*="clips.twitch.tv/"]');
+                if (!a) return;
+
+                const hrefAbs = absURL(a.getAttribute('href') || '');
+                if (!hrefAbs) return;
+
+                const slug = clipSlugFromHref(hrefAbs);
+                if (!slug) return;
+                if (seen[slug]) return;
+                seen[slug] = true;
+
+                const img = card.querySelector('img') || a.querySelector('img');
+                const thumb = bestImageURL(img);
+                const title = pickTitle(a, card, img, 'Clip ' + slug);
+                const duration = findDurationIn(card);
+                const subtitle = findSubtitleIn(card, title, duration);
+
+                items.push({
+                  id: slug,
+                  kind: 'clip',
+                  url: canonicalClipURL(slug),
+                  title: title,
+                  thumbnailURL: thumb,
+                  duration: duration,
+                  subtitle: subtitle
+                });
+              } catch (_) {}
+            }
+
+            // Prefer actual cards.
+            try {
+              const cards = Array.from(document.querySelectorAll('article')).slice(0, 300);
+              for (const card of cards) {
+                pushFromCard(card);
+              }
+            } catch (_) {}
+
+            if (items.length) {
+              return items.slice(0, 80);
+            }
+
+            // Fallback: scan anchors.
+            try {
+              const anchors = Array.from(document.querySelectorAll('a[href]')).slice(0, 900);
+              for (const a of anchors) {
+                const rawHref = a.getAttribute('href') || '';
+                if (!rawHref) continue;
+                const hrefAbs = absURL(rawHref);
+                if (!hrefAbs) continue;
+
+                const isClip = hrefAbs.includes('clips.twitch.tv/') || rawHref.toLowerCase().includes('/clip/');
+                if (!isClip) continue;
+
+                const slug = clipSlugFromHref(hrefAbs);
+                if (!slug) continue;
+                if (seen[slug]) continue;
+
+                const card = a.closest('article') || a.closest('div') || a;
+                const img = (card && card.querySelector('img')) || a.querySelector('img');
+                const thumb = bestImageURL(img);
+                const title = pickTitle(a, card, img, 'Clip ' + slug);
+                const duration = findDurationIn(card);
+                const subtitle = findSubtitleIn(card, title, duration);
+
+                seen[slug] = true;
+                items.push({
+                  id: slug,
+                  kind: 'clip',
+                  url: canonicalClipURL(slug),
+                  title: title,
+                  thumbnailURL: thumb,
+                  duration: duration,
+                  subtitle: subtitle
+                });
+
+                if (items.length >= 80) break;
+              }
+            } catch (_) {}
+
+            return items;
+          }
+
+          let lastSent = null;
+          let pending = false;
+
+          function postIfChanged() {
+            dismissGates();
+            const section = currentSection();
+            const items = (section === 'clips') ? extractClips() : extractVods();
+            if (!items || items.length === 0) {
+              ensureFilters(section);
+              nudgeScroll();
+            }
+            let serialized = null;
+            try { serialized = JSON.stringify(items); } catch (_) { serialized = null; }
+            if (serialized === lastSent) { return; }
+            lastSent = serialized;
+            try {
+              window.webkit.messageHandlers.channelVideos.postMessage({ section: section, items: items });
+            } catch (_) {}
+          }
+
+          function schedulePost() {
+            if (pending) { return; }
+            pending = true;
+            setTimeout(function() {
+              pending = false;
+              postIfChanged();
+            }, 350);
+          }
+
+          window.__glitcho_scrapeChannelVideos = postIfChanged;
+
+          postIfChanged();
+          const observer = new MutationObserver(schedulePost);
+          observer.observe(document.documentElement, { childList: true, subtree: true });
+          setTimeout(postIfChanged, 1000);
+          setTimeout(postIfChanged, 2000);
+          setTimeout(postIfChanged, 4000);
+        })();
+        """#,
+        injectionTime: .atDocumentEnd,
+        forMainFrameOnly: true
+    )
+
+    private static let blockMediaScript = WKUserScript(
+        source: #"""
+        (function() {
+          if (window.__glitcho_block_media_scraper) { return; }
+          window.__glitcho_block_media_scraper = true;
+
+          function pauseAll() {
+            try {
+              document.querySelectorAll('video,audio').forEach(el => {
+                try { el.pause(); } catch (e) {}
+                try { el.muted = true; } catch (e) {}
+                try { el.volume = 0; } catch (e) {}
+                try { el.removeAttribute('autoplay'); } catch (e) {}
+              });
+            } catch (e) {}
+          }
+
+          // Block programmatic play() calls.
+          try {
+            const origPlay = HTMLMediaElement.prototype.play;
+            HTMLMediaElement.prototype.play = function() {
+              try { this.pause(); } catch (e) {}
+              try { this.muted = true; this.volume = 0; } catch (e) {}
+              return Promise.reject(new Error('Blocked by Glitcho'));
+            };
+            window.__glitcho_origPlay_scraper = origPlay;
+          } catch (e) {}
+
+          pauseAll();
+          const observer = new MutationObserver(pauseAll);
+          observer.observe(document.documentElement, { childList: true, subtree: true });
+          setInterval(pauseAll, 500);
+        })();
+        """#,
+        injectionTime: .atDocumentStart,
+        forMainFrameOnly: true
+    )
+}
+
+struct ChannelVideosScraperView: NSViewRepresentable {
+    @ObservedObject var store: ChannelVideosStore
+
+    func makeNSView(context: Context) -> WKWebView {
+        let view = store.attachWebView()
+        view.isHidden = false
+        // Keep a tiny non-zero alpha so WebKit doesn’t treat it as fully invisible/offscreen.
+        view.alphaValue = 0.01
+        return view
+    }
+
+    func updateNSView(_ nsView: WKWebView, context: Context) {
+        nsView.isHidden = false
+        nsView.alphaValue = 0.01
+    }
+}
+
+private struct TwitchUnderlineTabs<T: Hashable>: View {
+    let tabs: [T]
+    @Binding var selection: T
+    let title: (T) -> String
+
+    var body: some View {
+        HStack(spacing: 18) {
+            ForEach(tabs, id: \.self) { tab in
+                Button {
+                    selection = tab
+                } label: {
+                    VStack(spacing: 6) {
+                        Text(title(tab))
+                            .font(.system(size: 12, weight: selection == tab ? .semibold : .medium))
+                            .foregroundColor(selection == tab ? .white.opacity(0.92) : .white.opacity(0.6))
+
+                        Rectangle()
+                            .fill(selection == tab ? Color.purple.opacity(0.95) : Color.clear)
+                            .frame(height: 2)
+                            .clipShape(Capsule())
+                    }
+                    .padding(.vertical, 4)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+}
+
+private struct ChannelVideoCardView: View {
+    let item: ChannelVideoItem
+    @State private var isHovering = false
+    @State private var showPreview = false
+    @State private var hoverWorkItem: DispatchWorkItem?
+    @State private var previewURL: URL?
+    @State private var previewTask: Task<Void, Never>?
+    @StateObject private var previewStreamlink = StreamlinkManager()
+
+    private var placeholder: some View {
+        LinearGradient(
+            colors: [Color.white.opacity(0.08), Color.white.opacity(0.04)],
+            startPoint: .topLeading,
+            endPoint: .bottomTrailing
+        )
+    }
+
+    private func hoverPreviewURL() -> URL? {
+        guard let url = item.thumbnailURL else { return nil }
+        let s = url.absoluteString
+        let upgraded = s
+            .replacingOccurrences(of: "320x180", with: "640x360")
+            .replacingOccurrences(of: "480x270", with: "640x360")
+            .replacingOccurrences(of: "%7Bwidth%7D", with: "640")
+            .replacingOccurrences(of: "%7Bheight%7D", with: "360")
+            .replacingOccurrences(of: "%{width}", with: "640")
+            .replacingOccurrences(of: "%{height}", with: "360")
+        return URL(string: upgraded) ?? url
+    }
+    private func previewTarget() -> String {
+        item.url.absoluteString
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ZStack(alignment: .bottomTrailing) {
+                Group {
+                    if let thumb = item.thumbnailURL {
+                        AsyncImage(url: thumb) { image in
+                            image
+                                .resizable()
+                                .scaledToFill()
+                        } placeholder: {
+                            placeholder
+                        }
+                    } else {
+                        placeholder
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .clipped()
+
+                if let duration = item.duration, !duration.isEmpty {
+                    Text(duration)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.92))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Color.black.opacity(0.55))
+                        .clipShape(Capsule())
+                        .padding(8)
+                }
+            }
+            .aspectRatio(16.0 / 9.0, contentMode: .fit)
+            .background(Color.white.opacity(0.05))
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(isHovering ? Color.purple.opacity(0.45) : Color.white.opacity(0.08), lineWidth: 1)
+            )
+            .overlay(alignment: .topLeading) {
+                if item.kind == .clip {
+                    Text("CLIP")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.92))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Color.purple.opacity(0.75))
+                        .clipShape(Capsule())
+                        .padding(8)
+                }
+            }
+
+            Text(item.title)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(.white.opacity(0.92))
+                .lineLimit(2)
+
+            if let subtitle = item.subtitle, !subtitle.isEmpty {
+                Text(subtitle)
+                    .font(.system(size: 10, weight: .regular))
+                    .foregroundColor(.white.opacity(0.6))
+                    .lineLimit(2)
+            }
+        }
+        .padding(8)
+        .background(Color.white.opacity(isHovering ? 0.07 : 0.05))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .onHover { hovering in
+            withAnimation(.easeOut(duration: 0.12)) {
+                isHovering = hovering
+            }
+            hoverWorkItem?.cancel()
+            if hovering {
+                let work = DispatchWorkItem {
+                    showPreview = true
+                    startPreview()
+                }
+                hoverWorkItem = work
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
+            } else {
+                showPreview = false
+                stopPreview()
+            }
+        }
+        .popover(isPresented: $showPreview, arrowEdge: .bottom) {
+            VStack(spacing: 8) {
+                ZStack {
+                    if let previewURL = hoverPreviewURL() {
+                        AsyncImage(url: previewURL) { image in
+                            image
+                                .resizable()
+                                .scaledToFill()
+                        } placeholder: {
+                            placeholder
+                        }
+                    } else {
+                        placeholder
+                    }
+
+                    if let previewURL {
+                        NativeHoverPlayerView(url: previewURL)
+                    } else if previewStreamlink.isLoading {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+                }
+                .frame(width: 360, height: 203)
+                .clipped()
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+                Text(item.title)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.9))
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(12)
+            .frame(width: 380)
+            .background(Color.black.opacity(0.9))
+        }
+    }
+
+    private func startPreview() {
+        previewTask?.cancel()
+        previewURL = nil
+        previewStreamlink.error = nil
+        previewStreamlink.isLoading = true
+        let target = previewTarget()
+        previewTask = Task {
+            do {
+                let url = try await previewStreamlink.getStreamURL(target: target, quality: "worst")
+                await MainActor.run {
+                    if showPreview {
+                        previewURL = url
+                        previewStreamlink.isLoading = false
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    previewStreamlink.isLoading = false
+                }
+            }
+        }
+    }
+
+    private func stopPreview() {
+        previewTask?.cancel()
+        previewTask = nil
+        previewStreamlink.stopStream()
+        previewURL = nil
+        previewStreamlink.isLoading = false
+    }
+}
+
+struct ChannelVideosPanelView: View {
+    let channelName: String
+    @ObservedObject var store: ChannelVideosStore
+    let onSelectPlayback: (NativePlaybackRequest) -> Void
+
+    private let gridColumns = [
+        GridItem(.adaptive(minimum: 200, maximum: 280), spacing: 16, alignment: .top)
+    ]
+
+    private var currentItems: [ChannelVideoItem] {
+        switch store.section {
+        case .videos:
+            return store.vods
+        case .clips:
+            return store.clips
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 18) {
+                TwitchUnderlineTabs(
+                    tabs: ChannelVideosStore.Section.allCases,
+                    selection: Binding(
+                        get: { store.section },
+                        set: { newValue in
+                            store.load(channelName: channelName, section: newValue)
+                        }
+                    )
+                ) { $0.rawValue }
+
+                Spacer()
+
+                if store.isLoading {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+            }
+
+            ScrollView {
+                if currentItems.isEmpty && store.isLoading {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Loading…")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundColor(.white.opacity(0.6))
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                } else if currentItems.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(store.section == .clips ? "No clips found yet." : "No videos found yet.")
+                            .font(.system(size: 12))
+                            .foregroundColor(.white.opacity(0.6))
+
+                        if let error = store.lastError, !error.isEmpty {
+                            Text(error)
+                                .font(.system(size: 11))
+                                .foregroundColor(.white.opacity(0.45))
+                                .lineLimit(3)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                } else {
+                    LazyVGrid(columns: gridColumns, alignment: .leading, spacing: 16) {
+                        ForEach(currentItems) { item in
+                            Button {
+                                onSelectPlayback(
+                                    NativePlaybackRequest(
+                                        kind: item.kind,
+                                        streamlinkTarget: item.url.absoluteString,
+                                        channelName: channelName
+                                    )
+                                )
+                            } label: {
+                                ChannelVideoCardView(item: item)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.top, 6)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+        }
+        .overlay(
+            ChannelVideosScraperView(store: store)
+                // Keep a real viewport so Twitch’s virtualized grids actually render.
+                .frame(width: 1200, height: 900)
+                .allowsHitTesting(false)
+                .opacity(0.001)
+        )
+        .onAppear {
+            store.load(channelName: channelName, section: store.section)
+        }
+        .onChange(of: channelName) { newValue in
+            store.load(channelName: newValue, section: store.section)
         }
     }
 }

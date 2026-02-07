@@ -90,6 +90,10 @@ struct ContentView: View {
                                 giftChannel = channel
                                 showGiftPopup = true
                             },
+                            onFollowChannel: { channel in
+                                store.followChannel(login: channel)
+                            },
+                            followedChannels: store.followedLive,
                             notificationEnabled: currentNotificationEnabled(),
                             onNotificationToggle: { enabled in
                                 guard let login = playbackRequest.channelName else { return }
