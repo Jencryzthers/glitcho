@@ -218,18 +218,6 @@ struct ContentView: View {
                 .zIndex(6)
             }
 
-            if recordingManager.isAnyRecordingIncludingBackground() {
-                RecordingStatusBadge(
-                    channel: recordingManager.recordingBadgeChannelIncludingBackground(),
-                    count: recordingManager.recordingCountIncludingBackground()
-                )
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
-                    .padding(.trailing, 24)
-                    .padding(.bottom, 24)
-                    .zIndex(2)
-                    .allowsHitTesting(false)
-            }
-
             if showLoadingOverlay {
                 LoadingOverlay()
                     .zIndex(100)
@@ -727,7 +715,6 @@ struct ContentView: View {
 
 private struct RecordingStatusBadge: View {
     let channel: String?
-    let count: Int
 
     private var text: String {
         if let channel {

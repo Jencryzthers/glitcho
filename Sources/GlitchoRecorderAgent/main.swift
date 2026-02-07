@@ -66,7 +66,7 @@ final class RecorderAgent {
     func run() {
         print("[RecorderAgent] Starting. Config: \(configPath.path)")
         prepareActiveSessionsDirectory()
-        clearActiveSessionLocks()
+        recoverExistingSessions()
 
         while true {
             autoreleasepool {
@@ -186,7 +186,13 @@ final class RecorderAgent {
         let now = Date()
         for channel in combinedChannels {
             let login = channel.login
+            
+            // Check if we have an active session in memory
             if let session = sessions[login], session.process.isRunning { continue }
+            
+            // Check if there's an existing recording via lock file
+            if isRecordingActiveViaLockFile(login: login) { continue }
+            
             if let retry = retryByLogin[login], now < retry.nextAttemptAt { continue }
 
             do {
@@ -275,7 +281,7 @@ final class RecorderAgent {
         }
     }
 
-    private func clearActiveSessionLocks() {
+    private func recoverExistingSessions() {
         guard let files = try? FileManager.default.contentsOfDirectory(
             at: activeSessionsDirectory,
             includingPropertiesForKeys: nil,
@@ -284,9 +290,45 @@ final class RecorderAgent {
             return
         }
 
+        // Clean up lock files for processes that are no longer alive
         for file in files {
-            try? FileManager.default.removeItem(at: file)
+            guard let data = try? Data(contentsOf: file),
+                  let lock = try? JSONDecoder().decode(ActiveSessionLock.self, from: data) else {
+                try? FileManager.default.removeItem(at: file)
+                continue
+            }
+            
+            if !isProcessAlive(lock.pid) {
+                try? FileManager.default.removeItem(at: file)
+                print("[RecorderAgent] Cleaned up stale lock for \(lock.login) (PID \(lock.pid) no longer alive)")
+            } else {
+                print("[RecorderAgent] Found existing recording for \(lock.login) (PID \(lock.pid))")
+            }
         }
+    }
+    
+    private func isRecordingActiveViaLockFile(login: String) -> Bool {
+        let lockURL = lockFileURL(for: login)
+        guard FileManager.default.fileExists(atPath: lockURL.path),
+              let data = try? Data(contentsOf: lockURL),
+              let lock = try? JSONDecoder().decode(ActiveSessionLock.self, from: data) else {
+            return false
+        }
+        
+        let alive = isProcessAlive(lock.pid)
+        if !alive {
+            // Clean up stale lock
+            try? FileManager.default.removeItem(at: lockURL)
+        }
+        return alive
+    }
+    
+    private func isProcessAlive(_ pid: Int32) -> Bool {
+        guard pid > 0 else { return false }
+        if kill(pid, 0) == 0 {
+            return true
+        }
+        return errno == EPERM
     }
 
     private func lockFileURL(for login: String) -> URL {
