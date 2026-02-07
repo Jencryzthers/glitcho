@@ -59,18 +59,37 @@ final class BackgroundRecorderAgentManager: ObservableObject {
         logsDirectory.appendingPathComponent("agent.stderr.log")
     }
 
-    private var manualRecordings: [BackgroundRecorderAgentChannel] = []
+    private let manualRecordingsDefaultsKey = "backgroundRecorder.manualRecordings.v1"
+    
+    private var manualRecordings: [BackgroundRecorderAgentChannel] {
+        get {
+            guard let data = UserDefaults.standard.data(forKey: manualRecordingsDefaultsKey),
+                  let decoded = try? JSONDecoder().decode([BackgroundRecorderAgentChannel].self, from: data) else {
+                return []
+            }
+            return decoded
+        }
+        set {
+            if let encoded = try? JSONEncoder().encode(newValue) {
+                UserDefaults.standard.set(encoded, forKey: manualRecordingsDefaultsKey)
+            }
+        }
+    }
     
     func addManualRecording(login: String, displayName: String?) {
         let channel = BackgroundRecorderAgentChannel(login: login.lowercased(), displayName: displayName)
-        if !manualRecordings.contains(where: { $0.login == channel.login }) {
-            manualRecordings.append(channel)
+        var recordings = manualRecordings
+        if !recordings.contains(where: { $0.login == channel.login }) {
+            recordings.append(channel)
+            manualRecordings = recordings
         }
     }
     
     func removeManualRecording(login: String) {
         let normalized = login.lowercased()
-        manualRecordings.removeAll { $0.login == normalized }
+        var recordings = manualRecordings
+        recordings.removeAll { $0.login == normalized }
+        manualRecordings = recordings
     }
     
     func sync(
