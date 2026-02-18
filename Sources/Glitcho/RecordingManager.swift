@@ -206,11 +206,20 @@ final class RecordingManager: ObservableObject {
             )
         }
 
+        // Remove from manifest if encrypted.
+        if url.pathExtension == "glitcho" {
+            let directory = recordingsDirectory()
+            let mgr = effectiveEncryptionManager
+            if var manifest = try? mgr.loadManifest(from: directory) {
+                manifest.removeValue(forKey: url.lastPathComponent)
+                try? mgr.saveManifest(manifest, to: directory)
+            }
+        }
+
         // Prefer moving to Trash to avoid accidental data loss.
         do {
             _ = try FileManager.default.trashItem(at: url, resultingItemURL: nil)
         } catch {
-            // Fallback: if Trash isn't available for some reason, attempt a hard delete.
             try FileManager.default.removeItem(at: url)
         }
     }
