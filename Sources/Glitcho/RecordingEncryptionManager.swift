@@ -210,9 +210,8 @@ final class RecordingEncryptionManager {
             let result = try encryptFile(at: mp4URL, in: directory)
             manifest[result.hashFilename] = result.entry
             migrated += 1
-        }
 
-        if migrated > 0 {
+            // Save manifest after each file to avoid data loss if interrupted.
             try saveManifest(manifest, to: directory)
         }
 

@@ -220,7 +220,14 @@ final class RecordingManager: ObservableObject {
             )
         }
 
-        // Remove from manifest if encrypted.
+        // Prefer moving to Trash to avoid accidental data loss.
+        do {
+            _ = try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+        } catch {
+            try FileManager.default.removeItem(at: url)
+        }
+
+        // Remove from manifest after successful file removal.
         if url.pathExtension == "glitcho" {
             let directory = recordingsDirectory()
             let mgr = effectiveEncryptionManager
@@ -228,13 +235,6 @@ final class RecordingManager: ObservableObject {
                 manifest.removeValue(forKey: url.lastPathComponent)
                 try? mgr.saveManifest(manifest, to: directory)
             }
-        }
-
-        // Prefer moving to Trash to avoid accidental data loss.
-        do {
-            _ = try FileManager.default.trashItem(at: url, resultingItemURL: nil)
-        } catch {
-            try FileManager.default.removeItem(at: url)
         }
     }
     func toggleRecording(target: String, channelName: String?, quality: String = "best") {
