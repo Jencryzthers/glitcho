@@ -93,6 +93,20 @@ final class RecordingManager: ObservableObject {
         refreshBackgroundRecordingState()
         startBackgroundRecordingMonitor()
         _ = enforceRetentionPoliciesNow()
+        effectiveEncryptionManager.cleanupTempPlaybackFiles()
+        let activeURLs = recordingSessions.values.map(\.outputURL)
+        if let migrationResult = try? effectiveEncryptionManager.migrateUnencryptedRecordings(
+            in: recordingsDirectory(),
+            activeOutputURLs: activeURLs
+        ), migrationResult.migratedCount > 0 {
+            GlitchoTelemetry.track(
+                "recordings_migration_completed",
+                metadata: [
+                    "migrated": "\(migrationResult.migratedCount)",
+                    "skipped": "\(migrationResult.skippedCount)"
+                ]
+            )
+        }
     }
 
     deinit {

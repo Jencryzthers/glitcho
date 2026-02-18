@@ -240,6 +240,46 @@ final class RecordingEncryptionManagerTests: XCTestCase {
         }
     }
 
+    // MARK: - Task 15: End-to-end integration test
+
+    func testFullRoundTrip_EncryptMigrateListDeleteExport() throws {
+        try withTemporaryDirectory { dir in
+            let key = SymmetricKey(size: .bits256)
+            let mgr = makeManager(key: key)
+
+            // 1. Create two unencrypted recordings.
+            try Data("video1".utf8).write(to: dir.appendingPathComponent("channel1_2026-02-17_10-00-00.mp4"))
+            try Data("video2".utf8).write(to: dir.appendingPathComponent("channel2_2026-02-17_11-00-00.mp4"))
+
+            // 2. Migrate.
+            let migResult = try mgr.migrateUnencryptedRecordings(in: dir, activeOutputURLs: [])
+            XCTAssertEqual(migResult.migratedCount, 2)
+
+            // 3. Load manifest.
+            let manifest = try mgr.loadManifest(from: dir)
+            XCTAssertEqual(manifest.count, 2)
+
+            // 4. Verify channel names are parsed.
+            let channels = Set(manifest.values.map(\.channelName))
+            XCTAssertTrue(channels.contains("channel1"))
+            XCTAssertTrue(channels.contains("channel2"))
+
+            // 5. Decrypt one recording.
+            let firstKey = manifest.keys.sorted().first!
+            let exportURL = dir.appendingPathComponent("exported.mp4")
+            try mgr.decryptFile(named: firstKey, in: dir, to: exportURL)
+            let exported = try Data(contentsOf: exportURL)
+            XCTAssertTrue(exported == Data("video1".utf8) || exported == Data("video2".utf8))
+
+            // 6. Delete from manifest.
+            var updated = manifest
+            updated.removeValue(forKey: firstKey)
+            try mgr.saveManifest(updated, to: dir)
+            let reloaded = try mgr.loadManifest(from: dir)
+            XCTAssertEqual(reloaded.count, 1)
+        }
+    }
+
     // MARK: - Task 7: Temp file cleanup
 
     func testCleanupTempFiles_RemovesGlitchoTempFiles() throws {
