@@ -78,4 +78,106 @@ final class RecordingEncryptionManagerTests: XCTestCase {
         let b = mgr.generateHashFilename(originalFilename: "same.mp4")
         XCTAssertNotEqual(a, b, "Each call uses a random salt")
     }
+
+    // MARK: - Helpers
+
+    private func withTemporaryDirectory<T>(_ body: (URL) throws -> T) throws -> T {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        return try body(dir)
+    }
+
+    // MARK: - Task 4: Manifest CRUD
+
+    func testManifest_SaveAndLoadRoundTrip() throws {
+        try withTemporaryDirectory { dir in
+            let key = SymmetricKey(size: .bits256)
+            let mgr = makeManager(key: key)
+
+            let entry = RecordingManifestEntry(
+                channelName: "streamer",
+                date: Date(timeIntervalSinceReferenceDate: 1000),
+                quality: "best",
+                originalFilename: "streamer_2026-02-17_14-30-45.mp4"
+            )
+            var manifest: [String: RecordingManifestEntry] = [:]
+            manifest["abc123def456.glitcho"] = entry
+
+            try mgr.saveManifest(manifest, to: dir)
+            let loaded = try mgr.loadManifest(from: dir)
+
+            XCTAssertEqual(loaded.count, 1)
+            XCTAssertEqual(loaded["abc123def456.glitcho"]?.channelName, "streamer")
+            XCTAssertEqual(loaded["abc123def456.glitcho"]?.quality, "best")
+            XCTAssertEqual(loaded["abc123def456.glitcho"]?.originalFilename, "streamer_2026-02-17_14-30-45.mp4")
+        }
+    }
+
+    func testLoadManifest_ReturnsEmptyWhenNoManifestExists() throws {
+        try withTemporaryDirectory { dir in
+            let mgr = makeManager(key: SymmetricKey(size: .bits256))
+            let loaded = try mgr.loadManifest(from: dir)
+            XCTAssertTrue(loaded.isEmpty)
+        }
+    }
+
+    func testLoadManifest_ThrowsWhenDecryptionFails() throws {
+        try withTemporaryDirectory { dir in
+            let key1 = SymmetricKey(size: .bits256)
+            let key2 = SymmetricKey(size: .bits256)
+            let mgr1 = makeManager(key: key1)
+            let mgr2 = makeManager(key: key2)
+
+            let entry = RecordingManifestEntry(
+                channelName: "test",
+                date: Date(),
+                quality: "best",
+                originalFilename: "test.mp4"
+            )
+            try mgr1.saveManifest(["file.glitcho": entry], to: dir)
+            XCTAssertThrowsError(try mgr2.loadManifest(from: dir))
+        }
+    }
+
+    // MARK: - Task 5: File-level encrypt/decrypt
+
+    func testEncryptFile_CreatesEncryptedFileAndDeletesOriginal() throws {
+        try withTemporaryDirectory { dir in
+            let key = SymmetricKey(size: .bits256)
+            let mgr = makeManager(key: key)
+
+            let original = dir.appendingPathComponent("streamer_2026-02-17_14-30-45.mp4")
+            try Data("video data".utf8).write(to: original)
+
+            let result = try mgr.encryptFile(at: original, in: dir)
+
+            XCTAssertFalse(FileManager.default.fileExists(atPath: original.path))
+
+            let encryptedURL = dir.appendingPathComponent(result.hashFilename)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: encryptedURL.path))
+            XCTAssertTrue(result.hashFilename.hasSuffix(".glitcho"))
+            XCTAssertEqual(result.entry.originalFilename, "streamer_2026-02-17_14-30-45.mp4")
+        }
+    }
+
+    func testDecryptFile_WritesDecryptedDataToDestination() throws {
+        try withTemporaryDirectory { dir in
+            let key = SymmetricKey(size: .bits256)
+            let mgr = makeManager(key: key)
+
+            let original = dir.appendingPathComponent("test.mp4")
+            let content = Data("test video content".utf8)
+            try content.write(to: original)
+
+            let result = try mgr.encryptFile(at: original, in: dir)
+
+            let decryptedURL = dir.appendingPathComponent("decrypted.mp4")
+            try mgr.decryptFile(named: result.hashFilename, in: dir, to: decryptedURL)
+
+            let decrypted = try Data(contentsOf: decryptedURL)
+            XCTAssertEqual(decrypted, content)
+        }
+    }
 }
