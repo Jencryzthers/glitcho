@@ -168,6 +168,79 @@ final class RecordingEncryptionManager {
         try plaintext.write(to: destinationURL, options: .atomic)
     }
 
+    // MARK: - Migration Logic (Task 6)
+
+    struct MigrationResult {
+        let migratedCount: Int
+        let skippedCount: Int
+    }
+
+    func migrateUnencryptedRecordings(
+        in directory: URL,
+        activeOutputURLs: [URL]
+    ) throws -> MigrationResult {
+        let activeURLSet = Set(activeOutputURLs.map { $0.standardizedFileURL })
+
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return MigrationResult(migratedCount: 0, skippedCount: 0)
+        }
+
+        let mp4Files = files.filter { $0.pathExtension.lowercased() == "mp4" }
+        guard !mp4Files.isEmpty else {
+            return MigrationResult(migratedCount: 0, skippedCount: 0)
+        }
+
+        var manifest = (try? loadManifest(from: directory)) ?? [:]
+        var migrated = 0
+        var skipped = 0
+
+        for mp4URL in mp4Files {
+            if activeURLSet.contains(mp4URL.standardizedFileURL) {
+                skipped += 1
+                continue
+            }
+            // Skip stderr log files and remux temp files.
+            if mp4URL.lastPathComponent.hasSuffix(".stderr.log") { continue }
+            if mp4URL.lastPathComponent.contains(".remux-") { continue }
+
+            let result = try encryptFile(at: mp4URL, in: directory)
+            manifest[result.hashFilename] = result.entry
+            migrated += 1
+        }
+
+        if migrated > 0 {
+            try saveManifest(manifest, to: directory)
+        }
+
+        return MigrationResult(migratedCount: migrated, skippedCount: skipped)
+    }
+
+    // MARK: - Temp File Cleanup (Task 7)
+
+    static let tempPlaybackSuffix = ".glitcho-playback.mp4"
+
+    func tempPlaybackURL() -> URL {
+        let filename = "\(UUID().uuidString)\(Self.tempPlaybackSuffix)"
+        return FileManager.default.temporaryDirectory.appendingPathComponent(filename)
+    }
+
+    func cleanupTempPlaybackFiles() {
+        let tempDir = FileManager.default.temporaryDirectory
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: tempDir,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else { return }
+
+        for file in files where file.lastPathComponent.hasSuffix(Self.tempPlaybackSuffix) {
+            try? FileManager.default.removeItem(at: file)
+        }
+    }
+
     // MARK: - Filename Parsing Helpers
 
     private static let filenameDateFormatter: DateFormatter = {

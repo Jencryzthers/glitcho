@@ -180,4 +180,79 @@ final class RecordingEncryptionManagerTests: XCTestCase {
             XCTAssertEqual(decrypted, content)
         }
     }
+
+    // MARK: - Task 6: Migration logic
+
+    func testMigrateUnencryptedRecordings_EncryptsAllMP4Files() throws {
+        try withTemporaryDirectory { dir in
+            let key = SymmetricKey(size: .bits256)
+            let mgr = makeManager(key: key)
+
+            try Data("video1".utf8).write(to: dir.appendingPathComponent("streamer_2026-02-17_10-00-00.mp4"))
+            try Data("video2".utf8).write(to: dir.appendingPathComponent("streamer_2026-02-17_11-00-00.mp4"))
+
+            let result = try mgr.migrateUnencryptedRecordings(in: dir, activeOutputURLs: [])
+
+            XCTAssertEqual(result.migratedCount, 2)
+            XCTAssertEqual(result.skippedCount, 0)
+
+            let remaining = try FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)
+            let mp4s = remaining.filter { $0.pathExtension.lowercased() == "mp4" }
+            XCTAssertTrue(mp4s.isEmpty)
+
+            let glitchos = remaining.filter { $0.pathExtension == "glitcho" }
+            XCTAssertEqual(glitchos.count, 3) // 2 recordings + 1 manifest
+
+            let manifest = try mgr.loadManifest(from: dir)
+            XCTAssertEqual(manifest.count, 2)
+        }
+    }
+
+    func testMigrateUnencryptedRecordings_SkipsActiveRecordings() throws {
+        try withTemporaryDirectory { dir in
+            let key = SymmetricKey(size: .bits256)
+            let mgr = makeManager(key: key)
+
+            let activeURL = dir.appendingPathComponent("active_2026-02-17_12-00-00.mp4")
+            try Data("active".utf8).write(to: activeURL)
+            try Data("done".utf8).write(to: dir.appendingPathComponent("done_2026-02-17_13-00-00.mp4"))
+
+            let result = try mgr.migrateUnencryptedRecordings(in: dir, activeOutputURLs: [activeURL])
+
+            XCTAssertEqual(result.migratedCount, 1)
+            XCTAssertEqual(result.skippedCount, 1)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: activeURL.path))
+        }
+    }
+
+    func testMigrateUnencryptedRecordings_IsIdempotent() throws {
+        try withTemporaryDirectory { dir in
+            let key = SymmetricKey(size: .bits256)
+            let mgr = makeManager(key: key)
+
+            try Data("video".utf8).write(to: dir.appendingPathComponent("test_2026-02-17_10-00-00.mp4"))
+
+            let result1 = try mgr.migrateUnencryptedRecordings(in: dir, activeOutputURLs: [])
+            XCTAssertEqual(result1.migratedCount, 1)
+
+            let result2 = try mgr.migrateUnencryptedRecordings(in: dir, activeOutputURLs: [])
+            XCTAssertEqual(result2.migratedCount, 0)
+        }
+    }
+
+    // MARK: - Task 7: Temp file cleanup
+
+    func testCleanupTempFiles_RemovesGlitchoTempFiles() throws {
+        let tempDir = FileManager.default.temporaryDirectory
+        let tempFile = tempDir.appendingPathComponent("\(UUID().uuidString).glitcho-playback.mp4")
+        try Data("temp".utf8).write(to: tempFile)
+        defer { try? FileManager.default.removeItem(at: tempFile) }
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: tempFile.path))
+
+        let mgr = makeManager(key: SymmetricKey(size: .bits256))
+        mgr.cleanupTempPlaybackFiles()
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tempFile.path))
+    }
 }
