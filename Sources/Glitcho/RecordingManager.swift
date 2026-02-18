@@ -30,6 +30,8 @@ final class RecordingManager: ObservableObject {
     @Published var ffmpegInstallStatus: String?
     @Published var ffmpegInstallError: String?
 
+    let recorderOrchestrator: RecorderOrchestrator
+
     private struct RecordingSession {
         let key: String
         let target: String
@@ -47,7 +49,19 @@ final class RecordingManager: ObservableObject {
         let pid: Int32
     }
 
+    struct RetentionResult {
+        let deletedCount: Int
+        let failedCount: Int
+    }
+
+    private struct QueuedRecordingRequest {
+        let target: String
+        let channelName: String?
+        let quality: String
+    }
+
     private var recordingSessions: [String: RecordingSession] = [:]
+    private var queuedRecordingRequestsByLogin: [String: QueuedRecordingRequest] = [:]
     private var backgroundRecordingLogins: Set<String> = []
     private var backgroundRecordingMonitor: Timer?
     private var pendingRecoveryIntents: [RecoveryIntent] = []
@@ -65,10 +79,20 @@ final class RecordingManager: ObservableObject {
     /// Override streamlink path resolution (primarily for unit tests).
     var _resolveStreamlinkPathOverride: (() -> String?)?
 
-    init() {
+    /// Override encryption manager (primarily for unit tests).
+    var _encryptionManagerOverride: RecordingEncryptionManager?
+    private let _encryptionManager = RecordingEncryptionManager()
+    var effectiveEncryptionManager: RecordingEncryptionManager {
+        _encryptionManagerOverride ?? _encryptionManager
+    }
+
+    init(recorderOrchestrator: RecorderOrchestrator? = nil) {
+        self.recorderOrchestrator = recorderOrchestrator ?? RecorderOrchestrator()
+        syncOrchestratorConcurrencyLimit()
         pendingRecoveryIntents = loadPersistedRecoveryIntents()
         refreshBackgroundRecordingState()
         startBackgroundRecordingMonitor()
+        _ = enforceRetentionPoliciesNow()
     }
 
     deinit {
@@ -101,6 +125,31 @@ final class RecordingManager: ObservableObject {
 
     func listRecordings() -> [RecordingEntry] {
         let directory = recordingsDirectory()
+
+        // Try loading encrypted manifest first.
+        if let manifest = try? effectiveEncryptionManager.loadManifest(from: directory), !manifest.isEmpty {
+            return manifest.map { hashFilename, entry in
+                let url = directory.appendingPathComponent(hashFilename)
+                return RecordingEntry(url: url, channelName: entry.channelName, recordedAt: entry.date)
+            }.sorted { left, right in
+                let nameCompare = left.channelName.localizedCaseInsensitiveCompare(right.channelName)
+                if nameCompare != .orderedSame {
+                    return nameCompare == .orderedAscending
+                }
+                switch (left.recordedAt, right.recordedAt) {
+                case let (lhs?, rhs?):
+                    return lhs > rhs
+                case (.some, .none):
+                    return true
+                case (.none, .some):
+                    return false
+                case (.none, .none):
+                    return left.url.lastPathComponent < right.url.lastPathComponent
+                }
+            }
+        }
+
+        // Fallback: scan for unencrypted .mp4 files (pre-migration state).
         guard let urls = try? FileManager.default.contentsOfDirectory(
             at: directory,
             includingPropertiesForKeys: [.isRegularFileKey],
@@ -116,7 +165,6 @@ final class RecordingManager: ObservableObject {
             guard parts.count >= 3 else {
                 return RecordingEntry(url: url, channelName: filename, recordedAt: nil)
             }
-
             let channelName = parts.dropLast(2).joined(separator: "_")
             let dateString = "\(parts[parts.count - 2])_\(parts[parts.count - 1])"
             let recordedAt = filenameDateFormatter.date(from: dateString)
@@ -186,17 +234,46 @@ final class RecordingManager: ObservableObject {
     func startRecording(target: String, channelName: String?, quality: String = "best") -> Bool {
         errorMessage = nil
 
+        if !LicenseManager.shared.canUseRecording {
+            let message = "No license detected. Email j.christophe@devjc.net for a Pro license key."
+            errorMessage = message
+            GlitchoTelemetry.track("recording_start_blocked_unlicensed")
+            return false
+        }
+
         let resolvedChannelLogin = channelLogin(from: target)
         if let resolvedChannelLogin,
            isRecordingInBackgroundAgent(channelLogin: resolvedChannelLogin) {
-            errorMessage = "This channel is already being recorded by the background recorder."
+            let message = "This channel is already being recorded by the background recorder."
+            errorMessage = message
+            recorderOrchestrator.setError(for: resolvedChannelLogin, errorMessage: message)
+            GlitchoTelemetry.track(
+                "recording_start_blocked_background_active",
+                metadata: ["login": resolvedChannelLogin]
+            )
             return false
         }
         let sessionKey = recordingKey(target: target, channelLogin: resolvedChannelLogin)
         guard recordingSessions[sessionKey] == nil else { return false }
 
+        if let resolvedChannelLogin,
+           maybeQueueRecordingRequest(
+               login: resolvedChannelLogin,
+               target: target,
+               channelName: channelName,
+               quality: quality
+           ) {
+            return true
+        }
+
         guard let streamlinkPath = resolveStreamlinkPath() else {
-            errorMessage = "Streamlink is not installed. Use Settings > Recording to download it or set a custom path."
+            let message = "Streamlink is not installed. Use Settings > Recording to download it or set a custom path."
+            errorMessage = message
+            recorderOrchestrator.setError(for: resolvedChannelLogin, errorMessage: message)
+            GlitchoTelemetry.track(
+                "recording_start_failed_streamlink_missing",
+                metadata: ["login": resolvedChannelLogin ?? "unknown"]
+            )
             return false
         }
 
@@ -204,7 +281,16 @@ final class RecordingManager: ObservableObject {
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         } catch {
-            errorMessage = "Unable to create recordings folder: \(error.localizedDescription)"
+            let message = "Unable to create recordings folder: \(error.localizedDescription)"
+            errorMessage = message
+            recorderOrchestrator.setError(for: resolvedChannelLogin, errorMessage: message)
+            GlitchoTelemetry.track(
+                "recording_start_failed_directory",
+                metadata: [
+                    "login": resolvedChannelLogin ?? "unknown",
+                    "error": error.localizedDescription
+                ]
+            )
             return false
         }
 
@@ -232,19 +318,71 @@ final class RecordingManager: ObservableObject {
         ]
 
         let errorPipe = Pipe()
-        process.standardError = errorPipe
+        let stderrLogURL = outputURL
+            .deletingPathExtension()
+            .appendingPathExtension("stderr.log")
+        let stderrFileDescriptor: Int32? = {
+            if FileManager.default.createFile(atPath: stderrLogURL.path, contents: nil),
+               let fileHandle = try? FileHandle(forWritingTo: stderrLogURL) {
+                process.standardError = fileHandle
+                return fileHandle.fileDescriptor
+            }
+            process.standardError = errorPipe
+            return nil
+        }()
 
         process.terminationHandler = { [weak self] proc in
+            if let fileDescriptor = stderrFileDescriptor {
+                _ = Darwin.close(fileDescriptor)
+            }
+
             Task { @MainActor in
                 guard let self else { return }
                 guard let session = self.recordingSessions.removeValue(forKey: sessionKey) else { return }
                 self.syncPublishedRecordingState()
 
                 let didUserStop = session.userInitiatedStop
+                var failureMessage: String?
                 if proc.terminationStatus != 0 && !didUserStop {
-                    let data = errorPipe.fileHandleForReading.readDataToEndOfFile()
-                    let message = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
-                    self.errorMessage = message?.isEmpty == false ? message : "Recording stopped unexpectedly."
+                    let data: Data
+                    if stderrFileDescriptor != nil,
+                       let fileData = try? Data(contentsOf: stderrLogURL) {
+                        data = fileData
+                    } else {
+                        data = errorPipe.fileHandleForReading.readDataToEndOfFile()
+                    }
+                    let message = String(data: data, encoding: .utf8)?
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    let resolvedMessage = message?.isEmpty == false ? message : "Recording stopped unexpectedly."
+                    self.errorMessage = resolvedMessage
+                    failureMessage = resolvedMessage
+                }
+
+                try? FileManager.default.removeItem(at: stderrLogURL)
+
+                if let login = session.login {
+                    if didUserStop || proc.terminationStatus == 0 {
+                        self.recorderOrchestrator.setIdle(for: login)
+                        GlitchoTelemetry.track(
+                            "recording_stopped",
+                            metadata: [
+                                "login": login,
+                                "status": "\(proc.terminationStatus)",
+                                "user_initiated": didUserStop ? "true" : "false"
+                            ]
+                        )
+                    } else {
+                        self.recorderOrchestrator.setError(for: login, errorMessage: failureMessage)
+                        _ = self.recorderOrchestrator.scheduleRetry(for: login, errorMessage: failureMessage)
+                        GlitchoTelemetry.track(
+                            "recording_failed_retry_scheduled",
+                            metadata: [
+                                "login": login,
+                                "status": "\(proc.terminationStatus)",
+                                "error": failureMessage ?? "unknown"
+                            ]
+                        )
+                    }
                 }
 
                 // Streamlink outputs MPEG-TS data even when the filename ends with .mp4.
@@ -253,11 +391,22 @@ final class RecordingManager: ObservableObject {
                 if shouldAttemptFinalize {
                     Task {
                         _ = try? await self.prepareRecordingForPlayback(at: session.outputURL)
+                        self.encryptCompletedRecording(
+                            at: session.outputURL,
+                            channelName: session.channelName,
+                            quality: session.quality
+                        )
                     }
                 }
+
+                _ = self.enforceRetentionPoliciesNow()
+                self.processQueuedRecordingsIfPossible()
             }
         }
 
+        if let resolvedChannelLogin {
+            recorderOrchestrator.setQueued(for: resolvedChannelLogin)
+        }
         recordingSessions[sessionKey] = RecordingSession(
             key: sessionKey,
             target: resolvedRecordingTarget,
@@ -273,21 +422,42 @@ final class RecordingManager: ObservableObject {
 
         do {
             try process.run()
+            if let resolvedChannelLogin {
+                recorderOrchestrator.setRecording(for: resolvedChannelLogin)
+                GlitchoTelemetry.track(
+                    "recording_started",
+                    metadata: ["login": resolvedChannelLogin, "quality": quality]
+                )
+            }
             return true
         } catch {
             recordingSessions.removeValue(forKey: sessionKey)
             syncPublishedRecordingState()
-            errorMessage = "Failed to start recording: \(error.localizedDescription)"
+            let message = "Failed to start recording: \(error.localizedDescription)"
+            errorMessage = message
+            recorderOrchestrator.setError(for: resolvedChannelLogin, errorMessage: message)
+            _ = recorderOrchestrator.scheduleRetry(for: resolvedChannelLogin, errorMessage: message)
+            GlitchoTelemetry.track(
+                "recording_start_failed_launch",
+                metadata: [
+                    "login": resolvedChannelLogin ?? "unknown",
+                    "error": error.localizedDescription
+                ]
+            )
             return false
         }
     }
 
     func stopRecording(channelLogin: String) {
         guard let normalized = normalizedChannelLogin(channelLogin) else { return }
+        if cancelQueuedRecording(login: normalized) {
+            return
+        }
         stopRecording(forKey: loginKey(for: normalized))
     }
 
     func stopRecording() {
+        clearQueuedRecordings()
         for key in Array(recordingSessions.keys) {
             stopRecording(forKey: key)
         }
@@ -316,6 +486,10 @@ final class RecordingManager: ObservableObject {
         !recordingSessions.isEmpty || !backgroundRecordingLogins.isEmpty
     }
 
+    func refreshBackgroundRecordingStateNow() {
+        refreshBackgroundRecordingState()
+    }
+
     func recordingCountIncludingBackground() -> Int {
         let localLogins = Set(recordingSessions.values.compactMap { normalizedChannelLogin($0.login) })
         let localWithoutLoginCount = recordingSessions.values.filter { normalizedChannelLogin($0.login) == nil }.count
@@ -333,13 +507,235 @@ final class RecordingManager: ObservableObject {
         resolveStreamlinkPath()
     }
 
+    private func encryptCompletedRecording(at url: URL, channelName: String?, quality: String) {
+        let directory = recordingsDirectory()
+        let mgr = effectiveEncryptionManager
+
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+
+        do {
+            let result = try mgr.encryptFile(
+                at: url,
+                in: directory,
+                channelName: channelName,
+                quality: quality
+            )
+
+            var manifest = (try? mgr.loadManifest(from: directory)) ?? [:]
+            manifest[result.hashFilename] = result.entry
+            try mgr.saveManifest(manifest, to: directory)
+        } catch {
+            // If encryption fails, the original MP4 is preserved.
+        }
+    }
+
     private func stopRecording(forKey key: String) {
         guard var session = recordingSessions[key] else { return }
         if !session.userInitiatedStop {
             session.userInitiatedStop = true
             recordingSessions[key] = session
         }
+        recorderOrchestrator.setStopping(for: session.login)
+        GlitchoTelemetry.track(
+            "recording_stop_requested",
+            metadata: ["login": session.login ?? "unknown"]
+        )
         session.process.terminate()
+    }
+
+    private func configuredConcurrencyLimit() -> Int {
+        let raw = UserDefaults.standard.integer(forKey: "recordingConcurrencyLimit")
+        if raw <= 0 {
+            return 2
+        }
+        return min(max(raw, 1), 12)
+    }
+
+    private func syncOrchestratorConcurrencyLimit() {
+        recorderOrchestrator.maxConcurrentRecordings = configuredConcurrencyLimit()
+    }
+
+    private func maybeQueueRecordingRequest(
+        login: String,
+        target: String,
+        channelName: String?,
+        quality: String
+    ) -> Bool {
+        syncOrchestratorConcurrencyLimit()
+
+        if queuedRecordingRequestsByLogin[login] != nil {
+            // Keep queued requests idempotent while waiting for capacity.
+            if activeRecordingCount < recorderOrchestrator.maxConcurrentRecordings {
+                queuedRecordingRequestsByLogin.removeValue(forKey: login)
+                recorderOrchestrator.removeFromQueue(login: login)
+                return false
+            }
+            return true
+        }
+
+        guard activeRecordingCount >= recorderOrchestrator.maxConcurrentRecordings else {
+            return false
+        }
+
+        queuedRecordingRequestsByLogin[login] = QueuedRecordingRequest(
+            target: target,
+            channelName: channelName,
+            quality: quality
+        )
+        recorderOrchestrator.setQueued(for: login)
+        GlitchoTelemetry.track(
+            "recording_queued_concurrency_limit",
+            metadata: [
+                "login": login,
+                "limit": "\(recorderOrchestrator.maxConcurrentRecordings)"
+            ]
+        )
+        return true
+    }
+
+    private func cancelQueuedRecording(login: String) -> Bool {
+        guard queuedRecordingRequestsByLogin.removeValue(forKey: login) != nil else {
+            return false
+        }
+        recorderOrchestrator.removeFromQueue(login: login)
+        recorderOrchestrator.setIdle(for: login)
+        GlitchoTelemetry.track(
+            "recording_queue_canceled",
+            metadata: ["login": login]
+        )
+        return true
+    }
+
+    private func processQueuedRecordingsIfPossible() {
+        syncOrchestratorConcurrencyLimit()
+        guard activeRecordingCount < recorderOrchestrator.maxConcurrentRecordings else { return }
+
+        while activeRecordingCount < recorderOrchestrator.maxConcurrentRecordings {
+            guard let login = recorderOrchestrator.dequeueNextQueuedLogin() else { break }
+            guard let request = queuedRecordingRequestsByLogin.removeValue(forKey: login) else {
+                recorderOrchestrator.setIdle(for: login)
+                continue
+            }
+
+            GlitchoTelemetry.track(
+                "recording_queue_dequeued",
+                metadata: ["login": login]
+            )
+            _ = startRecording(
+                target: request.target,
+                channelName: request.channelName,
+                quality: request.quality
+            )
+        }
+    }
+
+    private func clearQueuedRecordings() {
+        let queuedLogins = Array(queuedRecordingRequestsByLogin.keys)
+        guard !queuedLogins.isEmpty else { return }
+
+        for login in queuedLogins {
+            recorderOrchestrator.removeFromQueue(login: login)
+            recorderOrchestrator.setIdle(for: login)
+        }
+        queuedRecordingRequestsByLogin.removeAll()
+        GlitchoTelemetry.track(
+            "recording_queue_cleared",
+            metadata: ["count": "\(queuedLogins.count)"]
+        )
+    }
+
+    private func retentionMaxAgeDays() -> Int {
+        max(0, UserDefaults.standard.integer(forKey: "recordingsRetentionMaxAgeDays"))
+    }
+
+    private func retentionKeepLastGlobal() -> Int {
+        max(0, UserDefaults.standard.integer(forKey: "recordingsRetentionKeepLastGlobal"))
+    }
+
+    private func retentionKeepLastPerChannel() -> Int {
+        max(0, UserDefaults.standard.integer(forKey: "recordingsRetentionKeepLastPerChannel"))
+    }
+
+    func enforceRetentionPoliciesNow() -> RetentionResult {
+        let maxAgeDays = retentionMaxAgeDays()
+        let keepGlobal = retentionKeepLastGlobal()
+        let keepPerChannel = retentionKeepLastPerChannel()
+
+        if maxAgeDays == 0, keepGlobal == 0, keepPerChannel == 0 {
+            return RetentionResult(deletedCount: 0, failedCount: 0)
+        }
+
+        let entries = listRecordings()
+        guard !entries.isEmpty else {
+            return RetentionResult(deletedCount: 0, failedCount: 0)
+        }
+
+        var toDelete = Set<URL>()
+
+        if maxAgeDays > 0 {
+            let threshold = Date().addingTimeInterval(-Double(maxAgeDays) * 86_400)
+            for entry in entries {
+                guard let recordedAt = entry.recordedAt else { continue }
+                if recordedAt < threshold {
+                    toDelete.insert(entry.url)
+                }
+            }
+        }
+
+        let newestFirst = entries.sorted { lhs, rhs in
+            switch (lhs.recordedAt, rhs.recordedAt) {
+            case let (l?, r?):
+                return l > r
+            case (.some, .none):
+                return true
+            case (.none, .some):
+                return false
+            case (.none, .none):
+                return lhs.url.lastPathComponent < rhs.url.lastPathComponent
+            }
+        }
+
+        if keepGlobal > 0, newestFirst.count > keepGlobal {
+            for entry in newestFirst.dropFirst(keepGlobal) {
+                toDelete.insert(entry.url)
+            }
+        }
+
+        if keepPerChannel > 0 {
+            let grouped = Dictionary(grouping: newestFirst, by: { $0.channelName })
+            for entriesForChannel in grouped.values where entriesForChannel.count > keepPerChannel {
+                for entry in entriesForChannel.dropFirst(keepPerChannel) {
+                    toDelete.insert(entry.url)
+                }
+            }
+        }
+
+        var deletedCount = 0
+        var failedCount = 0
+        for url in toDelete {
+            guard !isRecording(outputURL: url) else { continue }
+            do {
+                try deleteRecording(at: url)
+                deletedCount += 1
+            } catch {
+                failedCount += 1
+            }
+        }
+
+        if deletedCount > 0 || failedCount > 0 {
+            GlitchoTelemetry.track(
+                "recordings_retention_enforced",
+                metadata: [
+                    "deleted": "\(deletedCount)",
+                    "failed": "\(failedCount)",
+                    "max_age_days": "\(maxAgeDays)",
+                    "keep_global": "\(keepGlobal)",
+                    "keep_per_channel": "\(keepPerChannel)"
+                ]
+            )
+        }
+
+        return RetentionResult(deletedCount: deletedCount, failedCount: failedCount)
     }
 
     private func syncPublishedRecordingState() {
