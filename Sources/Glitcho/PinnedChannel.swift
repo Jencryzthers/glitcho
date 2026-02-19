@@ -54,8 +54,10 @@ struct PinnedChannel: Identifiable, Codable, Hashable {
     }
 }
 
+#if os(macOS)
 extension TwitchChannel {
     var login: String { id }
 }
+#endif
 
 #endif

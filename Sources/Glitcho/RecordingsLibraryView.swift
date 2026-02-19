@@ -44,7 +44,6 @@ private enum RecordingsSortColumn: String, CaseIterable {
 
 struct RecordingsLibraryView: View {
     @ObservedObject var recordingManager: RecordingManager
-    var isProLicensed: Bool = false
     @StateObject private var pipController = PictureInPictureController()
     @State private var recordings: [RecordingEntry] = []
     @State private var selectedRecording: RecordingEntry?
@@ -98,19 +97,19 @@ struct RecordingsLibraryView: View {
     }
 
     private var isMotionSmootheningActive: Bool {
-        isProLicensed && motionSmoothening120Enabled && motionCapability.supported
+        motionSmoothening120Enabled && motionCapability.supported
     }
 
     private var isUpscaler4KActive: Bool {
-        isProLicensed && videoUpscaler4KEnabled
+        videoUpscaler4KEnabled
     }
 
     private var isImageOptimizeActive: Bool {
-        isProLicensed && videoImageOptimizeEnabled
+        videoImageOptimizeEnabled
     }
 
     private var effectiveVideoAspectMode: VideoAspectCropMode {
-        isProLicensed ? videoAspectMode : .source
+        videoAspectMode
     }
 
     private var imageOptimizationConfiguration: ImageOptimizationConfiguration {
@@ -134,7 +133,6 @@ struct RecordingsLibraryView: View {
         .onAppear {
             refreshRecordings()
             refreshMotionCapability()
-            sanitizeProVideoModeState()
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification)) { _ in
             refreshMotionCapability()
@@ -145,9 +143,6 @@ struct RecordingsLibraryView: View {
         .onReceive(NotificationCenter.default.publisher(for: .motionInterpolationRuntimeUpdated)) { notification in
             guard let status = notification.object as? MotionInterpolationRuntimeStatus else { return }
             motionRuntimeStatus = status
-        }
-        .onChange(of: isProLicensed) { _ in
-            sanitizeProVideoModeState()
         }
         .onChange(of: motionSmoothening120Enabled) { enabled in
             if enabled {
@@ -579,35 +574,29 @@ struct RecordingsLibraryView: View {
 
             Divider()
 
-            if isProLicensed {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Pro Video")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Pro Video")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
 
-                    Picker("Crop mode", selection: $videoAspectModeRaw) {
-                        ForEach(VideoAspectCropMode.allCases, id: \.self) { mode in
-                            Text(mode.label).tag(mode.rawValue)
-                        }
-                    }
-                    .pickerStyle(.menu)
-
-                    Toggle("Motion smoothening", isOn: $motionSmoothening120Enabled)
-                        .disabled(!motionCapability.supported)
-                    Toggle("4K upscaler", isOn: $videoUpscaler4KEnabled)
-                    Toggle("Image optimize", isOn: $videoImageOptimizeEnabled)
-
-                    if !motionCapability.supported {
-                        Text(motionCapability.reason)
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundStyle(.orange.opacity(0.9))
-                            .fixedSize(horizontal: false, vertical: true)
+                Picker("Crop mode", selection: $videoAspectModeRaw) {
+                    ForEach(VideoAspectCropMode.allCases, id: \.self) { mode in
+                        Text(mode.label).tag(mode.rawValue)
                     }
                 }
-            } else {
-                Text("Pro enhancements are available after license activation.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
+                .pickerStyle(.menu)
+
+                Toggle("Motion smoothening", isOn: $motionSmoothening120Enabled)
+                    .disabled(!motionCapability.supported)
+                Toggle("4K upscaler", isOn: $videoUpscaler4KEnabled)
+                Toggle("Image optimize", isOn: $videoImageOptimizeEnabled)
+
+                if !motionCapability.supported {
+                    Text(motionCapability.reason)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.orange.opacity(0.9))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
         }
         .padding(14)
@@ -626,21 +615,6 @@ struct RecordingsLibraryView: View {
         }
     }
 
-    private func sanitizeProVideoModeState() {
-        guard !isProLicensed else { return }
-        if motionSmoothening120Enabled {
-            motionSmoothening120Enabled = false
-        }
-        if videoUpscaler4KEnabled {
-            videoUpscaler4KEnabled = false
-        }
-        if videoImageOptimizeEnabled {
-            videoImageOptimizeEnabled = false
-        }
-        if videoAspectModeRaw != VideoAspectCropMode.source.rawValue {
-            videoAspectModeRaw = VideoAspectCropMode.source.rawValue
-        }
-    }
 
     @ViewBuilder
     private func recordingMotionFPSBadge(_ status: MotionInterpolationRuntimeStatus) -> some View {

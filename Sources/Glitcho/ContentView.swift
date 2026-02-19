@@ -14,17 +14,33 @@ private struct AutoRecordRetryState {
     let nextAttemptAt: Date
 }
 
+private struct PendingManualRecordingAction {
+    let login: String
+    let displayName: String
+    let action: ManualRecordingControlAction
+}
+
 struct ContentView: View {
     @StateObject private var store = WebViewStore(url: URL(string: "https://www.twitch.tv")!)
     @StateObject private var recordingManager = RecordingManager()
     @StateObject private var backgroundAgentManager = BackgroundRecorderAgentManager()
+    @StateObject private var companionAPIServer = CompanionAPIServer()
     @EnvironmentObject private var updateChecker: UpdateChecker
     @Environment(\.notificationManager) private var notificationManager
+    @Environment(\.openURL) private var openURL
     @AppStorage("pinnedChannels") private var pinnedChannelsJSON: String = "[]"
     @AppStorage("liveAlertsEnabled") private var liveAlertsEnabled = true
     @AppStorage("liveAlertsPinnedOnly") private var liveAlertsPinnedOnly = false
     @AppStorage("autoRecordOnLive") private var autoRecordOnLive = false
     @AppStorage("autoRecordPinnedOnly") private var autoRecordPinnedOnly = false
+    @AppStorage("autoRecordMode") private var autoRecordModeRaw = AutoRecordMode.pinnedAndFollowed.rawValue
+    @AppStorage("autoRecordSelectedChannels") private var autoRecordSelectedChannelsJSON = "[]"
+    @AppStorage("autoRecordBlockedChannels") private var autoRecordBlockedChannelsJSON = "[]"
+    @AppStorage("autoRecordDebounceSeconds") private var autoRecordDebounceSeconds = 1
+    @AppStorage("autoRecordCooldownSeconds") private var autoRecordCooldownSeconds = 30
+    @AppStorage("companionAPIEnabled") private var companionAPIEnabled = true
+    @AppStorage("companionAPIPort") private var companionAPIPort = 44555
+    @AppStorage("companionAPIToken") private var companionAPIToken = ""
     @AppStorage("recordingsDirectory") private var recordingsDirectorySetting = ""
     @AppStorage("streamlinkPath") private var streamlinkPathSetting = ""
     @State private var pinnedChannels: [PinnedChannel] = []
@@ -33,6 +49,7 @@ struct ContentView: View {
     @State private var hasSeenInitialLiveList = false
     @State private var autoRecordedLogins: Set<String> = []
     @State private var autoRecordRetryState: [String: AutoRecordRetryState] = [:]
+    @State private var autoRecordLastAttemptAt: [String: Date] = [:]
     @State private var autoRecordSuppressedLogins: Set<String> = []
     @State private var pendingRecoveryIntents: [String: RecordingManager.RecoveryIntent] = [:]
     @State private var hasLoadedRecoveryIntents = false
@@ -48,188 +65,20 @@ struct ContentView: View {
     @State private var showLoadingOverlay = true
     @State private var toastMessage: String? = nil
     @State private var toastIcon: String = "pin.slash"
+    @State private var pendingManualRecordingAction: PendingManualRecordingAction?
     private let pinnedLimit = 8
     private let autoRecordEvaluationTimer = Timer.publish(every: 20, on: .main, in: .common).autoconnect()
     @State private var pendingSyncWork: DispatchWorkItem?
+    @State private var pendingFollowedLiveWork: DispatchWorkItem?
 
     var body: some View {
         ZStack {
-            Color(red: 0.05, green: 0.05, blue: 0.07)
-                .ignoresSafeArea()
-
-            NavigationSplitView(columnVisibility: $columnVisibility) {
-                Sidebar(
-                    searchText: $searchText,
-                    store: store,
-                    recordingManager: recordingManager,
-                    pinnedChannels: $pinnedChannels,
-                    pinnedLimit: pinnedLimit,
-                    liveAlertsEnabled: $liveAlertsEnabled,
-                    onTogglePin: { channel in
-                        togglePinned(channel: channel)
-                    },
-                    onTogglePinNotifications: { pin in
-                        togglePinnedNotifications(pin)
-                    },
-                    onAddPin: { input in
-                        addPinned(fromInput: input)
-                    },
-                    onRemovePin: { pin in
-                        removePinned(pin: pin)
-                    },
-                    onNavigate: { url in
-                        detailMode = .web
-                        store.navigate(to: url)
-                    },
-                    onChannelSelected: { channelName in
-                        playbackRequest = NativePlaybackRequest(kind: .liveChannel, streamlinkTarget: "twitch.tv/\(channelName)", channelName: channelName)
-                        detailMode = .native
-                    },
-                    onShowRecordings: {
-                        detailMode = .recordings
-                    },
-                    onShowSettings: {
-                        detailMode = .settings
-                    },
-                    onPinLimitReached: {
-                        showToast(message: "You've reached the limit of \(pinnedLimit) favorites! 💜", icon: "heart.fill")
-                    }
-                )
-        .navigationSplitViewColumnWidth(295)
-            } detail: {
-                Group {
-                    switch detailMode {
-                    case .native:
-                        HybridTwitchView(
-                            playback: $playbackRequest,
-                            recordingManager: recordingManager,
-                            onOpenSubscription: { channel in
-                                subscriptionChannel = channel
-                                showSubscriptionPopup = true
-                            },
-                            onOpenGiftSub: { channel in
-                                giftChannel = channel
-                                showGiftPopup = true
-                            },
-                            onFollowChannel: { channel in
-                                store.followChannel(login: channel)
-                            },
-                            followedChannels: store.followedLive,
-                            notificationEnabled: currentNotificationEnabled(),
-                            onNotificationToggle: { enabled in
-                                guard let login = playbackRequest.channelName else { return }
-                                handleChannelNotificationToggle(ChannelNotificationToggle(login: login, enabled: enabled))
-                            },
-                            onRecordRequest: {
-                                guard playbackRequest.kind == .liveChannel else { return }
-                                guard let login = playbackRequest.channelName?.lowercased() else { return }
-
-                                if recordingManager.isRecordingInBackgroundAgent(channelLogin: login) {
-                                    // Stop manual recording via background agent
-                                    backgroundAgentManager.removeManualRecording(login: login)
-                                    scheduleSyncBackgroundRecordingAgent()
-                                    autoRecordSuppressedLogins.insert(login)
-                                    autoRecordRetryState.removeValue(forKey: login)
-                                } else {
-                                    // Start manual recording via background agent
-                                    let displayName = playbackRequest.channelName ?? login
-                                    backgroundAgentManager.addManualRecording(login: login, displayName: displayName)
-                                    scheduleSyncBackgroundRecordingAgent()
-                                    autoRecordSuppressedLogins.remove(login)
-                                    autoRecordRetryState.removeValue(forKey: login)
-                                }
-                            }
-                        )
-                    case .recordings:
-                        RecordingsLibraryView(recordingManager: recordingManager)
-                    case .settings:
-                        SettingsDetailView(
-                            recordingManager: recordingManager,
-                            backgroundAgentManager: backgroundAgentManager,
-                            onOpenTwitchSettings: {
-                                detailMode = .web
-                                store.navigate(to: URL(string: "https://www.twitch.tv/settings")!)
-                            }
-                        )
-                        .environment(\.notificationManager, notificationManager)
-                    case .web:
-                        WebViewContainer(webView: store.webView)
-                    }
-                }
-                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                .padding(12)
-            }
-            .navigationSplitViewStyle(.prominentDetail)
-            .onChange(of: store.shouldSwitchToNativePlayback) { request in
-                if let request {
-                    if detailMode == .native, playbackRequest == request {
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                            store.shouldSwitchToNativePlayback = nil
-                        }
-                        return
-                    }
-                    store.prepareWebViewForNativePlayer()
-                    playbackRequest = request
-                    detailMode = .native
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                        store.shouldSwitchToNativePlayback = nil
-                    }
-                }
-            }
-            .navigationSplitViewColumnWidth(min: 300, ideal: 320, max: 340)
-
-            if showSubscriptionPopup, let channel = subscriptionChannel {
-                PopupPanel(
-                    title: "Subscribe",
-                    width: 760,
-                    height: 700,
-                    url: URL(string: "https://www.twitch.tv/subs/\(channel)")!,
-                    onLoadScript: subscriptionPopupScript
-                ) {
-                    showSubscriptionPopup = false
-                }
-                .zIndex(3)
-            }
-
-            if showGiftPopup, let channel = giftChannel {
-                PopupPanel(
-                    title: "Gift a Sub",
-                    width: 760,
-                    height: 700,
-                    url: URL(string: "https://www.twitch.tv/subs/\(channel)?gift=1")!,
-                    onLoadScript: subscriptionPopupScript
-                ) {
-                    showGiftPopup = false
-                }
-                .zIndex(4)
-            }
-
-            if updateChecker.isPromptVisible, let update = updateChecker.update {
-                UpdatePromptView(update: update) {
-                    updateChecker.dismissPrompt()
-                }
-                .zIndex(5)
-            }
-
-            if updateChecker.isStatusVisible, let status = updateChecker.status {
-                UpdateStatusView(status: status) {
-                    updateChecker.dismissStatus()
-                }
-                .zIndex(6)
-            }
-
-            if showLoadingOverlay {
-                LoadingOverlay()
-                    .zIndex(100)
-                    .transition(.opacity)
-            }
-
-            // Toast notification
-            if let message = toastMessage {
-                ToastView(message: message, icon: toastIcon)
-                    .transition(.move(edge: .top).combined(with: .opacity))
-                    .zIndex(200)
-            }
+            backgroundLayer
+            splitView
+            popupPanels
+            updateOverlays
+            loadingOverlay
+            toastOverlay
         }
         .task {
             await updateChecker.checkForUpdates()
@@ -247,8 +96,12 @@ struct ContentView: View {
         .task {
             loadRecoveryIntentsIfNeeded()
         }
-    .task {
+        .task {
             scheduleSyncBackgroundRecordingAgent()
+        }
+        .task {
+            syncCompanionAPIServer()
+            fetchMissingPinnedAvatars()
         }
         .onChange(of: pinnedChannels) { newValue in
             savePinnedChannels(newValue)
@@ -256,8 +109,7 @@ struct ContentView: View {
         }
         .onChange(of: store.followedLive) { newValue in
             refreshPinnedMetadata(using: newValue)
-            handleFollowedLiveChange(newValue)
-            scheduleSyncBackgroundRecordingAgent()
+            scheduleFollowedLiveEvaluation(newValue)
         }
         .onChange(of: store.followedChannelLogins) { _ in
             scheduleSyncBackgroundRecordingAgent()
@@ -280,8 +132,20 @@ struct ContentView: View {
         .onChange(of: autoRecordOnLive) { _ in
             scheduleSyncBackgroundRecordingAgent()
         }
-        .onChange(of: autoRecordPinnedOnly) { _ in
+        .onChange(of: autoRecordModeRaw) { _ in
             scheduleSyncBackgroundRecordingAgent()
+        }
+        .onChange(of: autoRecordSelectedChannelsJSON) { _ in
+            scheduleSyncBackgroundRecordingAgent()
+        }
+        .onChange(of: autoRecordBlockedChannelsJSON) { _ in
+            scheduleSyncBackgroundRecordingAgent()
+        }
+        .onChange(of: autoRecordDebounceSeconds) { _ in
+            scheduleFollowedLiveEvaluation(store.followedLive)
+        }
+        .onChange(of: autoRecordCooldownSeconds) { _ in
+            scheduleFollowedLiveEvaluation(store.followedLive)
         }
         .onChange(of: recordingsDirectorySetting) { _ in
             scheduleSyncBackgroundRecordingAgent()
@@ -292,6 +156,15 @@ struct ContentView: View {
         .onChange(of: store.isLoggedIn) { _ in
             scheduleSyncBackgroundRecordingAgent()
         }
+        .onChange(of: companionAPIEnabled) { _ in
+            syncCompanionAPIServer()
+        }
+        .onChange(of: companionAPIPort) { _ in
+            syncCompanionAPIServer()
+        }
+        .onChange(of: companionAPIToken) { _ in
+            syncCompanionAPIServer()
+        }
         .onChange(of: playbackRequest) { _ in
             updateChannelBellStateIfNeeded()
         }
@@ -299,6 +172,246 @@ struct ContentView: View {
             guard store.isLoggedIn, autoRecordOnLive || !pendingRecoveryIntents.isEmpty else { return }
             handleFollowedLiveChange(store.followedLive)
         }
+        .confirmationDialog(
+            pendingManualRecordingAction?.action.confirmationTitle ?? "Recording Action",
+            isPresented: Binding(
+                get: { pendingManualRecordingAction != nil },
+                set: { isPresented in
+                    if !isPresented {
+                        pendingManualRecordingAction = nil
+                    }
+                }
+            ),
+            titleVisibility: .visible
+        ) {
+            if let pendingAction = pendingManualRecordingAction {
+                Button(
+                    pendingAction.action.confirmationButtonTitle,
+                    role: pendingAction.action == .stop ? .destructive : nil
+                ) {
+                    applyManualRecordingAction(pendingAction)
+                    pendingManualRecordingAction = nil
+                }
+            }
+            Button("Cancel", role: .cancel) {
+                pendingManualRecordingAction = nil
+            }
+        } message: {
+            if let pendingAction = pendingManualRecordingAction {
+                let verb = pendingAction.action == .stop ? "stop" : "start"
+                Text("Do you want to \(verb) manual recording for \(pendingAction.displayName)?")
+            }
+        }
+    }
+
+    private var backgroundLayer: some View {
+        Color(red: 0.05, green: 0.05, blue: 0.07)
+            .ignoresSafeArea()
+    }
+
+    private var loadingOverlay: some View {
+        Group {
+            if showLoadingOverlay {
+                LoadingOverlay()
+                    .zIndex(100)
+                    .transition(.opacity)
+            }
+        }
+    }
+
+    private var toastOverlay: some View {
+        Group {
+            if let message = toastMessage {
+                ToastView(message: message, icon: toastIcon)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                    .zIndex(200)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var popupPanels: some View {
+        if showSubscriptionPopup, let channel = subscriptionChannel {
+            PopupPanel(
+                title: "Subscribe",
+                width: 760,
+                height: 700,
+                url: URL(string: "https://www.twitch.tv/subs/\(channel)")!,
+                onLoadScript: subscriptionPopupScript
+            ) {
+                showSubscriptionPopup = false
+            }
+            .zIndex(3)
+        }
+
+        if showGiftPopup, let channel = giftChannel {
+            PopupPanel(
+                title: "Gift a Sub",
+                width: 760,
+                height: 700,
+                url: URL(string: "https://www.twitch.tv/subs/\(channel)?gift=1")!,
+                onLoadScript: subscriptionPopupScript
+            ) {
+                showGiftPopup = false
+            }
+            .zIndex(4)
+        }
+
+    }
+
+    @ViewBuilder
+    private var updateOverlays: some View {
+        if updateChecker.isPromptVisible, let update = updateChecker.update {
+            UpdatePromptView(update: update) {
+                updateChecker.dismissPrompt()
+            }
+            .zIndex(5)
+        }
+
+        if updateChecker.isStatusVisible, let status = updateChecker.status {
+            UpdateStatusView(status: status) {
+                updateChecker.dismissStatus()
+            }
+            .zIndex(6)
+        }
+    }
+
+    private var splitView: some View {
+        let recordingAllowlist = loadAutoRecordSelectedChannels()
+        let recordingBlocklist = loadAutoRecordBlockedChannels()
+        return NavigationSplitView(columnVisibility: $columnVisibility) {
+            Sidebar(
+                searchText: $searchText,
+                store: store,
+                recordingManager: recordingManager,
+                pinnedChannels: $pinnedChannels,
+                pinnedLimit: pinnedLimit,
+                liveAlertsEnabled: $liveAlertsEnabled,
+                onTogglePin: { channel in
+                    togglePinned(channel: channel)
+                },
+                onTogglePinNotifications: { pin in
+                    togglePinnedNotifications(pin)
+                },
+                onAddPin: { input in
+                    addPinned(fromInput: input)
+                },
+                onRemovePin: { pin in
+                    removePinned(pin: pin)
+                },
+                onNavigate: { url in
+                    detailMode = .web
+                    store.navigate(to: url)
+                },
+                onChannelSelected: { channelName in
+                    playbackRequest = NativePlaybackRequest(kind: .liveChannel, streamlinkTarget: "twitch.tv/\(channelName)", channelName: channelName)
+                    detailMode = .native
+                },
+                onShowRecordings: {
+                    detailMode = .recordings
+                },
+                onShowSettings: {
+                    detailMode = .settings
+                },
+                recordingAllowlist: recordingAllowlist,
+                recordingBlocklist: recordingBlocklist,
+                onSetRecordingAllowlisted: { login, isAllowlisted in
+                    setChannelRecordingAllowlisted(login, isAllowlisted: isAllowlisted)
+                },
+                onSetRecordingBlocked: { login, isBlocked in
+                    setChannelRecordingBlocked(login, isBlocked: isBlocked)
+                },
+                showRecordingsNavigation: true,
+                onPinLimitReached: {
+                    showToast(message: "You've reached the limit of \(pinnedLimit) favorites! 💜", icon: "heart.fill")
+                }
+            )
+            .navigationSplitViewColumnWidth(295)
+        } detail: {
+            detailContent
+        }
+        .navigationSplitViewStyle(.prominentDetail)
+        .onChange(of: store.shouldSwitchToNativePlayback) { request in
+            if let request {
+                if detailMode == .native, playbackRequest == request {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        store.shouldSwitchToNativePlayback = nil
+                    }
+                    return
+                }
+                store.prepareWebViewForNativePlayer()
+                playbackRequest = request
+                detailMode = .native
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    store.shouldSwitchToNativePlayback = nil
+                }
+            }
+        }
+        .navigationSplitViewColumnWidth(min: 300, ideal: 320, max: 340)
+    }
+
+    @ViewBuilder
+    private var detailContent: some View {
+        Group {
+            switch detailMode {
+            case .native:
+                HybridTwitchView(
+                    playback: $playbackRequest,
+                    recordingManager: recordingManager,
+                    onOpenSubscription: { channel in
+                        subscriptionChannel = channel
+                        showSubscriptionPopup = true
+                    },
+                    onOpenGiftSub: { channel in
+                        giftChannel = channel
+                        showGiftPopup = true
+                    },
+                    onFollowChannel: { channel in
+                        store.followChannel(login: channel)
+                    },
+                    followedChannels: store.followedLive,
+                    notificationEnabled: currentNotificationEnabled(),
+                    onNotificationToggle: { enabled in
+                        guard let login = playbackRequest.channelName else { return }
+                        handleChannelNotificationToggle(ChannelNotificationToggle(login: login, enabled: enabled))
+                    },
+                    showRecordingControl: shouldShowManualRecordingControl(),
+                    onRecordRequest: { action in
+                        guard playbackRequest.kind == .liveChannel else { return }
+                        guard let login = playbackRequest.channelName?.lowercased() else { return }
+                        let displayName = playbackRequest.channelName ?? login
+                        pendingManualRecordingAction = PendingManualRecordingAction(
+                            login: login,
+                            displayName: displayName,
+                            action: action
+                        )
+                    }
+                )
+            case .recordings:
+                RecordingsLibraryView(
+                    recordingManager: recordingManager
+                )
+            case .settings:
+                SettingsDetailView(
+                    recordingManager: recordingManager,
+                    backgroundAgentManager: backgroundAgentManager,
+                    store: store,
+                    companionAPIServer: companionAPIServer,
+                    onOpenTwitchSettings: {
+                        detailMode = .web
+                        store.navigate(to: URL(string: "https://www.twitch.tv/settings")!)
+                    },
+                    onActionFeedback: { message, icon in
+                        showToast(message: message, icon: icon)
+                    }
+                )
+                .environment(\.notificationManager, notificationManager)
+            case .web:
+                WebViewContainer(webView: store.webView)
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .padding(12)
     }
 
     private func showToast(message: String, icon: String = "info.circle.fill") {
@@ -311,6 +424,42 @@ struct ContentView: View {
                 toastMessage = nil
             }
         }
+    }
+
+    private func applyManualRecordingAction(_ pendingAction: PendingManualRecordingAction) {
+        switch pendingAction.action {
+        case .start:
+            startManualRecording(login: pendingAction.login, displayName: pendingAction.displayName)
+        case .stop:
+            stopManualRecording(login: pendingAction.login, displayName: pendingAction.displayName)
+        }
+    }
+
+    private func startManualRecording(login: String, displayName: String) {
+        backgroundAgentManager.addManualRecording(login: login, displayName: displayName)
+        scheduleSyncBackgroundRecordingAgent()
+        autoRecordSuppressedLogins.remove(login)
+        autoRecordRetryState.removeValue(forKey: login)
+        GlitchoTelemetry.track(
+            "manual_recording_start_requested",
+            metadata: ["login": login, "display_name": displayName]
+        )
+        showToast(message: "Started manual recording for \(displayName).", icon: "record.circle.fill")
+    }
+
+    private func stopManualRecording(login: String, displayName: String) {
+        if recordingManager.isRecording(channelLogin: login) {
+            recordingManager.stopRecording(channelLogin: login)
+        }
+        backgroundAgentManager.removeManualRecording(login: login)
+        scheduleSyncBackgroundRecordingAgent()
+        autoRecordSuppressedLogins.insert(login)
+        autoRecordRetryState.removeValue(forKey: login)
+        GlitchoTelemetry.track(
+            "manual_recording_stop_requested",
+            metadata: ["login": login, "display_name": displayName]
+        )
+        showToast(message: "Stopped manual recording for \(displayName).", icon: "stop.circle.fill")
     }
 
     private func loadPinnedChannelsIfNeeded() {
@@ -395,6 +544,92 @@ struct ContentView: View {
         if didChange {
             pinnedChannels = updated
         }
+        // Fetch avatars for pinned channels that have no thumbnail
+        fetchMissingPinnedAvatars()
+    }
+
+    private func fetchMissingPinnedAvatars() {
+        let missing = pinnedChannels.filter { $0.thumbnailURLString == nil || $0.thumbnailURLString?.isEmpty == true }
+        guard !missing.isEmpty else { return }
+        let logins = missing.map(\.login)
+        Task {
+            let avatars = await fetchTwitchAvatars(logins: logins)
+            guard !avatars.isEmpty else { return }
+            await MainActor.run {
+                var updated = self.pinnedChannels
+                var didChange = false
+                for index in updated.indices {
+                    if let url = avatars[updated[index].login], updated[index].thumbnailURLString == nil || updated[index].thumbnailURLString?.isEmpty == true {
+                        updated[index].thumbnailURLString = url
+                        didChange = true
+                    }
+                }
+                if didChange {
+                    self.pinnedChannels = updated
+                }
+            }
+        }
+    }
+
+    private func fetchTwitchAvatars(logins: [String]) async -> [String: String] {
+        let query = """
+        query($logins: [String!]) {
+          users(logins: $logins) {
+            login
+            profileImageURL(width: 70)
+          }
+        }
+        """
+        let variables: [String: Any] = ["logins": logins]
+        let body: [String: Any] = [
+            "query": query,
+            "variables": variables
+        ]
+        guard let jsonData = try? JSONSerialization.data(withJSONObject: body) else { return [:] }
+
+        var request = URLRequest(url: URL(string: "https://gql.twitch.tv/gql")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("kimne78kx3ncx6brgo4mv6wki5h1ko", forHTTPHeaderField: "Client-ID")
+
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let dataObj = json["data"] as? [String: Any],
+              let users = dataObj["users"] as? [[String: Any]?] else {
+            return [:]
+        }
+
+        var result: [String: String] = [:]
+        for userOpt in users {
+            guard let user = userOpt,
+                  let login = user["login"] as? String,
+                  let profileURL = user["profileImageURL"] as? String,
+                  !profileURL.isEmpty else { continue }
+            result[login.lowercased()] = profileURL
+        }
+        return result
+    }
+
+    private func autoRecordMode() -> AutoRecordMode {
+        if let mode = AutoRecordMode(rawValue: autoRecordModeRaw) {
+            return mode
+        }
+        return autoRecordPinnedOnly ? .onlyPinned : .pinnedAndFollowed
+    }
+
+    private func scheduleFollowedLiveEvaluation(_ liveChannels: [TwitchChannel]) {
+        pendingFollowedLiveWork?.cancel()
+        let snapshot = liveChannels
+        let work = DispatchWorkItem {
+            handleFollowedLiveChange(snapshot)
+            scheduleSyncBackgroundRecordingAgent()
+        }
+        pendingFollowedLiveWork = work
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + normalizedAutoRecordDebounceInterval(),
+            execute: work
+        )
     }
 
     private func handleFollowedLiveChange(_ liveChannels: [TwitchChannel]) {
@@ -403,6 +638,7 @@ struct ContentView: View {
             hasSeenInitialLiveList = false
             autoRecordedLogins = []
             autoRecordRetryState = [:]
+            autoRecordLastAttemptAt = [:]
             autoRecordSuppressedLogins = []
             return
         }
@@ -415,6 +651,7 @@ struct ContentView: View {
         let currentLogins = Set(liveChannels.map { $0.login.lowercased() })
         autoRecordSuppressedLogins.formIntersection(currentLogins)
         autoRecordRetryState = autoRecordRetryState.filter { currentLogins.contains($0.key) }
+        autoRecordLastAttemptAt = autoRecordLastAttemptAt.filter { currentLogins.contains($0.key) }
         autoRecordedLogins = Set(
             autoRecordedLogins.filter { login in
                 guard currentLogins.contains(login) else { return false }
@@ -431,6 +668,10 @@ struct ContentView: View {
 
         let channelMap = Dictionary(liveChannels.map { ($0.login.lowercased(), $0) }, uniquingKeysWith: { first, _ in first })
         let pinMap = Dictionary(pinnedChannels.map { ($0.login, $0) }, uniquingKeysWith: { first, _ in first })
+        let mode = autoRecordMode()
+        let selectedChannels = loadAutoRecordSelectedChannels()
+        let blockedChannels = loadAutoRecordBlockedChannels()
+        let followedLogins = Set(store.followedChannelLogins.map { $0.lowercased() }).union(currentLogins)
 
         if hasSeenInitialLiveList, liveAlertsEnabled, let notificationManager {
             for login in newlyLive {
@@ -452,7 +693,16 @@ struct ContentView: View {
         }
 
         // Recovery path: channels that were recording before restart/crash.
-        let recoveryCandidates = currentLogins.intersection(pendingRecoveryIntents.keys)
+        let recoveryCandidates = currentLogins.intersection(pendingRecoveryIntents.keys).filter { login in
+            isAutoRecordChannelAllowed(
+                login: login,
+                mode: mode,
+                pinMap: pinMap,
+                followedLogins: followedLogins,
+                selectedChannels: selectedChannels,
+                blockedChannels: blockedChannels
+            )
+        }
         for login in recoveryCandidates.sorted() {
             guard !isChannelAlreadyRecording(login) else {
                 pendingRecoveryIntents.removeValue(forKey: login)
@@ -468,6 +718,7 @@ struct ContentView: View {
             let channelName = channel?.name ?? intent?.channelName ?? login
             let quality = intent?.quality ?? "best"
 
+            registerAutoRecordAttempt(for: login, now: now)
             let started = recordingManager.startRecording(
                 target: target,
                 channelName: channelName,
@@ -501,10 +752,14 @@ struct ContentView: View {
         let eligibleLogins = autoRecordCandidates.filter { login in
             guard channelMap[login] != nil else { return false }
             guard !autoRecordSuppressedLogins.contains(login) else { return false }
-            if autoRecordPinnedOnly {
-                guard let pin = pinMap[login], pin.notifyEnabled else { return false }
-            }
-            return true
+            return isAutoRecordChannelAllowed(
+                login: login,
+                mode: mode,
+                pinMap: pinMap,
+                followedLogins: followedLogins,
+                selectedChannels: selectedChannels,
+                blockedChannels: blockedChannels
+            )
         }
 
         for targetLogin in eligibleLogins.sorted() {
@@ -516,6 +771,7 @@ struct ContentView: View {
             guard shouldAttemptAutoRecord(for: targetLogin, now: now) else { continue }
             guard let channel = channelMap[targetLogin] else { continue }
 
+            registerAutoRecordAttempt(for: targetLogin, now: now)
             let started = recordingManager.startRecording(
                 target: "twitch.tv/\(targetLogin)",
                 channelName: channel.name
@@ -560,8 +816,18 @@ struct ContentView: View {
     }
 
     private func shouldAttemptAutoRecord(for login: String, now: Date) -> Bool {
-        guard let retry = autoRecordRetryState[login] else { return true }
-        return now >= retry.nextAttemptAt
+        if let retry = autoRecordRetryState[login], now < retry.nextAttemptAt {
+            return false
+        }
+
+        let cooldown = normalizedAutoRecordCooldownInterval()
+        if cooldown > 0,
+           let lastAttemptAt = autoRecordLastAttemptAt[login],
+           now.timeIntervalSince(lastAttemptAt) < cooldown {
+            return false
+        }
+
+        return true
     }
 
     private func clearAutoRecordRetry(for login: String) {
@@ -578,23 +844,50 @@ struct ContentView: View {
         )
     }
 
+    private func registerAutoRecordAttempt(for login: String, now: Date) {
+        autoRecordLastAttemptAt[login] = now
+    }
+
+    private func normalizedAutoRecordDebounceInterval() -> TimeInterval {
+        TimeInterval(max(0, min(autoRecordDebounceSeconds, 20)))
+    }
+
+    private func normalizedAutoRecordCooldownInterval() -> TimeInterval {
+        TimeInterval(max(0, min(autoRecordCooldownSeconds, 600)))
+    }
+
+    private func syncCompanionAPIServer() {
+        companionAPIServer.configure(
+            enabled: companionAPIEnabled,
+            port: companionAPIPort,
+            token: companionAPIToken,
+            recordingManager: recordingManager
+        )
+    }
+
     private func scheduleSyncBackgroundRecordingAgent() {
         pendingSyncWork?.cancel()
         let work = DispatchWorkItem { [self] in
             let channels = backgroundAgentChannels()
             let streamlinkPath = recordingManager.streamlinkPathForBackgroundAgent()
             let recordingsDirectory = recordingManager.recordingsDirectory().path
+            let recordingEnabled = autoRecordOnLive
 
-            backgroundAgentManager.sync(
-                enabled: autoRecordOnLive,
-                channels: channels,
-                streamlinkPath: streamlinkPath,
-                recordingsDirectory: recordingsDirectory,
-                quality: "best"
-            )
+            DispatchQueue.global(qos: .utility).async {
+                backgroundAgentManager.sync(
+                    enabled: recordingEnabled,
+                    channels: channels,
+                    streamlinkPath: streamlinkPath,
+                    recordingsDirectory: recordingsDirectory,
+                    quality: "best"
+                )
+                DispatchQueue.main.async {
+                    recordingManager.refreshBackgroundRecordingStateNow()
+                }
+            }
         }
         pendingSyncWork = work
-        DispatchQueue.main.async(execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: work)
     }
 
     private func backgroundAgentChannels() -> [BackgroundRecorderAgentChannel] {
@@ -607,24 +900,32 @@ struct ContentView: View {
             uniquingKeysWith: { first, _ in first }
         )
 
-        var candidateLogins: Set<String>
-        if autoRecordPinnedOnly {
-            candidateLogins = Set(
-                pinnedChannels
-                    .filter { $0.notifyEnabled }
-                    .map { $0.login.lowercased() }
-            )
-        } else {
-            let followed = Set(store.followedChannelLogins.map { $0.lowercased() })
-            if !followed.isEmpty {
-                candidateLogins = followed
-            } else {
-                candidateLogins = Set(store.followedLive.map { $0.login.lowercased() })
-            }
+        let mode = autoRecordMode()
+        let selectedChannels = loadAutoRecordSelectedChannels()
+        let blockedChannels = loadAutoRecordBlockedChannels()
+        let followed = Set(store.followedChannelLogins.map { $0.lowercased() })
+        let fallbackFollowed = Set(store.followedLive.map { $0.login.lowercased() })
+        let effectiveFollowed = followed.isEmpty ? fallbackFollowed : followed
+        let pinnedEnabled = Set(
+            pinnedChannels
+                .filter { $0.notifyEnabled }
+                .map { $0.login.lowercased() }
+        )
 
-            // Keep pinned channels in the background set as a fallback when followed lists are stale.
-            candidateLogins.formUnion(pinnedChannels.map { $0.login.lowercased() })
+        var candidateLogins: Set<String>
+        switch mode {
+        case .onlyPinned:
+            candidateLogins = pinnedEnabled
+        case .onlyFollowed:
+            candidateLogins = effectiveFollowed
+        case .pinnedAndFollowed:
+            candidateLogins = effectiveFollowed.union(pinnedEnabled)
+        case .customAllowlist:
+            candidateLogins = selectedChannels
         }
+
+        candidateLogins.subtract(blockedChannels)
+        candidateLogins.subtract(autoRecordSuppressedLogins)
 
         return candidateLogins
             .sorted()
@@ -677,6 +978,10 @@ struct ContentView: View {
         return pin?.notifyEnabled ?? !liveAlertsPinnedOnly
     }
 
+    private func shouldShowManualRecordingControl() -> Bool {
+        return true
+    }
+
     private func decodePinnedChannels(from json: String) -> [PinnedChannel] {
         guard let data = json.data(using: .utf8) else { return [] }
         return (try? JSONDecoder().decode([PinnedChannel].self, from: data)) ?? []
@@ -687,6 +992,106 @@ struct ContentView: View {
         return String(decoding: data, as: UTF8.self)
     }
 
+    private func loadAutoRecordSelectedChannels() -> Set<String> {
+        guard let data = autoRecordSelectedChannelsJSON.data(using: .utf8),
+              let decoded = try? JSONDecoder().decode([String].self, from: data) else {
+            return []
+        }
+        return Set(decoded.map { $0.lowercased() })
+    }
+
+    private func loadAutoRecordBlockedChannels() -> Set<String> {
+        guard let data = autoRecordBlockedChannelsJSON.data(using: .utf8),
+              let decoded = try? JSONDecoder().decode([String].self, from: data) else {
+            return []
+        }
+        return Set(decoded.map { $0.lowercased() })
+    }
+
+    private func saveAutoRecordSelectedChannels(_ channels: Set<String>) {
+        let sorted = Array(channels.map { $0.lowercased() }).sorted()
+        if let data = try? JSONEncoder().encode(sorted),
+           let json = String(data: data, encoding: .utf8) {
+            autoRecordSelectedChannelsJSON = json
+        }
+    }
+
+    private func saveAutoRecordBlockedChannels(_ channels: Set<String>) {
+        let sorted = Array(channels.map { $0.lowercased() }).sorted()
+        if let data = try? JSONEncoder().encode(sorted),
+           let json = String(data: data, encoding: .utf8) {
+            autoRecordBlockedChannelsJSON = json
+        }
+    }
+
+    private func setChannelRecordingAllowlisted(_ login: String, isAllowlisted: Bool) {
+        let normalized = login.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty else { return }
+
+        var selected = loadAutoRecordSelectedChannels()
+        var blocked = loadAutoRecordBlockedChannels()
+
+        if isAllowlisted {
+            selected.insert(normalized)
+            blocked.remove(normalized)
+            showToast(message: "@\(normalized) added to recording allowlist.", icon: "checkmark.circle.fill")
+        } else {
+            selected.remove(normalized)
+            showToast(message: "@\(normalized) removed from recording allowlist.", icon: "minus.circle.fill")
+        }
+
+        saveAutoRecordSelectedChannels(selected)
+        saveAutoRecordBlockedChannels(blocked)
+    }
+
+    private func setChannelRecordingBlocked(_ login: String, isBlocked: Bool) {
+        let normalized = login.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty else { return }
+
+        var selected = loadAutoRecordSelectedChannels()
+        var blocked = loadAutoRecordBlockedChannels()
+
+        if isBlocked {
+            blocked.insert(normalized)
+            selected.remove(normalized)
+            showToast(message: "@\(normalized) blocked from recording.", icon: "hand.raised.fill")
+        } else {
+            blocked.remove(normalized)
+            showToast(message: "@\(normalized) unblocked for recording.", icon: "checkmark.circle.fill")
+        }
+
+        saveAutoRecordSelectedChannels(selected)
+        saveAutoRecordBlockedChannels(blocked)
+    }
+
+    private func isAutoRecordChannelAllowed(
+        login: String,
+        mode: AutoRecordMode,
+        pinMap: [String: PinnedChannel],
+        followedLogins: Set<String>,
+        selectedChannels: Set<String>,
+        blockedChannels: Set<String>
+    ) -> Bool {
+        if blockedChannels.contains(login) {
+            return false
+        }
+
+        switch mode {
+        case .onlyPinned:
+            guard let pin = pinMap[login] else { return false }
+            return pin.notifyEnabled
+        case .onlyFollowed:
+            return followedLogins.contains(login)
+        case .pinnedAndFollowed:
+            if let pin = pinMap[login], pin.notifyEnabled {
+                return true
+            }
+            return followedLogins.contains(login)
+        case .customAllowlist:
+            return selectedChannels.contains(login)
+        }
+    }
+    
     private func normalizeChannelLogin(_ raw: String) -> String? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
@@ -821,6 +1226,11 @@ struct Sidebar: View {
     var onChannelSelected: ((String) -> Void)?
     var onShowRecordings: (() -> Void)?
     var onShowSettings: (() -> Void)?
+    var recordingAllowlist: Set<String> = []
+    var recordingBlocklist: Set<String> = []
+    var onSetRecordingAllowlisted: ((String, Bool) -> Void)?
+    var onSetRecordingBlocked: ((String, Bool) -> Void)?
+    var showRecordingsNavigation: Bool = true
     var onPinLimitReached: (() -> Void)?
     @State private var isAddingPin = false
     @State private var newPinText = ""
@@ -954,11 +1364,13 @@ struct Sidebar: View {
                         }
                     }
 
-                    SidebarRow(
-                        title: "Recordings",
-                        systemImage: "record.circle"
-                    ) {
-                        onShowRecordings?()
+                    if showRecordingsNavigation {
+                        SidebarRow(
+                            title: "Recordings",
+                            systemImage: "record.circle"
+                        ) {
+                            onShowRecordings?()
+                        }
                     }
 
                     // Divider
@@ -1044,7 +1456,9 @@ struct Sidebar: View {
                         let liveByLogin = Dictionary(store.followedLive.map { ($0.login, $0) }, uniquingKeysWith: { first, _ in first })
                         ForEach(pinnedChannels) { pin in
                             let liveChannel = liveByLogin[pin.login]
-                            let isRecording = recordingManager.isRecordingAny(channelLogin: pin.login)
+                            let isRecording = liveChannel != nil && recordingManager.isRecordingAny(channelLogin: pin.login)
+                            let isAllowlisted = recordingAllowlist.contains(pin.login)
+                            let isBlocked = recordingBlocklist.contains(pin.login)
                             PinnedRow(
                                 channel: pin,
                                 liveChannel: liveChannel,
@@ -1057,7 +1471,15 @@ struct Sidebar: View {
                                     }
                                 },
                                 onRemove: { onRemovePin?(pin) },
-                                onToggleNotifications: { onTogglePinNotifications?(pin) }
+                                onToggleNotifications: { onTogglePinNotifications?(pin) },
+                                isRecordingAllowlisted: isAllowlisted,
+                                isRecordingBlocked: isBlocked,
+                                onToggleRecordingAllowlist: {
+                                    onSetRecordingAllowlisted?(pin.login, !isAllowlisted)
+                                },
+                                onToggleRecordingBlocklist: {
+                                    onSetRecordingBlocked?(pin.login, !isBlocked)
+                                }
                             )
                         }
                     }
@@ -1070,21 +1492,26 @@ struct Sidebar: View {
                         .padding(.horizontal, 12)
 
                     // Following section
-                    Text("Following (Live)")
+                    Text("FOLLOWING")
                         .font(.system(size: 10, weight: .bold))
                         .foregroundStyle(.white.opacity(0.35))
                         .tracking(1)
                         .padding(.horizontal, 12)
                         .padding(.bottom, 8)
 
+                    let liveLogins = Set(store.followedLive.map(\.login))
                     let nonPinnedLive = store.followedLive.filter { !pinnedLogins.contains($0.login) }
+                    let offlineLogins = store.followedChannelLogins
+                        .map { $0.lowercased() }
+                        .filter { !pinnedLogins.contains($0) && !liveLogins.contains($0) }
+                        .sorted()
 
-                    if nonPinnedLive.isEmpty {
+                    if nonPinnedLive.isEmpty && offlineLogins.isEmpty {
                         HStack(spacing: 8) {
                             Image(systemName: "heart")
                                 .font(.system(size: 11))
                                 .foregroundStyle(.white.opacity(0.3))
-                            Text("No live channels")
+                            Text("No followed channels")
                                 .font(.system(size: 12))
                                 .foregroundStyle(.white.opacity(0.4))
                         }
@@ -1092,6 +1519,8 @@ struct Sidebar: View {
                         .padding(.vertical, 8)
                     } else {
                         ForEach(nonPinnedLive) { channel in
+                            let isAllowlisted = recordingAllowlist.contains(channel.login)
+                            let isBlocked = recordingBlocklist.contains(channel.login)
                             FollowingRow(
                                 channel: channel,
                                 isRecording: recordingManager.isRecordingAny(channelLogin: channel.login)
@@ -1107,6 +1536,19 @@ struct Sidebar: View {
                                         onTogglePin?(channel)
                                     }
                                 }
+                                Divider()
+                                Button(isAllowlisted ? "Remove from recording allowlist" : "Add to recording allowlist") {
+                                    onSetRecordingAllowlisted?(channel.login, !isAllowlisted)
+                                }
+                                Button(isBlocked ? "Unblock from recording" : "Block from recording") {
+                                    onSetRecordingBlocked?(channel.login, !isBlocked)
+                                }
+                            }
+                        }
+
+                        ForEach(offlineLogins, id: \.self) { login in
+                            OfflineFollowingRow(login: login) {
+                                onChannelSelected?(login)
                             }
                         }
                     }
@@ -1357,6 +1799,47 @@ struct FollowingRow: View {
     }
 }
 
+struct OfflineFollowingRow: View {
+    let login: String
+    let action: () -> Void
+    @State private var isHovered = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                Circle()
+                    .fill(Color.white.opacity(0.08))
+                    .frame(width: 28, height: 28)
+                    .overlay(
+                        Text(String(login.prefix(1)).uppercased())
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.35))
+                    )
+
+                Text(login)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(isHovered ? .white.opacity(0.6) : .white.opacity(0.4))
+                    .lineLimit(1)
+
+                Spacer()
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(isHovered ? Color.white.opacity(0.05) : Color.clear)
+            )
+        }
+        .buttonStyle(.plain)
+        .contentShape(Rectangle())
+        .onHover { hovering in
+            withAnimation(.easeOut(duration: 0.12)) {
+                isHovered = hovering
+            }
+        }
+    }
+}
+
 struct PinnedRow: View {
     let channel: PinnedChannel
     let liveChannel: TwitchChannel?
@@ -1364,6 +1847,10 @@ struct PinnedRow: View {
     let onOpen: () -> Void
     let onRemove: () -> Void
     let onToggleNotifications: () -> Void
+    let isRecordingAllowlisted: Bool
+    let isRecordingBlocked: Bool
+    var onToggleRecordingAllowlist: (() -> Void)?
+    var onToggleRecordingBlocklist: (() -> Void)?
     @State private var isHovered = false
 
     private var displayName: String {
@@ -1452,6 +1939,23 @@ struct PinnedRow: View {
         }
         .contextMenu {
             Button(channel.notifyEnabled ? "Disable notifications" : "Enable notifications", action: onToggleNotifications)
+            if let onToggleRecordingAllowlist {
+                Button(
+                    isRecordingAllowlisted
+                        ? "Remove from recording allowlist"
+                        : "Add to recording allowlist",
+                    action: onToggleRecordingAllowlist
+                )
+            }
+            if let onToggleRecordingBlocklist {
+                Button(
+                    isRecordingBlocked
+                        ? "Unblock from recording"
+                        : "Block from recording",
+                    action: onToggleRecordingBlocklist
+                )
+            }
+            Divider()
             Button("Remove from Favorites", action: onRemove)
         }
     }

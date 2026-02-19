@@ -1,196 +1,109 @@
 # Codebase Structure
 
-**Analysis Date:** 2026-02-04
+**Analysis Date:** 2026-02-13
 
 ## Directory Layout
 
-```
+```text
 glitcho/
 ├── Sources/
-│   └── Glitcho/
-│       ├── App.swift                      # Entry point, window config, about view
-│       ├── ContentView.swift              # Main UI: sidebar + detail split, mode logic
-│       ├── WebViewStore.swift             # WKWebView + JavaScript injection + data extraction
-│       ├── StreamlinkPlayer.swift         # Streamlink process + AVPlayer wrapper
-│       ├── RecordingManager.swift         # Recording orchestration + file management
-│       ├── RecordingsLibraryView.swift    # Recordings browsing and playback UI
-│       ├── SettingsView.swift             # Settings UI and configuration
-│       ├── NotificationManager.swift      # macOS notification center integration
-│       ├── UpdateChecker.swift            # GitHub release checking
-│       ├── PictureInPictureController.swift # PiP support
-│       ├── StreamlinkRecorder.swift       # (Legacy/utility) recording helper
-│       ├── DetachedChatView.swift         # Floating chat window
-│       ├── WindowConfigurator.swift       # Window chrome customization
-│       ├── SidebarTint.swift              # Sidebar color theming
-│       ├── PinnedChannel.swift            # Data model for pinned channels
-│       ├── UpdatePromptView.swift         # Update notification UI
-│       ├── UpdateStatusView.swift         # Update progress/status UI
-│       ├── Environment+NotificationManager.swift  # Environment key injection
-│       ├── NonSwiftUIMain.swift           # (Legacy) non-SwiftUI entry point
-│       └── WebViewStore.swift             # (see above, large file)
-├── Tests/
-│   ├── GlitchoTests.swift
-│   ├── NativeVideoPlayerGestureTests.swift
-│   └── RecordingManagerTests.swift
-├── Resources/
-│   └── AppIcon.iconset/
-│       └── (icon files at various resolutions)
-├── Scripts/
-│   └── make_app.sh                       # Build script
-├── Build/
-│   └── Glitcho.app                       # Generated app bundle
-├── Package.swift                          # SPM manifest
-├── CHANGELOG.md
+│   ├── Glitcho/                        # main app target
+│   └── GlitchoRecorderAgent/           # helper executable target
+├── Tests/                              # Glitcho test target
+├── Scripts/                            # build + ops scripts
+├── deploy/license-server/              # Dockerized activation server
+├── docs/                               # user/dev documentation
+├── .planning/codebase/                 # architecture/stack/testing notes
+├── Package.swift
 ├── README.md
+├── CHANGELOG.md
 └── AGENTS.md
 ```
 
-## Directory Purposes
+## Main Source Modules (`Sources/Glitcho`)
 
-**Sources/Glitcho/:**
-- Purpose: All application source code
-- Contains: 19 Swift files, primarily SwiftUI Views and Manager classes
-- Key files: App.swift (entry), ContentView.swift (main UI), WebViewStore.swift (web layer), StreamlinkPlayer.swift (playback), RecordingManager.swift (recording)
+### App shell and windows
+- `App.swift`
+- `ContentView.swift`
+- `WindowConfigurator.swift`
+- `DetachedChatView.swift`
 
-**Tests/:**
-- Purpose: Unit and integration tests
-- Contains: 3 test files covering RecordingManager, NativeVideoPlayer gestures, and smoke tests
-- Key files: RecordingManagerTests.swift (most comprehensive)
+### Twitch/web bridge
+- `WebViewStore.swift`
 
-**Resources/:**
-- Purpose: Static assets
-- Contains: AppIcon.iconset with app icons at multiple resolutions
+### Playback and channel details
+- `StreamlinkPlayer.swift`
+- `PictureInPictureController.swift`
 
-**Scripts/:**
-- Purpose: Build automation
-- Contains: make_app.sh (compiles, creates app bundle, configures Info.plist)
+### Recording subsystem
+- `RecordingManager.swift`
+- `RecorderOrchestrator.swift`
+- `StreamlinkRecorder.swift`
+- `AutoRecordMode.swift`
+- `RecordingsLibraryView.swift`
+- `RecordingFeatureVisibilityPolicy.swift`
 
-**Build/:**
-- Purpose: Build output (generated, not committed)
-- Contains: Glitcho.app (final executable app bundle)
+### Licensing and pro gating
+- `LicenseManager.swift`
+- `KeychainHelper.swift`
 
-## Key File Locations
+### Motion/video enhancement
+- `MotionInterpolation.swift`
 
-**Entry Points:**
-- `Sources/Glitcho/App.swift`: @main app definition, creates TwitchGlassApp, sets up WindowGroup with ContentView
-- `Sources/Glitcho/NonSwiftUIMain.swift`: Legacy non-SwiftUI entry point (not currently used)
+### Companion API
+- `CompanionAPIServer.swift`
+- `CompanionAPIClient.swift`
+- `CompanionAPIModels.swift`
 
-**Configuration:**
-- `Package.swift`: Swift package manifest, platforms, dependencies, target definitions
-- `Scripts/make_app.sh`: Build configuration (APP_VERSION, APP_BUILD, LSMinimumSystemVersion)
-- `Sources/Glitcho/SettingsView.swift`: User-facing settings for Streamlink/FFmpeg paths, recording directory, notification prefs
+### Support and utilities
+- `NotificationManager.swift`
+- `Telemetry.swift`
+- `PinnedChannel.swift`
+- `SharedUtilities.swift`
+- `SidebarTint.swift`
+- `UpdateChecker.swift`
+- `UpdatePromptView.swift`
+- `UpdateStatusView.swift`
+- `Environment+NotificationManager.swift`
+- `NonSwiftUIMain.swift` (legacy/compat entry scaffold)
 
-**Core Logic:**
-- `Sources/Glitcho/ContentView.swift`: Main view controller logic, state management, mode switching (web/native/recordings)
-- `Sources/Glitcho/WebViewStore.swift`: WKWebView setup, all JavaScript injection, message handling, Following/profile extraction
-- `Sources/Glitcho/StreamlinkPlayer.swift`: Streamlink URL resolution, AVPlayer integration
-- `Sources/Glitcho/RecordingManager.swift`: Recording control, file I/O, Streamlink/FFmpeg installation/invocation
+## Tests (`Tests`)
 
-**UI Components:**
-- `Sources/Glitcho/RecordingsLibraryView.swift`: Recordings list, playback, deletion
-- `Sources/Glitcho/NotificationManager.swift`: macOS notification delivery
-- `Sources/Glitcho/UpdateChecker.swift`: GitHub API polling, update prompts
-- `Sources/Glitcho/DetachedChatView.swift`: Floating chat window
-- `Sources/Glitcho/UpdatePromptView.swift`, `UpdateStatusView.swift`: Update UI
+- `RecordingManagerTests.swift`
+- `RecordingFeatureVisibilityPolicyTests.swift`
+- `NativeVideoPlayerGestureTests.swift`
+- `NativeVideoPlayerPlaybackNudgeTests.swift`
+- `ChannelVideosRoutingTests.swift`
+- `ChannelAboutLinkIdentityTests.swift`
+- `MotionInterpolationHeuristicsTests.swift`
+- `MotionSmootheningCapabilityTests.swift`
+- `GlitchoTests.swift`
 
-**Data Models:**
-- `Sources/Glitcho/PinnedChannel.swift`: Codable struct for pinned channels, persisted via JSON in UserDefaults
-- `Sources/Glitcho/WebViewStore.swift`: TwitchChannel, NativePlaybackRequest, TwitchProfile (inline structs)
+## Scripts (`Scripts`)
 
-**Testing:**
-- `Tests/RecordingManagerTests.swift`: Tests for RecordingManager methods (path resolution, file detection, process invocation)
-- `Tests/NativeVideoPlayerGestureTests.swift`: Tests for gesture handling in video player
-- `Tests/GlitchoTests.swift`: Smoke tests
+- `make_app.sh` (package + app bundle creation)
+- `start_activation_server.sh` (Docker activation service bootstrap + key generation)
+- `stop_activation_server.sh` (activation service shutdown)
+- `profile_recording_runtime.sh` (recording CPU/RAM/process profiling)
+- `license_server_example.mjs` (reference validation service)
+- `generate_icon.py`, `proxy_server.py` (utility scripts)
 
-## Naming Conventions
+## Deployment Assets (`deploy/license-server`)
 
-**Files:**
-- PascalCase for all Swift files (e.g., `ContentView.swift`, `RecordingManager.swift`)
-- Descriptive names indicating content type (View, Manager, Controller)
-- No underscore separators; compound words are concatenated
+- `Dockerfile`
+- `docker-compose.yml`
+- `.env.example`
+- `data/license-keys.example.json`
+- Generated runtime artifacts under `data/` (private/public keys, key store copies)
 
-**Directories:**
-- `Sources/Glitcho`: All source code in one flat directory (no subdirectories)
-- `Tests`: All tests at top level (no subdirectories)
-- `Resources`: Asset folders with descriptive names (e.g., `AppIcon.iconset`)
+## Docs (`docs`)
 
-**Swift Types (Classes, Structs, Enums):**
-- PascalCase (e.g., `ContentView`, `RecordingManager`, `PinnedChannel`)
-- Manager suffix for orchestrator classes (e.g., `RecordingManager`, `StreamlinkManager`)
-- View suffix for SwiftUI views (e.g., `ContentView`, `SettingsView`)
-- Controller suffix for AppKit controllers (e.g., `PictureInPictureController`)
+- `docs/licensing-server.md`
+- `docs/perf/recording-profiling.md`
+- `docs/plans/2026-02-12-dvr-phase0-kickoff.md`
 
-**Properties & Methods:**
-- camelCase for properties and methods
-- Underscores for private properties indicating internal state: `_resolveFFmpegPathOverride`, `_webView`
-- Function names are imperative verbs: `startRecording()`, `toggleRecording()`, `navigateTo()`
+## Scope Notes
 
-**Constants:**
-- UPPER_SNAKE_CASE for module-level constants (in Scripts/make_app.sh): `APP_VERSION`, `APP_BUILD`
-- camelCase for static properties inside types: `Self.safariUserAgent`, `Self.initialHideScript`
-
-## Where to Add New Code
-
-**New Feature (Playback Enhancement, e.g., Quality Selection):**
-- Primary code: `Sources/Glitcho/StreamlinkPlayer.swift`
-- UI: Add button/selector to `Sources/Glitcho/StreamlinkPlayer.swift` NativeVideoPlayer view or ContentView
-- Tests: `Tests/VideoPlayerFeatureTests.swift` (new file if feature is substantial)
-
-**New Component/Module (e.g., Chat Integration):**
-- Implementation: `Sources/Glitcho/ChatIntegrationManager.swift` (new file)
-- UI View: `Sources/Glitcho/ChatView.swift` (new file)
-- State: Integrate into ContentView or create via @StateObject
-- Tests: `Tests/ChatIntegrationTests.swift` (new file)
-
-**Utilities (Helper Functions, Extensions):**
-- Shared helpers: `Sources/Glitcho/Utilities.swift` (new file) or add as extensions to existing types
-- Example: URL validation, string parsing helpers
-- Keep in same file if used by only one type; extract to Utilities if used across multiple files
-
-**Settings/Preferences:**
-- New setting key: Add @AppStorage property to `Sources/Glitcho/SettingsView.swift`
-- Default value: Store in @AppStorage declaration or UserDefaults.standard
-- UI control: Add to `SettingsViewContent` or create new settings section in SettingsView
-
-**New Window/Dialog:**
-- Define: New View struct in `Sources/Glitcho/App.swift` or dedicated file (e.g., `Sources/Glitcho/AboutView.swift`)
-- Register: Add Window or WindowGroup to TwitchGlassApp.body
-- Integration: Create open button in existing view, pass through @Environment(\.openWindow)
-
-## Special Directories
-
-**Build/:**
-- Purpose: Generated app bundle
-- Generated: Yes (by Scripts/make_app.sh)
-- Committed: No
-- Management: Regenerated on each build; .gitignore should exclude
-
-**.build/:**
-- Purpose: SPM build cache
-- Generated: Yes (by swift build)
-- Committed: No
-- Management: Ignored by .gitignore
-
-**Resources/AppIcon.iconset/:**
-- Purpose: App icon images at multiple resolutions (required by macOS)
-- Contents: .png files at 16x16, 32x32, 64x64, 128x128, 256x256, 512x512, 1024x1024 (and @2x variants)
-- Committed: Yes
-- Management: Maintain resolution consistency; update when changing app appearance
-
-## Code Organization Principles
-
-1. **Single file per major type**: Each manager class (RecordingManager, StreamlinkManager, WebViewStore) is in its own file.
-
-2. **View hierarchy in ContentView**: Main layout views (Sidebar, PinnedRow, FollowingRow, etc.) are defined inline within ContentView.swift or in dedicated small files.
-
-3. **No subdirectories under Sources/Glitcho**: All Swift files are at the same level for simplicity. Flat structure works well for small-to-medium projects.
-
-4. **Inline utilities in host file**: Helper methods are kept in the file that primarily uses them (e.g., `isTransportStreamFile()` in RecordingManager).
-
-5. **Environment keys for global state**: Shared services like NotificationManager are injected via @Environment key (see `Environment+NotificationManager.swift`).
-
-6. **Tests alongside source**: Test files are in Tests/ directory with clear naming to match source files (RecordingManagerTests.swift → RecordingManager.swift).
-
----
-
-*Structure analysis: 2026-02-04*
+- iOS/iPadOS app scaffolding and IPA scripts were removed.
+- Source tree is now intentionally macOS-focused.
+- App icons remain under `Resources/`.

@@ -26,7 +26,10 @@ let package = Package(
         ),
         .testTarget(
             name: "GlitchoTests",
-            dependencies: ["Glitcho"]
+            dependencies: ["Glitcho"],
+            resources: [
+                .process("Fixtures")
+            ]
         )
     ]
 )

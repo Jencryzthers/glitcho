@@ -18,12 +18,19 @@ struct BackgroundRecorderAgentConfig: Codable, Equatable {
     let manualRecordings: [BackgroundRecorderAgentChannel]?
 }
 
-@MainActor
+struct BackgroundRecorderControlResult: Equatable {
+    let success: Bool
+    let message: String
+    let stoppedProcessCount: Int
+    let finishedAt: Date
+}
+
 final class BackgroundRecorderAgentManager: ObservableObject {
     static let launchAgentLabel = "com.glitcho.recorder-agent"
 
     private var lastConfigData: Data?
     private var lastEffectiveEnabled: Bool?
+    private let syncQueue = DispatchQueue(label: "com.glitcho.background-recorder.sync")
 
     private var appSupportDirectory: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
@@ -59,7 +66,17 @@ final class BackgroundRecorderAgentManager: ObservableObject {
         logsDirectory.appendingPathComponent("agent.stderr.log")
     }
 
+    private var activeSessionsDirectory: URL {
+        appSupportDirectory.appendingPathComponent("ActiveSessions", isDirectory: true)
+    }
+
     private let manualRecordingsDefaultsKey = "backgroundRecorder.manualRecordings.v1"
+    private var isControlActionInFlight = false
+
+    private struct BackgroundAgentActiveSession: Decodable {
+        let login: String
+        let pid: Int32
+    }
     
     private var manualRecordings: [BackgroundRecorderAgentChannel] {
         get {
@@ -99,46 +116,51 @@ final class BackgroundRecorderAgentManager: ObservableObject {
         recordingsDirectory: String,
         quality: String = "best"
     ) {
-        do {
-            let normalizedChannels = deduplicatedChannels(channels)
-            let normalizedManual = deduplicatedChannels(manualRecordings)
-            let effectiveEnabled = enabled && !normalizedChannels.isEmpty
-            let hasManualRecordings = !normalizedManual.isEmpty
-            let shouldBeRunning = effectiveEnabled || hasManualRecordings
+        syncQueue.sync {
+            do {
+                let normalizedChannels = deduplicatedChannels(channels)
+                let normalizedManual = deduplicatedChannels(manualRecordings)
+                let effectiveEnabled = enabled && !normalizedChannels.isEmpty
+                let hasManualRecordings = !normalizedManual.isEmpty
+                let shouldBeRunning = effectiveEnabled || hasManualRecordings
 
-            try FileManager.default.createDirectory(at: appSupportDirectory, withIntermediateDirectories: true)
-            try FileManager.default.createDirectory(at: logsDirectory, withIntermediateDirectories: true)
-            try installHelperBinaryIfNeeded()
+                try FileManager.default.createDirectory(at: appSupportDirectory, withIntermediateDirectories: true)
+                try FileManager.default.createDirectory(at: logsDirectory, withIntermediateDirectories: true)
+                try installHelperBinaryIfNeeded()
 
-            let config = BackgroundRecorderAgentConfig(
-                version: 1,
-                enabled: effectiveEnabled,
-                streamlinkPath: normalizedPath(streamlinkPath),
-                recordingsDirectory: recordingsDirectory,
-                quality: quality,
-                pollIntervalSeconds: 25,
-                channels: normalizedChannels,
-                manualRecordings: normalizedManual
-            )
+                let config = BackgroundRecorderAgentConfig(
+                    version: 1,
+                    enabled: effectiveEnabled,
+                    streamlinkPath: normalizedPath(streamlinkPath),
+                    recordingsDirectory: recordingsDirectory,
+                    quality: quality,
+                    pollIntervalSeconds: 25,
+                    channels: normalizedChannels,
+                    manualRecordings: normalizedManual
+                )
 
-            let configData = try JSONEncoder().encode(config)
-            if configData != lastConfigData || !FileManager.default.fileExists(atPath: configPath.path) {
-                try configData.write(to: configPath, options: .atomic)
-                lastConfigData = configData
-            }
-
-            try writeLaunchAgentPlist()
-
-            if shouldBeRunning {
-                if lastEffectiveEnabled != true {
-                    try ensureAgentRunning()
+                let configData = try JSONEncoder().encode(config)
+                let configChanged =
+                    configData != lastConfigData
+                    || !FileManager.default.fileExists(atPath: configPath.path)
+                if configChanged {
+                    try configData.write(to: configPath, options: .atomic)
+                    lastConfigData = configData
                 }
-            } else if lastEffectiveEnabled != false {
-                stopAgent()
+
+                try writeLaunchAgentPlist()
+
+                if shouldBeRunning {
+                    if lastEffectiveEnabled != true || configChanged {
+                        try ensureAgentRunning()
+                    }
+                } else if lastEffectiveEnabled != false {
+                    stopAgent()
+                }
+                lastEffectiveEnabled = shouldBeRunning
+            } catch {
+                print("[BackgroundRecorderAgent] Sync failed: \(error.localizedDescription)")
             }
-            lastEffectiveEnabled = shouldBeRunning
-        } catch {
-            print("[BackgroundRecorderAgent] Sync failed: \(error.localizedDescription)")
         }
     }
 
@@ -295,22 +317,106 @@ final class BackgroundRecorderAgentManager: ObservableObject {
         try? runLaunchctl(["bootout", target, plistPath], allowFailure: true)
     }
     
-    func restartAgent() {
-        stopAgent()
-        do {
-            try FileManager.default.createDirectory(at: appSupportDirectory, withIntermediateDirectories: true)
-            try FileManager.default.createDirectory(at: logsDirectory, withIntermediateDirectories: true)
-            try installHelperBinaryIfNeeded()
-            try writeLaunchAgentPlist()
-            try ensureAgentRunning()
-        } catch {
-            print("[BackgroundRecorderAgent] Restart failed: \(error.localizedDescription)")
+    @discardableResult
+    func restartAgent() -> BackgroundRecorderControlResult {
+        syncQueue.sync {
+            guard !isControlActionInFlight else {
+                return BackgroundRecorderControlResult(
+                    success: true,
+                    message: "Background recorder action already in progress.",
+                    stoppedProcessCount: 0,
+                    finishedAt: Date()
+                )
+            }
+            isControlActionInFlight = true
+            defer { isControlActionInFlight = false }
+
+            stopAgent()
+            do {
+                try FileManager.default.createDirectory(at: appSupportDirectory, withIntermediateDirectories: true)
+                try FileManager.default.createDirectory(at: logsDirectory, withIntermediateDirectories: true)
+                try installHelperBinaryIfNeeded()
+                try writeLaunchAgentPlist()
+                try ensureAgentRunning()
+                return BackgroundRecorderControlResult(
+                    success: true,
+                    message: "Background recorder agent restarted.",
+                    stoppedProcessCount: 0,
+                    finishedAt: Date()
+                )
+            } catch {
+                let message = "Restart failed: \(error.localizedDescription)"
+                print("[BackgroundRecorderAgent] \(message)")
+                return BackgroundRecorderControlResult(
+                    success: false,
+                    message: message,
+                    stoppedProcessCount: 0,
+                    finishedAt: Date()
+                )
+            }
         }
     }
-    
-    func killAgent() {
-        stopAgent()
-        manualRecordings = []
+
+    @discardableResult
+    func killAgent() -> BackgroundRecorderControlResult {
+        syncQueue.sync {
+            guard !isControlActionInFlight else {
+                return BackgroundRecorderControlResult(
+                    success: true,
+                    message: "Background recorder action already in progress.",
+                    stoppedProcessCount: 0,
+                    finishedAt: Date()
+                )
+            }
+            isControlActionInFlight = true
+            defer { isControlActionInFlight = false }
+
+            stopAgent()
+            let termination = terminateActiveSessions()
+            manualRecordings = []
+
+            let success = termination.failed == 0
+            let baseMessage = "Stopped \(termination.stopped) recording process(es)."
+            let message = termination.failed > 0
+                ? "\(baseMessage) Failed to stop \(termination.failed) process(es)."
+                : baseMessage
+            return BackgroundRecorderControlResult(
+                success: success,
+                message: message,
+                stoppedProcessCount: termination.stopped,
+                finishedAt: Date()
+            )
+        }
+    }
+
+    private func terminateActiveSessions() -> (stopped: Int, failed: Int) {
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: activeSessionsDirectory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else {
+            return (0, 0)
+        }
+
+        var stopped = 0
+        var failed = 0
+        for file in files where file.pathExtension.lowercased() == "json" {
+            guard let data = try? Data(contentsOf: file),
+                  let session = try? JSONDecoder().decode(BackgroundAgentActiveSession.self, from: data) else {
+                try? FileManager.default.removeItem(at: file)
+                continue
+            }
+
+            if session.pid > 0 {
+                if Darwin.kill(session.pid, SIGTERM) == 0 || errno == ESRCH {
+                    stopped += 1
+                } else {
+                    failed += 1
+                }
+            }
+            try? FileManager.default.removeItem(at: file)
+        }
+        return (stopped, failed)
     }
 }
 

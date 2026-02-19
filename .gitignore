@@ -5,3 +5,10 @@ Build/
 *.dSYM/
 *.app/
 .swiftpm/
+.local/
+apps/commerce/node_modules/
+apps/commerce/data/
+deploy/commerce-site/.env
+deploy/commerce-site/data/*.json
+deploy/commerce-site/data/*.pem
+deploy/commerce-site/data/*.b64

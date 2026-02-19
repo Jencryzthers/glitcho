@@ -2,6 +2,8 @@
 import Foundation
 import AppKit
 import AVKit
+import Darwin
+import Metal
 import SwiftUI
 import WebKit
 
@@ -343,16 +345,154 @@ private func isStreamOfflineErrorMessage(_ message: String) -> Bool {
     return offlineMarkers.contains(where: { s.contains($0) })
 }
 
+enum VideoAspectCropMode: String, CaseIterable, Hashable {
+    case source
+    case aspect21x9
+    case aspect32x9
+
+    var label: String {
+        switch self {
+        case .source:
+            return "Auto"
+        case .aspect21x9:
+            return "21:9"
+        case .aspect32x9:
+            return "32:9"
+        }
+    }
+
+    var targetAspectRatio: CGFloat? {
+        switch self {
+        case .source:
+            return nil
+        case .aspect21x9:
+            return 21.0 / 9.0
+        case .aspect32x9:
+            return 32.0 / 9.0
+        }
+    }
+}
+
+struct MotionSmootheningCapability: Equatable {
+    struct Environment: Equatable {
+        let refreshRate: Int
+        let hasMetalDevice: Bool
+        let lowPowerModeEnabled: Bool
+        let thermalState: ProcessInfo.ThermalState
+        let supportsAIInterpolation: Bool
+    }
+
+    let supported: Bool
+    let aiInterpolationSupported: Bool
+    let maxRefreshRate: Int
+    let reason: String
+
+    var targetRefreshRate: Int {
+        max(60, min(maxRefreshRate, 120))
+    }
+
+    static func evaluate(screen: NSScreen?) -> MotionSmootheningCapability {
+        let refresh = max(0, screen?.maximumFramesPerSecond ?? NSScreen.main?.maximumFramesPerSecond ?? 60)
+        return evaluate(
+            environment: .init(
+                refreshRate: refresh,
+                hasMetalDevice: MTLCreateSystemDefaultDevice() != nil,
+                lowPowerModeEnabled: ProcessInfo.processInfo.isLowPowerModeEnabled,
+                thermalState: ProcessInfo.processInfo.thermalState,
+                supportsAIInterpolation: MotionAIInterpolationSupport.isAvailable()
+            )
+        )
+    }
+
+    static func evaluate(environment: Environment) -> MotionSmootheningCapability {
+        let refresh = max(0, environment.refreshRate)
+        guard refresh >= 60 else {
+            return MotionSmootheningCapability(
+                supported: false,
+                aiInterpolationSupported: false,
+                maxRefreshRate: refresh,
+                reason: "Display refresh rate is \(refresh)Hz. 60Hz+ is required."
+            )
+        }
+        guard environment.hasMetalDevice else {
+            return MotionSmootheningCapability(
+                supported: false,
+                aiInterpolationSupported: false,
+                maxRefreshRate: refresh,
+                reason: "Metal GPU support is unavailable on this device."
+            )
+        }
+        guard environment.supportsAIInterpolation else {
+            return MotionSmootheningCapability(
+                supported: false,
+                aiInterpolationSupported: false,
+                maxRefreshRate: refresh,
+                reason: "AI interpolation is unavailable on this device."
+            )
+        }
+        if environment.lowPowerModeEnabled {
+            return MotionSmootheningCapability(
+                supported: false,
+                aiInterpolationSupported: true,
+                maxRefreshRate: refresh,
+                reason: "Low Power Mode is enabled."
+            )
+        }
+        let thermal = environment.thermalState
+        if thermal == .serious || thermal == .critical {
+            return MotionSmootheningCapability(
+                supported: false,
+                aiInterpolationSupported: true,
+                maxRefreshRate: refresh,
+                reason: "Thermal state is \(thermal.description)."
+            )
+        }
+        return MotionSmootheningCapability(
+            supported: true,
+            aiInterpolationSupported: true,
+            maxRefreshRate: refresh,
+            reason: "AI motion smoothening available."
+        )
+    }
+}
+
+private extension ProcessInfo.ThermalState {
+    var description: String {
+        switch self {
+        case .nominal:
+            return "nominal"
+        case .fair:
+            return "fair"
+        case .serious:
+            return "serious"
+        case .critical:
+            return "critical"
+        @unknown default:
+            return "unknown"
+        }
+    }
+}
+
 /// Vue player vidéo natif avec AVPlayer
 struct NativeVideoPlayer: NSViewRepresentable {
     let url: URL
     @Binding var isPlaying: Bool
+    @Binding var volume: Double
+    @Binding var muted: Bool
+    @Binding var fullscreenRequestToken: Int
     let pipController: PictureInPictureController?
 
     /// Digital zoom (1.0 = normal). Applied to the underlying video layer (not the whole UI).
     @Binding var zoom: CGFloat
     /// Pan offset in points (only meaningful when zoom > 1).
     @Binding var pan: CGSize
+    var motionSmootheningEnabled: Bool = false
+    var motionCapability: MotionSmootheningCapability = MotionSmootheningCapability.evaluate(screen: nil)
+    var motionConfiguration: MotionInterpolationConfiguration = .productionDefault
+    var videoAspectMode: VideoAspectCropMode = .source
+    var upscaler4KEnabled: Bool = false
+    var imageOptimizeEnabled: Bool = false
+    var imageOptimizationConfiguration: ImageOptimizationConfiguration = .productionDefault
 
     var minZoom: CGFloat = 1.0
     var maxZoom: CGFloat = 4.0
@@ -360,17 +500,37 @@ struct NativeVideoPlayer: NSViewRepresentable {
     init(
         url: URL,
         isPlaying: Binding<Bool>,
+        volume: Binding<Double> = .constant(1.0),
+        muted: Binding<Bool> = .constant(false),
+        fullscreenRequestToken: Binding<Int> = .constant(0),
         pipController: PictureInPictureController? = nil,
         zoom: Binding<CGFloat> = .constant(1.0),
         pan: Binding<CGSize> = .constant(.zero),
+        motionSmootheningEnabled: Bool = false,
+        motionCapability: MotionSmootheningCapability = MotionSmootheningCapability.evaluate(screen: nil),
+        motionConfiguration: MotionInterpolationConfiguration = .productionDefault,
+        videoAspectMode: VideoAspectCropMode = .source,
+        upscaler4KEnabled: Bool = false,
+        imageOptimizeEnabled: Bool = false,
+        imageOptimizationConfiguration: ImageOptimizationConfiguration = .productionDefault,
         minZoom: CGFloat = 1.0,
         maxZoom: CGFloat = 4.0
     ) {
         self.url = url
         self._isPlaying = isPlaying
+        self._volume = volume
+        self._muted = muted
+        self._fullscreenRequestToken = fullscreenRequestToken
         self.pipController = pipController
         self._zoom = zoom
         self._pan = pan
+        self.motionSmootheningEnabled = motionSmootheningEnabled
+        self.motionCapability = motionCapability
+        self.motionConfiguration = motionConfiguration
+        self.videoAspectMode = videoAspectMode
+        self.upscaler4KEnabled = upscaler4KEnabled
+        self.imageOptimizeEnabled = imageOptimizeEnabled
+        self.imageOptimizationConfiguration = imageOptimizationConfiguration
         self.minZoom = minZoom
         self.maxZoom = maxZoom
     }
@@ -391,13 +551,40 @@ struct NativeVideoPlayer: NSViewRepresentable {
         var parent: NativeVideoPlayer
         private var magnifyStartZoom: CGFloat = 1.0
         private var panStart: CGSize = .zero
+        private var lastAppliedZoom: CGFloat = -.greatestFiniteMagnitude
+        private var lastAppliedPan: CGSize = CGSize(
+            width: CGFloat.greatestFiniteMagnitude,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        private var lastAppliedBounds: CGRect = .zero
+        private var lastPlaybackState: Bool?
+        private var lastMotionEnabled: Bool?
+        private var lastMotionSupportReason: String?
+        private var lastMotionPipelineSignature: MotionPipelineSignature?
+        private var lastAspectMode: VideoAspectCropMode = .source
+        private var lastUpscalerEnabled = false
+        private var lastImageOptimizeEnabled = false
+        private var lastImageOptimizationConfiguration = ImageOptimizationConfiguration.productionDefault
+        private var lastAppliedVolume: Double = -1
+        private var lastAppliedMuted = false
+        private var lastFullscreenRequestToken: Int
+        let interpolationController = MotionInterpolationController()
 
         weak var resolvedVideoLayer: CALayer?
         weak var playerView: ZoomableAVPlayerView?
 
+        struct MotionPipelineSignature: Equatable {
+            let processingEnabled: Bool
+            let interpolationEnabled: Bool
+            let upscalerEnabled: Bool
+            let imageOptimizeEnabled: Bool
+            let itemID: ObjectIdentifier?
+        }
+
         init(parent: NativeVideoPlayer, pipController: PictureInPictureController?) {
             self.parent = parent
             self.pipController = pipController
+            self.lastFullscreenRequestToken = parent.fullscreenRequestToken
         }
 
         func gestureRecognizer(_ gestureRecognizer: NSGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: NSGestureRecognizer) -> Bool {
@@ -405,9 +592,8 @@ struct NativeVideoPlayer: NSViewRepresentable {
         }
 
         func gestureRecognizerShouldBegin(_ gestureRecognizer: NSGestureRecognizer) -> Bool {
-            // Avoid interfering with AVPlayerView controls: only pan when Option is held.
             if gestureRecognizer is NSPanGestureRecognizer {
-                return NSEvent.modifierFlags.contains(.option)
+                guard parent.zoom > (parent.minZoom + 0.001) else { return false }
             }
             return true
         }
@@ -426,11 +612,11 @@ struct NativeVideoPlayer: NSViewRepresentable {
                 if parent.zoom != clamped {
                     parent.zoom = clamped
                 }
-                parent.pan = clampPan(parent.pan, in: bounds, zoom: parent.zoom)
+                parent.pan = clampPan(parent.pan, in: bounds, zoom: parent.zoom, videoLayer: resolveVideoLayer(in: view))
                 applyZoomAndPan(to: view)
             case .ended, .cancelled, .failed:
                 parent.zoom = clampZoom(parent.zoom)
-                parent.pan = clampPan(parent.pan, in: bounds, zoom: parent.zoom)
+                parent.pan = clampPan(parent.pan, in: bounds, zoom: parent.zoom, videoLayer: resolveVideoLayer(in: view))
                 applyZoomAndPan(to: view)
             default:
                 break
@@ -457,13 +643,13 @@ struct NativeVideoPlayer: NSViewRepresentable {
             case .changed:
                 let t = recognizer.translation(in: view)
                 let raw = CGSize(width: panStart.width + t.x, height: panStart.height + t.y)
-                let clamped = clampPan(raw, in: bounds, zoom: parent.zoom)
+                let clamped = clampPan(raw, in: bounds, zoom: parent.zoom, videoLayer: resolveVideoLayer(in: view))
                 if parent.pan != clamped {
                     parent.pan = clamped
                 }
                 applyZoomAndPan(to: view)
             case .ended, .cancelled, .failed:
-                parent.pan = clampPan(parent.pan, in: bounds, zoom: parent.zoom)
+                parent.pan = clampPan(parent.pan, in: bounds, zoom: parent.zoom, videoLayer: resolveVideoLayer(in: view))
                 applyZoomAndPan(to: view)
             default:
                 break
@@ -472,7 +658,7 @@ struct NativeVideoPlayer: NSViewRepresentable {
 
         @objc func handleDoubleClick(_ recognizer: NSClickGestureRecognizer) {
             guard let view = recognizer.view as? AVPlayerView else { return }
-            parent.zoom = 1.0
+            parent.zoom = parent.zoom <= (parent.minZoom + 0.01) ? min(max(parent.minZoom * 2.0, 2.0), parent.maxZoom) : parent.minZoom
             parent.pan = .zero
             applyZoomAndPan(to: view)
         }
@@ -485,9 +671,24 @@ struct NativeVideoPlayer: NSViewRepresentable {
             guard bounds.width > 0, bounds.height > 0 else { return }
 
             let z = clampZoom(parent.zoom)
-            let p = clampPan(parent.pan, in: bounds, zoom: z)
-
             guard let videoLayer = resolveVideoLayer(in: view) else { return }
+            let effectiveZoom = z * aspectCropZoomMultiplier(videoLayer: videoLayer, bounds: bounds)
+            let p = clampPan(parent.pan, in: bounds, zoom: effectiveZoom, videoLayer: videoLayer)
+
+            if parent.pan != p {
+                parent.pan = p
+            }
+            if abs(lastAppliedZoom - z) < 0.0001,
+               abs(lastAppliedPan.width - p.width) < 0.25,
+               abs(lastAppliedPan.height - p.height) < 0.25,
+               abs(lastAppliedBounds.width - bounds.width) < 0.25,
+               abs(lastAppliedBounds.height - bounds.height) < 0.25,
+               lastAspectMode == parent.videoAspectMode,
+               lastUpscalerEnabled == parent.upscaler4KEnabled,
+               lastImageOptimizeEnabled == parent.imageOptimizeEnabled,
+               lastImageOptimizationConfiguration == parent.imageOptimizationConfiguration {
+                return
+            }
 
             let containerBounds = videoLayer.superlayer?.bounds ?? view.layer?.bounds ?? bounds
             let center = CGPoint(x: containerBounds.midX, y: containerBounds.midY)
@@ -496,18 +697,249 @@ struct NativeVideoPlayer: NSViewRepresentable {
             CATransaction.setDisableActions(true)
             videoLayer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
             videoLayer.position = CGPoint(x: center.x + p.width, y: center.y + p.height)
-            videoLayer.setAffineTransform(CGAffineTransform(scaleX: z, y: z))
+            videoLayer.setAffineTransform(CGAffineTransform(scaleX: effectiveZoom, y: effectiveZoom))
             CATransaction.commit()
+
+            lastAppliedZoom = z
+            lastAppliedPan = p
+            lastAppliedBounds = bounds
+            lastAspectMode = parent.videoAspectMode
+            lastUpscalerEnabled = parent.upscaler4KEnabled
+            lastImageOptimizeEnabled = parent.imageOptimizeEnabled
+            lastImageOptimizationConfiguration = parent.imageOptimizationConfiguration
+            interpolationController.updateViewport(
+                zoom: z,
+                pan: p,
+                aspectMode: parent.videoAspectMode,
+                upscaler4KEnabled: parent.upscaler4KEnabled,
+                imageOptimizeEnabled: parent.imageOptimizeEnabled,
+                imageOptimizationConfiguration: parent.imageOptimizationConfiguration
+            )
+        }
+
+        func updatePlaybackStateIfNeeded(on view: AVPlayerView) {
+            guard let player = view.player else { return }
+            if lastPlaybackState == parent.isPlaying {
+                return
+            }
+            lastPlaybackState = parent.isPlaying
+            if parent.isPlaying {
+                player.play()
+            } else {
+                player.pause()
+            }
+        }
+
+        func applyMotionSettingsIfNeeded(to view: AVPlayerView) {
+            guard let player = view.player else { return }
+            let interpolationEnabled = parent.motionSmootheningEnabled && parent.motionCapability.supported
+            let allowProcessingWithoutAI = (parent.upscaler4KEnabled || parent.imageOptimizeEnabled) && !parent.motionCapability.aiInterpolationSupported
+            let isEnabled = interpolationEnabled || parent.upscaler4KEnabled || parent.imageOptimizeEnabled
+            let supportReason = parent.motionCapability.reason
+            let nextPipelineSignature = MotionPipelineSignature(
+                processingEnabled: isEnabled,
+                interpolationEnabled: interpolationEnabled,
+                upscalerEnabled: parent.upscaler4KEnabled,
+                imageOptimizeEnabled: parent.imageOptimizeEnabled,
+                itemID: player.currentItem.map(ObjectIdentifier.init)
+            )
+            let shouldNudgePlayback = Self.shouldNudgePlaybackAfterPipelineChange(
+                previous: lastMotionPipelineSignature,
+                next: nextPipelineSignature,
+                isPlaying: parent.isPlaying
+            )
+            defer {
+                lastMotionPipelineSignature = nextPipelineSignature
+            }
+            if lastMotionEnabled == isEnabled, lastMotionSupportReason == supportReason {
+                if isEnabled {
+                    interpolationController.enable(
+                        on: view,
+                        player: player,
+                        capability: parent.motionCapability,
+                        configuration: parent.motionConfiguration,
+                        interpolationEnabled: interpolationEnabled,
+                        imageOptimizeEnabled: parent.imageOptimizeEnabled,
+                        imageOptimizationConfiguration: parent.imageOptimizationConfiguration,
+                        allowWithoutAISupport: allowProcessingWithoutAI
+                    )
+                }
+                if shouldNudgePlayback {
+                    interpolationController.refreshOutput()
+                    nudgePlaybackIfNeeded(player)
+                }
+                return
+            }
+            lastMotionEnabled = isEnabled
+            lastMotionSupportReason = supportReason
+
+            if isEnabled {
+                player.automaticallyWaitsToMinimizeStalling = false
+                player.currentItem?.preferredForwardBufferDuration = 0
+                interpolationController.enable(
+                    on: view,
+                    player: player,
+                    capability: parent.motionCapability,
+                    configuration: parent.motionConfiguration,
+                    interpolationEnabled: interpolationEnabled,
+                    imageOptimizeEnabled: parent.imageOptimizeEnabled,
+                    imageOptimizationConfiguration: parent.imageOptimizationConfiguration,
+                    allowWithoutAISupport: allowProcessingWithoutAI
+                )
+                GlitchoTelemetry.track(
+                    "motion_smoothening_active",
+                    metadata: [
+                        "refresh_hz": "\(parent.motionCapability.maxRefreshRate)",
+                        "target_hz": "\(parent.motionCapability.targetRefreshRate)",
+                        "supported": "true",
+                        "ai_supported": parent.motionCapability.aiInterpolationSupported ? "true" : "false",
+                        "image_optimize_enabled": parent.imageOptimizeEnabled ? "true" : "false",
+                        "upscaler_4k_enabled": parent.upscaler4KEnabled ? "true" : "false",
+                        "thermal": ProcessInfo.processInfo.thermalState.description
+                    ]
+                )
+                if shouldNudgePlayback {
+                    interpolationController.refreshOutput()
+                    nudgePlaybackIfNeeded(player)
+                }
+            } else {
+                player.automaticallyWaitsToMinimizeStalling = true
+                player.currentItem?.preferredForwardBufferDuration = 1.5
+                interpolationController.disable()
+                GlitchoTelemetry.track(
+                    "motion_smoothening_fallback",
+                    metadata: [
+                        "supported": parent.motionCapability.supported ? "true" : "false",
+                        "ai_supported": parent.motionCapability.aiInterpolationSupported ? "true" : "false",
+                        "image_optimize_enabled": parent.imageOptimizeEnabled ? "true" : "false",
+                        "upscaler_4k_enabled": parent.upscaler4KEnabled ? "true" : "false",
+                        "reason": supportReason,
+                        "thermal": ProcessInfo.processInfo.thermalState.description
+                    ]
+                )
+            }
+        }
+
+        static func shouldNudgePlaybackAfterPipelineChange(
+            previous: MotionPipelineSignature?,
+            next: MotionPipelineSignature,
+            isPlaying: Bool
+        ) -> Bool {
+            guard isPlaying, next.processingEnabled else { return false }
+            guard let previous else { return true }
+            guard previous != next else { return false }
+            if !previous.processingEnabled && next.processingEnabled {
+                return true
+            }
+            if previous.itemID != next.itemID {
+                return true
+            }
+            if previous.interpolationEnabled != next.interpolationEnabled {
+                return true
+            }
+            if previous.upscalerEnabled != next.upscalerEnabled {
+                return true
+            }
+            if previous.imageOptimizeEnabled != next.imageOptimizeEnabled {
+                return true
+            }
+            return false
+        }
+
+        private func nudgePlaybackIfNeeded(_ player: AVPlayer) {
+            guard parent.isPlaying else { return }
+            DispatchQueue.main.async {
+                player.playImmediately(atRate: 1.0)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak player] in
+                    guard let player else { return }
+                    if player.timeControlStatus != .playing {
+                        player.play()
+                    }
+                }
+            }
+        }
+
+        func updateAudioStateIfNeeded(on view: AVPlayerView) {
+            guard let player = view.player else { return }
+            let clampedVolume = max(0.0, min(1.0, parent.volume))
+            let shouldMute = parent.muted || clampedVolume <= 0.0001
+            if abs(lastAppliedVolume - clampedVolume) < 0.0001, lastAppliedMuted == shouldMute {
+                return
+            }
+            player.volume = Float(clampedVolume)
+            player.isMuted = shouldMute
+            lastAppliedVolume = clampedVolume
+            lastAppliedMuted = shouldMute
+        }
+
+        func updatePlayerFullscreenIfNeeded(on view: AVPlayerView) {
+            guard parent.fullscreenRequestToken != lastFullscreenRequestToken else { return }
+            lastFullscreenRequestToken = parent.fullscreenRequestToken
+            DispatchQueue.main.async {
+                if view.isInFullScreenMode {
+                    view.exitFullScreenMode(options: nil)
+                    self.updatePlayerNativeChromeForFullscreenState(on: view)
+                    return
+                }
+
+                // Native AVPlayerView fullscreen (player-only), with native controls enabled.
+                view.controlsStyle = .floating
+                view.showsFullScreenToggleButton = true
+                view.window?.makeFirstResponder(view)
+                if let screen = view.window?.screen ?? NSScreen.main ?? NSScreen.screens.first {
+                    view.enterFullScreenMode(screen, withOptions: nil)
+                    self.updatePlayerNativeChromeForFullscreenState(on: view)
+                } else if let window = view.window ?? NSApp.keyWindow ?? NSApp.mainWindow {
+                    // Last-resort fallback if no screen is available.
+                    window.toggleFullScreen(nil)
+                }
+            }
+        }
+
+        func updatePlayerNativeChromeForFullscreenState(on view: AVPlayerView) {
+            view.controlsStyle = .floating
+            view.showsFullScreenToggleButton = true
         }
 
         private func clampZoom(_ value: CGFloat) -> CGFloat {
             min(max(value, parent.minZoom), parent.maxZoom)
         }
 
-        private func clampPan(_ value: CGSize, in bounds: CGRect, zoom: CGFloat) -> CGSize {
+        private func aspectCropZoomMultiplier(videoLayer: CALayer, bounds: CGRect) -> CGFloat {
+            guard let targetAspect = parent.videoAspectMode.targetAspectRatio, targetAspect > 0 else {
+                return 1.0
+            }
+            let sourceAspect: CGFloat = {
+                if let playerLayer = videoLayer as? AVPlayerLayer {
+                    let rect = playerLayer.videoRect
+                    if rect.width > 0.1, rect.height > 0.1 {
+                        return rect.width / rect.height
+                    }
+                }
+                if bounds.height > 0 {
+                    return bounds.width / bounds.height
+                }
+                return 16.0 / 9.0
+            }()
+            guard sourceAspect > 0 else { return 1.0 }
+            guard targetAspect > sourceAspect else { return 1.0 }
+            return targetAspect / sourceAspect
+        }
+
+        private func clampPan(_ value: CGSize, in bounds: CGRect, zoom: CGFloat, videoLayer: CALayer?) -> CGSize {
             if zoom <= (parent.minZoom + 0.001) { return .zero }
-            let maxX = (zoom - 1.0) * bounds.width / 2.0
-            let maxY = (zoom - 1.0) * bounds.height / 2.0
+            let videoSize: CGSize = {
+                if let playerLayer = videoLayer as? AVPlayerLayer {
+                    let rect = playerLayer.videoRect
+                    if rect.width > 0.1, rect.height > 0.1 {
+                        return rect.size
+                    }
+                }
+                return bounds.size
+            }()
+
+            let maxX = (zoom - 1.0) * videoSize.width / 2.0
+            let maxY = (zoom - 1.0) * videoSize.height / 2.0
             if maxX <= 0 || maxY <= 0 { return .zero }
             return CGSize(
                 width: min(max(value.width, -maxX), maxX),
@@ -550,13 +982,14 @@ struct NativeVideoPlayer: NSViewRepresentable {
         playerView.controlsStyle = .floating
         playerView.showsFrameSteppingButtons = false
         playerView.showsFullScreenToggleButton = true
+        playerView.videoGravity = .resizeAspect
         playerView.wantsLayer = true
         playerView.layer?.masksToBounds = true
 
         let player = AVPlayer(url: url)
         playerView.player = player
 
-        // Gestures: pinch to zoom, drag to pan, double-click to reset.
+        // Gestures: pinch to zoom, drag to pan, double-click to toggle zoom.
         let magnify = NSMagnificationGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleMagnify(_:)))
         magnify.delegate = context.coordinator
         playerView.addGestureRecognizer(magnify)
@@ -577,10 +1010,9 @@ struct NativeVideoPlayer: NSViewRepresentable {
 
         context.coordinator.playerView = playerView
 
-        // Auto-play
-        if isPlaying {
-            player.play()
-        }
+        context.coordinator.updatePlaybackStateIfNeeded(on: playerView)
+        context.coordinator.updateAudioStateIfNeeded(on: playerView)
+        context.coordinator.applyMotionSettingsIfNeeded(to: playerView)
 
         // Observer pour détecter la fin
         context.coordinator.endObserver = NotificationCenter.default.addObserver(
@@ -605,11 +1037,11 @@ struct NativeVideoPlayer: NSViewRepresentable {
         if let current = playerView.player?.currentItem?.asset as? AVURLAsset, current.url != url {
             playerView.player?.replaceCurrentItem(with: AVPlayerItem(url: url))
         }
-        if isPlaying {
-            playerView.player?.play()
-        } else {
-            playerView.player?.pause()
-        }
+        context.coordinator.updatePlayerNativeChromeForFullscreenState(on: playerView)
+        context.coordinator.updatePlaybackStateIfNeeded(on: playerView)
+        context.coordinator.updateAudioStateIfNeeded(on: playerView)
+        context.coordinator.updatePlayerFullscreenIfNeeded(on: playerView)
+        context.coordinator.applyMotionSettingsIfNeeded(to: playerView)
         context.coordinator.pipController?.attach(playerView)
         context.coordinator.applyZoomAndPan(to: playerView)
     }
@@ -620,6 +1052,7 @@ struct NativeVideoPlayer: NSViewRepresentable {
             coordinator.endObserver = nil
         }
         (playerView as? ZoomableAVPlayerView)?.onLayout = nil
+        coordinator.interpolationController.teardown()
         playerView.player?.pause()
         playerView.player = nil
         coordinator.pipController?.detach(playerView)
@@ -760,7 +1193,6 @@ struct StreamlinkPlayerView: View {
             isStreamOffline = false
             streamlink.error = nil
             streamlink.isLoading = true
-            streamURL = nil
         }
 
         do {
@@ -787,6 +1219,55 @@ struct StreamlinkPlayerView: View {
     }
 }
 
+enum ManualRecordingControlAction: Equatable {
+    case start
+    case stop
+
+    var confirmationTitle: String {
+        switch self {
+        case .start:
+            return "Start Recording?"
+        case .stop:
+            return "Stop Recording?"
+        }
+    }
+
+    var confirmationButtonTitle: String {
+        switch self {
+        case .start:
+            return "Start Recording"
+        case .stop:
+            return "Stop Recording"
+        }
+    }
+}
+
+private enum MotionInterpolationPreset: String, CaseIterable, Hashable {
+    case quality
+    case balanced
+    case performance
+    case custom
+
+    var label: String {
+        switch self {
+        case .quality:
+            return "Quality"
+        case .balanced:
+            return "Balanced"
+        case .performance:
+            return "Performance"
+        case .custom:
+            return "Custom"
+        }
+    }
+}
+
+private struct MotionRuntimeSample: Identifiable {
+    let id = UUID()
+    let timestamp: Date
+    let status: MotionInterpolationRuntimeStatus
+}
+
 /// Vue hybride : Player natif + Chat + Infos de la chaîne
 struct HybridTwitchView: View {
     @Binding var playback: NativePlaybackRequest
@@ -798,7 +1279,8 @@ struct HybridTwitchView: View {
     var notificationEnabled: Bool = true
     var onNotificationToggle: ((Bool) -> Void)?
     var isRecording: Bool = false
-    var onRecordRequest: (() -> Void)?
+    var showRecordingControl: Bool = true
+    var onRecordRequest: ((ManualRecordingControlAction) -> Void)?
     @Environment(\.openWindow) private var openWindow
     @StateObject private var streamlink = StreamlinkManager()
     @StateObject private var pipController = PictureInPictureController()
@@ -812,18 +1294,50 @@ struct HybridTwitchView: View {
     @State private var detachedChannelName: String?
     @State private var programmaticChatCloseChannel: String?
     @AppStorage("hybridPlayerHeightRatio") private var playerHeightRatio: Double = 0.8
+    @AppStorage("hybridDetailsCollapsed") private var isDetailsSectionCollapsed = false
     @State private var dragStartRatio: Double?
     @State private var lastChannelName: String?
     @State private var recordingError: String?
+    @AppStorage("player.volume") private var playerVolume = 0.9
+    @AppStorage("player.muted") private var playerMuted = false
+    @State private var isHoveringVideoSurface = false
+    @State private var showOverlayMorePopover = false
+    @State private var playerFullscreenRequestToken = 0
 
     @State private var videoZoom: CGFloat = 1.0
     @State private var videoPan: CGSize = .zero
-    @StateObject private var aboutStore = ChannelAboutStore()
+    @AppStorage("motionSmoothening120Enabled") private var motionSmoothening120Enabled = false
+    @AppStorage("video.aspectCropMode") private var videoAspectModeRaw = VideoAspectCropMode.source.rawValue
+    @AppStorage("video.upscaler4kEnabled") private var videoUpscaler4KEnabled = false
+    @AppStorage("video.imageOptimizeEnabled") private var videoImageOptimizeEnabled = false
+    @AppStorage("video.imageOptimize.contrast") private var imageOptimizeContrast = ImageOptimizationConfiguration.productionDefault.contrast
+    @AppStorage("video.imageOptimize.lighting") private var imageOptimizeLighting = ImageOptimizationConfiguration.productionDefault.lighting
+    @AppStorage("video.imageOptimize.denoiser") private var imageOptimizeDenoiser = ImageOptimizationConfiguration.productionDefault.denoiser
+    @AppStorage("video.imageOptimize.neuralClarity") private var imageOptimizeNeuralClarity = ImageOptimizationConfiguration.productionDefault.neuralClarity
+    @AppStorage("motionSmoothening.autoPreset") private var motionAutoPresetEnabled = true
+    @AppStorage("motionSmoothening.preset") private var motionPresetRaw = MotionInterpolationPreset.balanced.rawValue
+    @AppStorage("motionSmoothening.forceFrameGenDebug") private var motionForceFrameGenDebug = false
+    @AppStorage("motionSmoothening.lowMotionThreshold") private var motionLowMotionThreshold = 0.08
+    @AppStorage("motionSmoothening.highMotionThreshold") private var motionHighMotionThreshold = 3.2
+    @AppStorage("motionSmoothening.extremeMotionThreshold") private var motionExtremeMotionThreshold = 7.5
+    @AppStorage("motionSmoothening.midpointShiftFactor") private var motionMidpointShiftFactor = 0.5
+    @AppStorage("motionSmoothening.maxShiftPixels") private var motionMaxShiftPixels = 20.0
+    @AppStorage("motionSmoothening.maxInterpolationBudgetMs") private var motionMaxInterpolationBudgetMs = 7.8
+    @AppStorage("motionSmoothening.slowFramesForGuardrail") private var motionSlowFramesForGuardrail = 3
+    @AppStorage("motionSmoothening.overloadDurationSeconds") private var motionOverloadDurationSeconds = 6.0
+    @AppStorage("motionSmoothening.cpuPressurePercent") private var motionCpuPressurePercent = 78.0
+    @State private var motionCapability = MotionSmootheningCapability.evaluate(screen: NSScreen.main)
+    @State private var motionRuntimeStatus: MotionInterpolationRuntimeStatus?
+    @State private var motionRuntimeSamples: [MotionRuntimeSample] = []
+    @State private var suppressMotionPresetAutoCustom = false
+    @StateObject private var aboutStore = AboutTabStore()
     @StateObject private var videosStore = ChannelVideosStore()
+    @StateObject private var scheduleStore = ChannelScheduleStore()
 
     private enum ChannelDetailsTab: String, CaseIterable {
         case about = "About"
         case videos = "Videos"
+        case schedule = "Schedule"
     }
 
     @State private var detailsTab: ChannelDetailsTab = .about
@@ -835,16 +1349,96 @@ struct HybridTwitchView: View {
     }
 
     private static let chatPreferencesKey = "glitcho.chatPreferencesByChannel"
+
+    private var motionPreset: MotionInterpolationPreset {
+        MotionInterpolationPreset(rawValue: motionPresetRaw) ?? .balanced
+    }
+
+    private var motionPresetBinding: Binding<MotionInterpolationPreset> {
+        Binding(
+            get: { motionPreset },
+            set: { next in
+                guard next != motionPreset else { return }
+                motionAutoPresetEnabled = false
+                motionPresetRaw = next.rawValue
+                if next != .custom {
+                    applyMotionPreset(next)
+                }
+                trackMotionConfigurationChange(trigger: "preset")
+            }
+        )
+    }
+
+    private var motionConfiguration: MotionInterpolationConfiguration {
+        let low = max(0.01, min(Float(motionLowMotionThreshold), Float(motionHighMotionThreshold - 0.05)))
+        let high = max(low + 0.05, min(Float(motionHighMotionThreshold), Float(motionExtremeMotionThreshold - 0.05)))
+        let extreme = max(high + 0.1, Float(motionExtremeMotionThreshold))
+        return MotionInterpolationConfiguration(
+            lowMotionThreshold: low,
+            highMotionThreshold: high,
+            extremeMotionThreshold: extreme,
+            midpointShiftFactor: max(0.2, min(CGFloat(motionMidpointShiftFactor), 0.75)),
+            maxMidpointShiftPixels: max(8.0, min(CGFloat(motionMaxShiftPixels), 36.0)),
+            maxInterpolationBudgetMs: max(4.0, min(motionMaxInterpolationBudgetMs, 14.0)),
+            consecutiveSlowFramesForGuardrail: max(1, min(motionSlowFramesForGuardrail, 8)),
+            overloadGuardrailDurationSeconds: max(2.0, min(motionOverloadDurationSeconds, 20.0)),
+            cpuPressurePercent: max(45.0, min(motionCpuPressurePercent, 95.0)),
+            guardrailsEnabled: !motionForceFrameGenDebug
+        )
+    }
+
+    private var videoAspectMode: VideoAspectCropMode {
+        VideoAspectCropMode(rawValue: videoAspectModeRaw) ?? .source
+    }
+
+    private var recommendedMotionPreset: MotionInterpolationPreset {
+        recommendedMotionPreset(screen: NSScreen.main, capability: motionCapability)
+    }
+
+    private var isMotionSmootheningActive: Bool {
+        motionSmoothening120Enabled
+    }
+
+    private var isUpscaler4KActive: Bool {
+        videoUpscaler4KEnabled
+    }
+
+    private var isImageOptimizeActive: Bool {
+        videoImageOptimizeEnabled
+    }
+
+    private var effectiveVideoAspectMode: VideoAspectCropMode {
+        videoAspectMode
+    }
+
+    private var imageOptimizationConfiguration: ImageOptimizationConfiguration {
+        ImageOptimizationConfiguration(
+            contrast: imageOptimizeContrast,
+            lighting: imageOptimizeLighting,
+            denoiser: imageOptimizeDenoiser,
+            neuralClarity: imageOptimizeNeuralClarity
+        ).clamped
+    }
+
+    private var motionDeviceSummary: String {
+        let refresh = motionCapability.maxRefreshRate
+        let memoryGB = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824.0
+        let cores = ProcessInfo.processInfo.activeProcessorCount
+        let silicon = isAppleSiliconRuntime() ? "Apple Silicon" : "Intel"
+        return "\(silicon) • \(cores)c • \(Int(memoryGB.rounded()))GB • \(refresh)Hz"
+    }
     
     var body: some View {
         HStack(spacing: 0) {
             // Colonne principale : Player + Infos
             GeometryReader { geo in
                 let minPlayerHeight: CGFloat = 280
-                let minAboutHeight: CGFloat = 160
+                let minAboutHeight: CGFloat = isDetailsSectionCollapsed ? 0 : 160
                 let maxPlayerHeight = max(geo.size.height - minAboutHeight, minPlayerHeight)
                 let desiredPlayerHeight = CGFloat(playerHeightRatio) * geo.size.height
-                let playerHeight = min(max(desiredPlayerHeight, minPlayerHeight), maxPlayerHeight)
+                let playerHeight = isDetailsSectionCollapsed
+                    ? maxPlayerHeight
+                    : min(max(desiredPlayerHeight, minPlayerHeight), maxPlayerHeight)
                 VStack(spacing: 0) {
                     // Player vidéo natif (≥ 80% de la hauteur)
                     VStack(spacing: 0) {
@@ -854,9 +1448,19 @@ struct HybridTwitchView: View {
                                     NativeVideoPlayer(
                                         url: url,
                                         isPlaying: $isPlaying,
+                                        volume: $playerVolume,
+                                        muted: $playerMuted,
+                                        fullscreenRequestToken: $playerFullscreenRequestToken,
                                         pipController: pipController,
                                         zoom: $videoZoom,
-                                        pan: $videoPan
+                                        pan: $videoPan,
+                                        motionSmootheningEnabled: isMotionSmootheningActive && motionCapability.supported,
+                                        motionCapability: motionCapability,
+                                        motionConfiguration: motionConfiguration,
+                                        videoAspectMode: effectiveVideoAspectMode,
+                                        upscaler4KEnabled: isUpscaler4KActive,
+                                        imageOptimizeEnabled: isImageOptimizeActive,
+                                        imageOptimizationConfiguration: imageOptimizationConfiguration
                                     )
                                 } else if streamlink.isLoading {
                                     VStack(spacing: 12) {
@@ -903,225 +1507,162 @@ struct HybridTwitchView: View {
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                             .background(Color(red: 0.04, green: 0.04, blue: 0.05))
 
-                            // Contrôles
-                            HStack(spacing: 16) {
-                                Button(action: { isPlaying.toggle() }) {
-                                    Image(systemName: isPlaying ? "pause.fill" : "play.fill")
-                                        .font(.system(size: 12, weight: .semibold))
-                                        .foregroundStyle(.white.opacity(0.8))
-                                }
-                                .buttonStyle(.plain)
-
-                                Text(playback.channelName ?? "Stream")
-                                    .font(.system(size: 12, weight: .medium))
-                                    .foregroundColor(.white.opacity(0.7))
-                                    .lineLimit(1)
-
-                                HStack(spacing: 8) {
-                                    Image(systemName: "plus.magnifyingglass")
-                                        .font(.system(size: 12, weight: .medium))
-                                        .foregroundStyle(.white.opacity(0.6))
-
-                                    Slider(
-                                        value: Binding(
-                                            get: { Double(videoZoom) },
-                                            set: { newValue in
-                                                videoZoom = CGFloat(newValue)
-                                                if videoZoom <= 1.001 {
-                                                    videoPan = .zero
-                                                }
-                                            }
-                                        ),
-                                        in: 1.0...4.0,
-                                        step: 0.05
-                                    )
-                                    .frame(width: 110)
-                                    .controlSize(.mini)
-                                    .tint(.white.opacity(0.8))
-
-                                    Text(String(format: "%.2f×", Double(videoZoom)))
-                                        .font(.system(size: 11, weight: .medium))
-                                        .foregroundStyle(.white.opacity(0.6))
-                                        .frame(width: 52, alignment: .trailing)
-
-                                    Button(action: { resetVideoZoom() }) {
-                                        Image(systemName: "arrow.counterclockwise")
-                                            .font(.system(size: 11, weight: .semibold))
-                                            .foregroundStyle(.white.opacity(0.55))
-                                    }
-                                    .buttonStyle(.plain)
-                                    .help("Reset zoom")
-                                }
-                                .help("Pinch to zoom • Option-drag to pan • Double-click to reset")
-
-                                Spacer()
-
-                                if playback.kind == .liveChannel, let channel = playback.channelName {
-                                    if !isChatDetached {
-                                        Button(action: { toggleChatVisibility(channel: channel) }) {
-                                            Image(systemName: "sidebar.right")
-                                                .font(.system(size: 12, weight: .medium))
-                                                .foregroundStyle(.white.opacity(showChat ? 0.8 : 0.4))
+                            if isMotionSmootheningActive || isUpscaler4KActive {
+                                VStack {
+                                    HStack(spacing: 8) {
+                                        if isMotionSmootheningActive, let status = motionRuntimeStatus {
+                                            motionFPSBadge(status)
                                         }
-                                        .buttonStyle(.plain)
-                                        .help(showChat ? "Hide chat" : "Show chat")
+                                        if isUpscaler4KActive {
+                                            upscaler4KBadge
+                                        }
+                                        Spacer()
                                     }
-
-                                    Button(action: { isChatDetached ? attachChat() : detachChat(channel) }) {
-                                        Image(systemName: isChatDetached ? "rectangle.on.rectangle" : "arrow.up.right.square")
-                                            .font(.system(size: 12, weight: .medium))
-                                            .foregroundStyle(.white.opacity(0.7))
-                                    }
-                                    .buttonStyle(.plain)
-                                    .help(isChatDetached ? "Attach chat" : "Detach chat")
+                                    Spacer()
                                 }
-
-                                if pipController.isAvailable {
-                                    Button(action: { pipController.toggle() }) {
-                                        Image(systemName: "pip.enter")
-                                            .font(.system(size: 12, weight: .medium))
-                                            .foregroundStyle(.white.opacity(0.7))
-                                    }
-                                    .buttonStyle(.plain)
-                                    .help("Picture in Picture")
-                                }
-
-                                if playback.kind == .liveChannel, let channelLogin = playback.channelName?.lowercased() {
-                                    let isLocalRecording = recordingManager.isRecording(channelLogin: channelLogin)
-                                    let isBackgroundRecording = recordingManager.isRecordingInBackgroundAgent(channelLogin: channelLogin)
-                                    let isChannelRecording = isLocalRecording || isBackgroundRecording
-                                    let badgeLabel = isLocalRecording ? "Stop" : (isBackgroundRecording ? "BG" : "Record")
-                                    Button(action: { onRecordRequest?() }) {
-                                        RecordingControlBadge(
-                                            isRecording: isChannelRecording,
-                                            label: badgeLabel
-                                        )
-                                    }
-                                    .buttonStyle(.plain)
-                                    .disabled(isBackgroundRecording && !isLocalRecording)
-                                    .help(
-                                        isBackgroundRecording && !isLocalRecording
-                                            ? "Recording is active in background auto-record"
-                                            : (isLocalRecording ? "Stop recording this channel" : "Start recording this channel")
-                                    )
-                                }
-
-                                Button(action: { Task { await loadStream() } }) {
-                                    Image(systemName: "arrow.clockwise")
-                                        .font(.system(size: 11, weight: .semibold))
-                                        .foregroundStyle(.white.opacity(0.5))
-                                }
-                                .buttonStyle(.plain)
-                                .help("Reload stream")
+                                .padding(10)
+                                .allowsHitTesting(false)
                             }
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 10)
-                            .background(
-                                LinearGradient(
-                                    colors: [Color.black.opacity(0), Color.black.opacity(0.8)],
-                                    startPoint: .top,
-                                    endPoint: .bottom
-                                )
-                            )
+
+                            if let channel = playback.channelName {
+                                playerControlsToolbar(channel: channel)
+                                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                                    .padding(.trailing, 12)
+                                    .padding(.top, 10)
+                                    .opacity(isHoveringVideoSurface ? 1 : 0)
+                                    .allowsHitTesting(isHoveringVideoSurface)
+                                    .animation(.easeOut(duration: 0.18), value: isHoveringVideoSurface)
+                            }
+
                         }
                         .frame(height: playerHeight)
                         .layoutPriority(2)
+                        .contentShape(Rectangle())
+                        .onHover { hovering in
+                            isHoveringVideoSurface = hovering
+                        }
                     }
 
-                    ResizeHandle()
-                        .contentShape(Rectangle())
-                        .gesture(
-                            DragGesture(minimumDistance: 0)
-                                .onChanged { value in
-                                    let start = dragStartRatio ?? playerHeightRatio
-                                    dragStartRatio = start
+                    if !isDetailsSectionCollapsed {
+                        ResizeHandle()
+                            .contentShape(Rectangle())
+                            .gesture(
+                                DragGesture(minimumDistance: 0)
+                                    .onChanged { value in
+                                        let start = dragStartRatio ?? playerHeightRatio
+                                        dragStartRatio = start
 
-                                    let nextHeight = (CGFloat(start) * geo.size.height) + value.translation.height
-                                    let unclamped = Double(nextHeight / geo.size.height)
-                                    let minRatio = Double(minPlayerHeight / geo.size.height)
-                                    let maxRatio = Double(maxPlayerHeight / geo.size.height)
-                                    playerHeightRatio = min(max(unclamped, minRatio), maxRatio)
-                                }
-                                .onEnded { _ in
-                                    dragStartRatio = nil
-                                }
-                        )
+                                        let nextHeight = (CGFloat(start) * geo.size.height) + value.translation.height
+                                        let unclamped = Double(nextHeight / geo.size.height)
+                                        let minRatio = Double(minPlayerHeight / geo.size.height)
+                                        let maxRatio = Double(maxPlayerHeight / geo.size.height)
+                                        playerHeightRatio = min(max(unclamped, minRatio), maxRatio)
+                                    }
+                                    .onEnded { _ in
+                                        dragStartRatio = nil
+                                    }
+                            )
+                    }
 
                     if let channel = playback.channelName {
-                        VStack(spacing: 0) {
-                            HStack(spacing: 12) {
-                                TwitchUnderlineTabs(tabs: ChannelDetailsTab.allCases, selection: $detailsTab) { $0.rawValue }
-                                    .frame(width: 220, alignment: .leading)
+                        if !isDetailsSectionCollapsed {
+                            VStack(spacing: 0) {
+                                HStack(spacing: 12) {
+                                    TwitchUnderlineTabs(tabs: ChannelDetailsTab.allCases, selection: $detailsTab) { $0.rawValue }
+                                        .frame(width: 220, alignment: .leading)
 
-                                Spacer()
+                                    Spacer()
 
-                                if detailsTab == .videos {
-                                    Button(action: { videosStore.reload() }) {
-                                        Image(systemName: "arrow.clockwise")
+                                    Button(action: { setDetailsSectionCollapsed(true) }) {
+                                        Image(systemName: "chevron.down")
                                             .font(.system(size: 12, weight: .semibold))
                                     }
                                     .buttonStyle(.bordered)
                                     .controlSize(.small)
-                                    .help("Reload videos")
-                                }
-                                if let onFollowChannel {
-                                    let isFollowing = followedChannels.contains { $0.login.lowercased() == channel.lowercased() }
-                                    Button(isFollowing ? "Following" : "Follow") { onFollowChannel(channel) }
-                                        .buttonStyle(.bordered)
-                                        .controlSize(.small)
-                                        .tint(isFollowing ? .purple : nil)
-                                }
+                                    .help("Collapse details panel")
 
-                                if let onOpenSubscription {
-                                    Button("Subscribe") { onOpenSubscription(channel) }
-                                        .buttonStyle(.bordered)
-                                        .controlSize(.small)
-                                }
-
-                                if let onOpenGiftSub {
-                                    Button("Gift Sub") { onOpenGiftSub(channel) }
-                                        .buttonStyle(.bordered)
-                                        .controlSize(.small)
-                                }
-                            }
-                            .padding(.horizontal, 16)
-                            .padding(.top, 12)
-                            .padding(.bottom, 10)
-
-                            Rectangle()
-                                .fill(Color.white.opacity(0.06))
-                                .frame(height: 1)
-
-                            Group {
-                                switch detailsTab {
-                                case .about:
-                                    ChannelAboutPanelView(
-                                        channelName: channel,
-                                        store: aboutStore
-                                    )
-                                case .videos:
-                                    ChannelVideosPanelView(
-                                        channelName: channel,
-                                        store: videosStore,
-                                        onSelectPlayback: { request in
-                                            playback = request
+                                    if detailsTab == .videos {
+                                        Button(action: { videosStore.reload() }) {
+                                            Image(systemName: "arrow.clockwise")
+                                                .font(.system(size: 12, weight: .semibold))
                                         }
-                                    )
+                                        .buttonStyle(.bordered)
+                                        .controlSize(.small)
+                                        .help("Reload videos")
+                                    } else if detailsTab == .schedule {
+                                        Button(action: { scheduleStore.reload() }) {
+                                            Image(systemName: "arrow.clockwise")
+                                                .font(.system(size: 12, weight: .semibold))
+                                        }
+                                        .buttonStyle(.bordered)
+                                        .controlSize(.small)
+                                        .help("Reload schedule")
+                                    }
+                                    if let onFollowChannel {
+                                        let isFollowing = followedChannels.contains { $0.login.lowercased() == channel.lowercased() }
+                                        Button(isFollowing ? "Following" : "Follow") { onFollowChannel(channel) }
+                                            .buttonStyle(.bordered)
+                                            .controlSize(.small)
+                                            .tint(isFollowing ? .purple : nil)
+                                    }
+
+                                    if let onOpenSubscription {
+                                        Button("Subscribe") { onOpenSubscription(channel) }
+                                            .buttonStyle(.bordered)
+                                            .controlSize(.small)
+                                    }
+
+                                    if let onOpenGiftSub {
+                                        Button("Gift Sub") { onOpenGiftSub(channel) }
+                                            .buttonStyle(.bordered)
+                                            .controlSize(.small)
+                                    }
                                 }
+                                .padding(.horizontal, 16)
+                                .padding(.top, 12)
+                                .padding(.bottom, 10)
+
+                                Rectangle()
+                                    .fill(Color.white.opacity(0.06))
+                                    .frame(height: 1)
+
+                                Group {
+                                    switch detailsTab {
+                                    case .about:
+                                        AboutTabView(
+                                            channelName: channel,
+                                            store: aboutStore
+                                        )
+                                    case .videos:
+                                        ChannelVideosPanelView(
+                                            channelName: channel,
+                                            store: videosStore,
+                                            isChannelOffline: isStreamOffline,
+                                            onSelectPlayback: { request in
+                                                playback = request
+                                            }
+                                        )
+                                    case .schedule:
+                                        ChannelSchedulePanelView(
+                                            channelName: channel,
+                                            store: scheduleStore
+                                        )
+                                    }
+                                }
+                                .padding(16)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                             }
-                            .padding(16)
-                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                            .background(
+                                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                                    .fill(Color.white.opacity(0.04))
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 18, style: .continuous)
+                                            .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                                    )
+                            )
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                            .layoutPriority(0)
                         }
-                        .background(
-                            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                                .fill(Color.white.opacity(0.04))
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 18, style: .continuous)
-                                        .stroke(Color.white.opacity(0.08), lineWidth: 1)
-                                )
-                        )
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-                        .layoutPriority(0)
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
@@ -1151,12 +1692,41 @@ struct HybridTwitchView: View {
         }
         .onAppear {
             lastChannelName = playback.channelName
+            if MotionInterpolationPreset(rawValue: motionPresetRaw) == nil {
+                applyMotionPreset(.balanced)
+                motionPresetRaw = MotionInterpolationPreset.balanced.rawValue
+            }
+            refreshMotionCapability()
+            if motionAutoPresetEnabled {
+                applyAutoMotionPresetIfNeeded(reason: "startup")
+            } else if motionPreset != .custom {
+                applyMotionPreset(motionPreset)
+            }
+            sanitizeMotionConfigurationValues()
             if playback.kind == .liveChannel, let channel = playback.channelName {
                 applyChatPreference(for: channel)
                 aboutStore.load(channelName: channel)
+                scheduleStore.load(channelName: channel)
             } else {
                 showChat = false
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification)) { _ in
+            refreshMotionCapability()
+            applyAutoMotionPresetIfNeeded(reason: "screen_change")
+        }
+        .onReceive(NotificationCenter.default.publisher(for: ProcessInfo.thermalStateDidChangeNotification)) { _ in
+            refreshMotionCapability()
+            applyAutoMotionPresetIfNeeded(reason: "thermal_change")
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .NSProcessInfoPowerStateDidChange)) { _ in
+            refreshMotionCapability()
+            applyAutoMotionPresetIfNeeded(reason: "power_change")
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .motionInterpolationRuntimeUpdated)) { notification in
+            guard let status = notification.object as? MotionInterpolationRuntimeStatus else { return }
+            motionRuntimeStatus = status
+            appendMotionRuntimeStatus(status)
         }
         .onChange(of: playback) { newValue in
             // Mettre à jour le player sans "ouvrir Twitch" en bas:
@@ -1170,6 +1740,7 @@ struct HybridTwitchView: View {
                 if newValue.kind == .liveChannel, let channel = newValue.channelName {
                     applyChatPreference(for: channel)
                     aboutStore.load(channelName: channel)
+                    scheduleStore.load(channelName: channel)
                 } else {
                     showChat = false
                     closeDetachedChat()
@@ -1182,13 +1753,99 @@ struct HybridTwitchView: View {
                 }
             }
         }
+        .onChange(of: detailsTab) { tab in
+            guard tab == .videos else { return }
+            guard playback.kind == .liveChannel, let channel = playback.channelName else { return }
+            videosStore.load(channelName: channel, section: videosStore.section, isChannelOffline: isStreamOffline)
+        }
+        .onChange(of: isStreamOffline) { offline in
+            guard detailsTab == .videos else { return }
+            guard playback.kind == .liveChannel, let channel = playback.channelName else { return }
+            videosStore.load(channelName: channel, section: videosStore.section, isChannelOffline: offline)
+        }
+        .onChange(of: motionSmoothening120Enabled) { enabled in
+            if !enabled && !videoUpscaler4KEnabled && !videoImageOptimizeEnabled {
+                motionRuntimeStatus = nil
+                motionRuntimeSamples.removeAll()
+            }
+            GlitchoTelemetry.track(
+                "motion_smoothening_toggle",
+                metadata: [
+                    "enabled": enabled ? "true" : "false",
+                    "supported": motionCapability.supported ? "true" : "false",
+                    "ai_supported": motionCapability.aiInterpolationSupported ? "true" : "false"
+                ]
+            )
+        }
+        .onChange(of: videoAspectModeRaw) { raw in
+            if VideoAspectCropMode(rawValue: raw) == nil {
+                videoAspectModeRaw = VideoAspectCropMode.source.rawValue
+                return
+            }
+            videoPan = .zero
+            GlitchoTelemetry.track(
+                "video_crop_mode_changed",
+                metadata: ["mode": videoAspectMode.rawValue]
+            )
+        }
+        .onChange(of: videoUpscaler4KEnabled) { enabled in
+            if !enabled && !motionSmoothening120Enabled && !videoImageOptimizeEnabled {
+                motionRuntimeStatus = nil
+                motionRuntimeSamples.removeAll()
+            }
+            GlitchoTelemetry.track(
+                "video_upscaler_4k_toggle",
+                metadata: [
+                    "enabled": enabled ? "true" : "false"
+                ]
+            )
+        }
+        .onChange(of: videoImageOptimizeEnabled) { enabled in
+            if !enabled && !motionSmoothening120Enabled && !videoUpscaler4KEnabled {
+                motionRuntimeStatus = nil
+                motionRuntimeSamples.removeAll()
+            }
+            GlitchoTelemetry.track(
+                "video_image_optimize_toggle",
+                metadata: [
+                    "enabled": enabled ? "true" : "false"
+                ]
+            )
+        }
+        .onChange(of: motionAutoPresetEnabled) { enabled in
+            if enabled {
+                applyAutoMotionPresetIfNeeded(reason: "auto_toggle")
+            }
+            GlitchoTelemetry.track(
+                "motion_smoothening_auto_preset_toggle",
+                metadata: ["enabled": enabled ? "true" : "false"]
+            )
+        }
+        .onChange(of: motionForceFrameGenDebug) { enabled in
+            trackMotionConfigurationChange(trigger: enabled ? "debug_force_on" : "debug_force_off")
+            GlitchoTelemetry.track(
+                "motion_smoothening_force_framegen_toggle",
+                metadata: ["enabled": enabled ? "true" : "false"]
+            )
+        }
+        .onChange(of: motionLowMotionThreshold) { _ in markMotionPresetCustomAndTrack() }
+        .onChange(of: motionHighMotionThreshold) { _ in markMotionPresetCustomAndTrack() }
+        .onChange(of: motionExtremeMotionThreshold) { _ in markMotionPresetCustomAndTrack() }
+        .onChange(of: motionMidpointShiftFactor) { _ in markMotionPresetCustomAndTrack() }
+        .onChange(of: motionMaxShiftPixels) { _ in markMotionPresetCustomAndTrack() }
+        .onChange(of: motionMaxInterpolationBudgetMs) { _ in markMotionPresetCustomAndTrack() }
+        .onChange(of: motionSlowFramesForGuardrail) { _ in markMotionPresetCustomAndTrack() }
+        .onChange(of: motionOverloadDurationSeconds) { _ in markMotionPresetCustomAndTrack() }
+        .onChange(of: motionCpuPressurePercent) { _ in markMotionPresetCustomAndTrack() }
         .task {
             await loadStream()
         }
-.onDisappear {
+        .onDisappear {
             // Important: stopper le player natif quand on quitte la vue (navigation ailleurs)
             isPlaying = false
             streamURL = nil
+            motionRuntimeStatus = nil
+            motionRuntimeSamples.removeAll()
             closeDetachedChat()
         }
         .onReceive(recordingManager.$errorMessage) { error in
@@ -1227,7 +1884,6 @@ struct HybridTwitchView: View {
             playbackInlineError = nil
             streamlink.error = nil
             streamlink.isLoading = true
-            streamURL = nil
         }
 
         do {
@@ -1279,6 +1935,422 @@ struct HybridTwitchView: View {
     private func resetVideoZoom() {
         videoZoom = 1.0
         videoPan = .zero
+    }
+
+    @ViewBuilder
+    private func playerControlsToolbar(channel: String) -> some View {
+        HStack(spacing: 10) {
+            Spacer(minLength: 0)
+
+            HStack(spacing: 8) {
+                    if playback.kind == .liveChannel {
+                    Button(action: { toggleDetailsSectionCollapsed() }) {
+                        Image(systemName: isDetailsSectionCollapsed ? "chevron.up.square" : "chevron.down.square")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.84))
+                            .frame(width: 22, height: 22)
+                    }
+                    .buttonStyle(.plain)
+                    .help(isDetailsSectionCollapsed ? "Show details panel" : "Collapse details panel")
+
+                    if !isChatDetached {
+                        Button(action: { toggleChatVisibility(channel: channel) }) {
+                            Image(systemName: "sidebar.right")
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundStyle(.white.opacity(showChat ? 0.84 : 0.45))
+                                .frame(width: 22, height: 22)
+                        }
+                        .buttonStyle(.plain)
+                        .help(showChat ? "Collapse chat" : "Show chat")
+                    }
+
+                    Button(action: { isChatDetached ? attachChat() : detachChat(channel) }) {
+                        Image(systemName: isChatDetached ? "rectangle.on.rectangle" : "arrow.up.right.square")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.8))
+                            .frame(width: 22, height: 22)
+                    }
+                    .buttonStyle(.plain)
+                    .help(isChatDetached ? "Attach chat" : "Chat popup")
+
+                    if showRecordingControl {
+                        let channelLogin = channel.lowercased()
+                        let isLocalRecording = recordingManager.isRecording(channelLogin: channelLogin)
+                        let isBackgroundRecording = recordingManager.isRecordingInBackgroundAgent(channelLogin: channelLogin)
+                        let isChannelRecording = isLocalRecording || isBackgroundRecording
+                        let badgeLabel = isChannelRecording ? "Stop" : "Record"
+                        let manualAction: ManualRecordingControlAction = isChannelRecording ? .stop : .start
+                        Button(action: { onRecordRequest?(manualAction) }) {
+                            RecordingControlBadge(
+                                isRecording: isChannelRecording,
+                                label: badgeLabel
+                            )
+                        }
+                        .buttonStyle(.plain)
+                        .help(isChannelRecording ? "Stop recording this channel" : "Start recording this channel")
+                    }
+                }
+
+                if pipController.isAvailable {
+                    Button(action: { pipController.toggle() }) {
+                        Image(systemName: "pip.enter")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.84))
+                            .frame(width: 22, height: 22)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Picture in Picture")
+                }
+
+                Button(action: requestPlayerFullscreenToggle) {
+                    Image(systemName: "arrow.up.left.and.arrow.down.right")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.84))
+                        .frame(width: 22, height: 22)
+                }
+                .buttonStyle(.plain)
+                .help("Player fullscreen")
+
+                Button(action: { showOverlayMorePopover.toggle() }) {
+                    Label("More", systemImage: "ellipsis")
+                        .font(.system(size: 11, weight: .semibold))
+                        .labelStyle(.titleAndIcon)
+                        .foregroundStyle(.white.opacity(0.82))
+                        .padding(.horizontal, 6)
+                        .frame(height: 22)
+                }
+                .buttonStyle(.plain)
+                .help("More controls")
+                .popover(isPresented: $showOverlayMorePopover, arrowEdge: .bottom) {
+                    overlayMorePopover(channel: channel)
+                }
+            }
+            .padding(.horizontal, 9)
+            .padding(.vertical, 6)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(Color.white.opacity(0.1))
+            )
+        }
+    }
+
+    @ViewBuilder
+    private func overlayMorePopover(channel: String) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("More Controls")
+                .font(.system(size: 13, weight: .semibold))
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Zoom")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    OverlayValueSlider(
+                        value: Binding(
+                            get: { Double(videoZoom) },
+                            set: { newValue in
+                                let stepped = (newValue * 20).rounded() / 20
+                                videoZoom = CGFloat(min(max(1.0, stepped), 4.0))
+                                if videoZoom <= 1.001 {
+                                    videoPan = .zero
+                                }
+                            }
+                        ),
+                        range: 1.0...4.0
+                    )
+                    .frame(width: 180, height: 16)
+                    Text(String(format: "%.2f×", Double(videoZoom)))
+                        .font(.system(size: 11, weight: .medium))
+                        .frame(width: 52, alignment: .trailing)
+                    Button("Reset") { resetVideoZoom() }
+                        .buttonStyle(.borderless)
+                }
+            }
+
+            Divider()
+
+            HStack(spacing: 10) {
+                Text("AirPlay")
+                    .font(.system(size: 11, weight: .medium))
+                AirPlayRoutePicker()
+                    .frame(width: 24, height: 24)
+            }
+
+            HStack(spacing: 10) {
+                Button("Reload Stream") { Task { await loadStream() } }
+            }
+            .buttonStyle(.borderless)
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Pro Video")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
+
+                    Picker("Crop mode", selection: $videoAspectModeRaw) {
+                        ForEach(VideoAspectCropMode.allCases, id: \.self) { mode in
+                            Text(mode.label).tag(mode.rawValue)
+                        }
+                    }
+                    .pickerStyle(.menu)
+
+                    Toggle("Motion smoothening", isOn: $motionSmoothening120Enabled)
+                        .disabled(!motionCapability.supported)
+                    Toggle("4K upscaler", isOn: $videoUpscaler4KEnabled)
+                    Toggle("Image optimize", isOn: $videoImageOptimizeEnabled)
+
+                    Picker("Preset", selection: motionPresetBinding) {
+                        ForEach(MotionInterpolationPreset.allCases, id: \.self) { preset in
+                            Text(preset.label).tag(preset)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                }
+        }
+        .padding(14)
+        .frame(width: 320)
+    }
+
+    private func requestPlayerFullscreenToggle() {
+        playerFullscreenRequestToken &+= 1
+    }
+
+    private func toggleDetailsSectionCollapsed() {
+        setDetailsSectionCollapsed(!isDetailsSectionCollapsed)
+    }
+
+    private func setDetailsSectionCollapsed(_ collapsed: Bool) {
+        guard collapsed != isDetailsSectionCollapsed else { return }
+        withAnimation(.easeInOut(duration: 0.18)) {
+            isDetailsSectionCollapsed = collapsed
+        }
+        GlitchoTelemetry.track(
+            "player_details_panel_toggled",
+            metadata: [
+                "collapsed": collapsed ? "true" : "false",
+                "tab": detailsTab.rawValue.lowercased()
+            ]
+        )
+    }
+
+    private func refreshMotionCapability() {
+        let next = MotionSmootheningCapability.evaluate(screen: NSScreen.main)
+        if motionCapability != next {
+            motionCapability = next
+            GlitchoTelemetry.track(
+                "motion_smoothening_capability",
+                metadata: [
+                    "supported": next.supported ? "true" : "false",
+                    "ai_supported": next.aiInterpolationSupported ? "true" : "false",
+                    "refresh_hz": "\(next.maxRefreshRate)",
+                    "reason": next.reason,
+                    "thermal": ProcessInfo.processInfo.thermalState.description
+                ]
+            )
+        }
+        if !next.supported {
+            motionSmoothening120Enabled = false
+        }
+    }
+
+    @ViewBuilder
+    private func motionFPSBadge(_ status: MotionInterpolationRuntimeStatus) -> some View {
+        HStack(spacing: 8) {
+            Text("FPS \(String(format: "%.1f", status.effectiveFPS))")
+                .font(.system(size: 11, weight: .bold))
+                .foregroundStyle(.white)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .frame(height: 28)
+        .background(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(Color.black.opacity(0.55))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .stroke(Color.white.opacity(0.16), lineWidth: 1)
+                )
+        )
+    }
+
+    private var upscaler4KBadge: some View {
+        HStack(spacing: 6) {
+            Text("4K")
+                .font(.system(size: 11, weight: .bold))
+                .foregroundStyle(.white)
+            Text("Upscale")
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.82))
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .frame(height: 28)
+        .background(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(Color.black.opacity(0.55))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .stroke(Color.cyan.opacity(0.5), lineWidth: 1)
+                )
+        )
+    }
+
+
+    private func applyMotionPreset(_ preset: MotionInterpolationPreset) {
+        let config: MotionInterpolationConfiguration
+        switch preset {
+        case .quality:
+            config = .quality
+        case .balanced:
+            config = .balanced
+        case .performance:
+            config = .performance
+        case .custom:
+            return
+        }
+        suppressMotionPresetAutoCustom = true
+        motionLowMotionThreshold = Double(config.lowMotionThreshold)
+        motionHighMotionThreshold = Double(config.highMotionThreshold)
+        motionExtremeMotionThreshold = Double(config.extremeMotionThreshold)
+        motionMidpointShiftFactor = Double(config.midpointShiftFactor)
+        motionMaxShiftPixels = Double(config.maxMidpointShiftPixels)
+        motionMaxInterpolationBudgetMs = config.maxInterpolationBudgetMs
+        motionSlowFramesForGuardrail = config.consecutiveSlowFramesForGuardrail
+        motionOverloadDurationSeconds = config.overloadGuardrailDurationSeconds
+        motionCpuPressurePercent = config.cpuPressurePercent
+        DispatchQueue.main.async {
+            suppressMotionPresetAutoCustom = false
+        }
+    }
+
+    private func appendMotionRuntimeStatus(_ status: MotionInterpolationRuntimeStatus) {
+        let now = Date()
+        motionRuntimeSamples.append(MotionRuntimeSample(timestamp: now, status: status))
+        let cutoff = now.addingTimeInterval(-60)
+        motionRuntimeSamples.removeAll { $0.timestamp < cutoff }
+        if motionRuntimeSamples.count > 360 {
+            motionRuntimeSamples.removeFirst(motionRuntimeSamples.count - 360)
+        }
+    }
+
+    private func sanitizeMotionConfigurationValues() {
+        let sanitizedLow = max(0.01, min(motionLowMotionThreshold, 0.6))
+        let sanitizedHigh = max(sanitizedLow + 0.05, min(motionHighMotionThreshold, 6.0))
+        let sanitizedExtreme = max(sanitizedHigh + 0.1, min(motionExtremeMotionThreshold, 12.0))
+        motionLowMotionThreshold = sanitizedLow
+        motionHighMotionThreshold = sanitizedHigh
+        motionExtremeMotionThreshold = sanitizedExtreme
+        motionMidpointShiftFactor = max(0.2, min(motionMidpointShiftFactor, 0.75))
+        motionMaxShiftPixels = max(8.0, min(motionMaxShiftPixels, 36.0))
+        motionMaxInterpolationBudgetMs = max(4.0, min(motionMaxInterpolationBudgetMs, 14.0))
+        motionSlowFramesForGuardrail = max(1, min(motionSlowFramesForGuardrail, 8))
+        motionOverloadDurationSeconds = max(2.0, min(motionOverloadDurationSeconds, 20.0))
+        motionCpuPressurePercent = max(45.0, min(motionCpuPressurePercent, 95.0))
+    }
+
+    private func markMotionPresetCustomAndTrack() {
+        if suppressMotionPresetAutoCustom {
+            return
+        }
+        sanitizeMotionConfigurationValues()
+        motionAutoPresetEnabled = false
+        if motionPreset != .custom {
+            motionPresetRaw = MotionInterpolationPreset.custom.rawValue
+        }
+        trackMotionConfigurationChange(trigger: "adjust")
+    }
+
+    private func trackMotionConfigurationChange(trigger: String) {
+        GlitchoTelemetry.track(
+            "motion_smoothening_config_changed",
+            metadata: [
+                "trigger": trigger,
+                "preset": motionPreset.rawValue,
+                "target_hz": "\(motionCapability.targetRefreshRate)",
+                "low": String(format: "%.2f", motionConfiguration.lowMotionThreshold),
+                "high": String(format: "%.2f", motionConfiguration.highMotionThreshold),
+                "extreme": String(format: "%.2f", motionConfiguration.extremeMotionThreshold),
+                "shift": String(format: "%.2f", motionConfiguration.midpointShiftFactor),
+                "max_shift": String(format: "%.1f", motionConfiguration.maxMidpointShiftPixels),
+                "budget_ms": String(format: "%.2f", motionConfiguration.maxInterpolationBudgetMs),
+                "cpu_guardrail": String(format: "%.1f", motionConfiguration.cpuPressurePercent),
+                "guardrails_enabled": motionConfiguration.guardrailsEnabled ? "true" : "false",
+                "crop_mode": videoAspectMode.rawValue,
+                "upscaler_4k": videoUpscaler4KEnabled ? "true" : "false",
+                "image_optimize": videoImageOptimizeEnabled ? "true" : "false"
+            ]
+        )
+    }
+
+    private func applyAutoMotionPresetIfNeeded(reason: String) {
+        guard motionAutoPresetEnabled else { return }
+
+        let recommended = recommendedMotionPreset
+        let presetChanged = motionPreset != recommended
+
+        if presetChanged {
+            motionPresetRaw = recommended.rawValue
+        }
+        applyMotionPreset(recommended)
+
+        GlitchoTelemetry.track(
+            "motion_smoothening_auto_preset",
+            metadata: [
+                "reason": reason,
+                "preset": recommended.rawValue,
+                "device": motionDeviceSummary,
+                "supported": motionCapability.supported ? "true" : "false"
+            ]
+        )
+        if presetChanged {
+            trackMotionConfigurationChange(trigger: "auto_\(reason)")
+        }
+    }
+
+    private func recommendedMotionPreset(
+        screen: NSScreen?,
+        capability: MotionSmootheningCapability
+    ) -> MotionInterpolationPreset {
+        if !capability.supported {
+            return .performance
+        }
+
+        if ProcessInfo.processInfo.isLowPowerModeEnabled {
+            return .performance
+        }
+
+        let memoryGB = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824.0
+        let cores = ProcessInfo.processInfo.activeProcessorCount
+        let refresh = max(60, screen?.maximumFramesPerSecond ?? capability.maxRefreshRate)
+        let appleSilicon = isAppleSiliconRuntime()
+
+        if appleSilicon, memoryGB >= 16, cores >= 8, refresh >= 60 {
+            return .quality
+        }
+
+        if (appleSilicon && memoryGB >= 10 && cores >= 8) || (memoryGB >= 12 && cores >= 8) {
+            return .balanced
+        }
+
+        if memoryGB >= 8, cores >= 6, refresh >= 60 {
+            return .balanced
+        }
+
+        return .performance
+    }
+
+    private func isAppleSiliconRuntime() -> Bool {
+        var value: Int32 = 0
+        var size = MemoryLayout<Int32>.size
+        if sysctlbyname("hw.optional.arm64", &value, &size, nil, 0) == 0 {
+            return value == 1
+        }
+        #if arch(arm64)
+        return true
+        #else
+        return false
+        #endif
     }
 
     private func detachChat(_ channel: String) {
@@ -1363,6 +2435,66 @@ struct HybridTwitchView: View {
     
 }
 
+private struct OverlayValueSlider: View {
+    @Binding var value: Double
+    let range: ClosedRange<Double>
+    var accent: Color = Color.white.opacity(0.92)
+    var trackBackground: Color = Color.white.opacity(0.16)
+
+    private var clampedValue: Double {
+        min(max(value, range.lowerBound), range.upperBound)
+    }
+
+    private var normalized: Double {
+        let span = range.upperBound - range.lowerBound
+        guard span > .ulpOfOne else { return 0 }
+        return (clampedValue - range.lowerBound) / span
+    }
+
+    var body: some View {
+        GeometryReader { geo in
+            let knobSize: CGFloat = 11
+            let width = max(1, geo.size.width)
+            let available = max(1, width - knobSize)
+            let knobX = CGFloat(normalized) * available
+            ZStack(alignment: .leading) {
+                Capsule(style: .continuous)
+                    .fill(trackBackground)
+                    .frame(height: 4)
+                Capsule(style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [accent, accent.opacity(0.62)],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                        )
+                    )
+                    .frame(width: max(5, CGFloat(normalized) * width), height: 4)
+                Circle()
+                    .fill(Color.white.opacity(0.95))
+                    .overlay(
+                        Circle()
+                            .stroke(Color.black.opacity(0.16), lineWidth: 0.6)
+                    )
+                    .frame(width: knobSize, height: knobSize)
+                    .shadow(color: Color.black.opacity(0.28), radius: 2, x: 0, y: 1)
+                    .offset(x: knobX, y: 0)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { drag in
+                        let location = min(max(0, drag.location.x - knobSize / 2), available)
+                        let fraction = location / available
+                        value = range.lowerBound + (range.upperBound - range.lowerBound) * Double(fraction)
+                    }
+            )
+        }
+        .frame(height: 16)
+    }
+}
+
 private struct RecordingControlBadge: View {
     let isRecording: Bool
     let label: String
@@ -1383,6 +2515,14 @@ private struct RecordingControlBadge: View {
                 .fill(Color.white.opacity(isRecording ? 0.15 : 0.08))
         )
     }
+}
+
+private struct AirPlayRoutePicker: NSViewRepresentable {
+    func makeNSView(context: Context) -> AVRoutePickerView {
+        AVRoutePickerView(frame: .zero)
+    }
+
+    func updateNSView(_ nsView: AVRoutePickerView, context: Context) {}
 }
 
 private struct ResizeHandle: View {
@@ -1408,6 +2548,119 @@ private struct ResizeHandle: View {
                     cursorPushed = false
                 }
             }
+    }
+}
+
+private struct MotionDiagnosticsPanel: View {
+    let samples: [MotionRuntimeSample]
+    let latest: MotionInterpolationRuntimeStatus?
+    let interpolationBudgetMs: Double
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Diagnostics (60s)")
+                    .font(.system(size: 12, weight: .semibold))
+                Spacer()
+                if let latest {
+                    Text(latest.method.replacingOccurrences(of: "_", with: " "))
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            MotionDiagnosticsGraph(samples: samples, interpolationBudgetMs: interpolationBudgetMs)
+                .frame(height: 92)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                )
+
+            HStack(spacing: 12) {
+                legendLabel(color: .green, text: "CPU")
+                legendLabel(color: .blue, text: "GPU")
+                legendLabel(color: .orange, text: "Interpolation")
+                Spacer()
+                if let latest {
+                    Text(latest.fallbackReason == "none"
+                        ? "No fallback"
+                        : "Fallback: \(latest.fallbackReason.replacingOccurrences(of: "_", with: " "))")
+                        .font(.system(size: 10))
+                        .foregroundColor(latest.fallbackReason == "none" ? .secondary : .orange)
+                }
+            }
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color.white.opacity(0.03))
+        )
+    }
+
+    @ViewBuilder
+    private func legendLabel(color: Color, text: String) -> some View {
+        HStack(spacing: 4) {
+            Circle().fill(color).frame(width: 6, height: 6)
+            Text(text)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+private struct MotionDiagnosticsGraph: View {
+    let samples: [MotionRuntimeSample]
+    let interpolationBudgetMs: Double
+
+    var body: some View {
+        GeometryReader { geo in
+            Canvas { context, size in
+                let now = samples.last?.timestamp ?? Date()
+                let start = now.addingTimeInterval(-60)
+                let visible = samples.filter { $0.timestamp >= start }
+                guard !visible.isEmpty else { return }
+
+                let cpuPoints = visible.map { sample -> CGPoint in
+                    let x = xPosition(sample.timestamp, start: start, width: size.width)
+                    let normalized = CGFloat((sample.status.cpuLoadPercent ?? 0) / 100.0)
+                    return CGPoint(x: x, y: size.height * (1 - normalized))
+                }
+
+                let gpuPoints = visible.map { sample -> CGPoint in
+                    let x = xPosition(sample.timestamp, start: start, width: size.width)
+                    let normalized = CGFloat(min(1.0, (sample.status.gpuRenderMs ?? 0) / max(1, interpolationBudgetMs * 2)))
+                    return CGPoint(x: x, y: size.height * (1 - normalized))
+                }
+
+                let interpolationPoints = visible.map { sample -> CGPoint in
+                    let x = xPosition(sample.timestamp, start: start, width: size.width)
+                    let normalized = CGFloat(min(1.0, sample.status.interpolationMs / max(1, interpolationBudgetMs * 2)))
+                    return CGPoint(x: x, y: size.height * (1 - normalized))
+                }
+
+                drawLine(points: cpuPoints, color: .green, context: &context)
+                drawLine(points: gpuPoints, color: .blue, context: &context)
+                drawLine(points: interpolationPoints, color: .orange, context: &context)
+            }
+        }
+        .background(Color.black.opacity(0.22))
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private func xPosition(_ timestamp: Date, start: Date, width: CGFloat) -> CGFloat {
+        let delta = timestamp.timeIntervalSince(start)
+        let clamped = max(0, min(60, delta))
+        return width * CGFloat(clamped / 60.0)
+    }
+
+    private func drawLine(points: [CGPoint], color: Color, context: inout GraphicsContext) {
+        guard points.count >= 2 else { return }
+        var path = Path()
+        path.move(to: points[0])
+        for point in points.dropFirst() {
+            path.addLine(to: point)
+        }
+        context.stroke(path, with: .color(color), lineWidth: 1.3)
     }
 }
 
@@ -1467,10 +2720,49 @@ struct ChannelAboutPanel: Identifiable, Hashable {
 }
 
 struct ChannelAboutLink: Identifiable, Hashable {
-    var id: String { url.absoluteString }
+    let id: String
     let title: String
     let url: URL
     let imageURL: URL?
+    let isImageLink: Bool
+
+    init(
+        id: String? = nil,
+        title: String,
+        url: URL,
+        imageURL: URL?,
+        isImageLink: Bool,
+        occurrence: Int = 0
+    ) {
+        self.title = title
+        self.url = url
+        self.imageURL = imageURL
+        self.isImageLink = isImageLink
+        self.id = id ?? ChannelAboutLink.makeStableID(
+            url: url,
+            title: title,
+            imageURL: imageURL,
+            isImageLink: isImageLink,
+            occurrence: occurrence
+        )
+    }
+
+    private static func makeStableID(
+        url: URL,
+        title: String,
+        imageURL: URL?,
+        isImageLink: Bool,
+        occurrence: Int
+    ) -> String {
+        let normalizedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let imageKey = imageURL?.absoluteString ?? ""
+        let kind = isImageLink ? "image" : "text"
+        return [url.absoluteString, normalizedTitle, imageKey, kind, String(occurrence)].joined(separator: "|")
+    }
+
+    var normalizedTitle: String {
+        title.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
 }
 
 final class ChannelAboutStore: NSObject, ObservableObject, WKNavigationDelegate, WKScriptMessageHandler {
@@ -1600,10 +2892,14 @@ final class ChannelAboutStore: NSObject, ObservableObject, WKNavigationDelegate,
               const linkNodes = Array.from(panel.querySelectorAll('a[href]'));
               const links = linkNodes.map(link => {
                 const linkImage = link.querySelector('img[src]');
+                const textValue = trim(link.textContent || '');
+                const imageValue = linkImage ? (linkImage.getAttribute('src') || '') : '';
+                const isImageLink = !!imageValue;
                 return {
-                  title: trim(link.textContent || link.getAttribute('href') || ''),
+                  title: isImageLink ? textValue : trim(link.textContent || link.getAttribute('href') || ''),
                   url: link.getAttribute('href') || '',
-                  imageURL: linkImage ? (linkImage.getAttribute('src') || '') : ''
+                  imageURL: imageValue,
+                  isImageLink: isImageLink
                 };
               }).filter(item => item.url);
 
@@ -1663,13 +2959,24 @@ final class ChannelAboutStore: NSObject, ObservableObject, WKNavigationDelegate,
             let body = (item["body"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let imageURLString = (item["imageURL"] as? String) ?? ""
             let imageURL = imageURLString.isEmpty ? nil : URL(string: imageURLString)
-            let linkItems = item["links"] as? [[String: String]] ?? []
-            let links = linkItems.compactMap { link -> ChannelAboutLink? in
-                guard let urlString = link["url"], let url = URL(string: urlString) else { return nil }
-                let label = (link["title"] ?? urlString).trimmingCharacters(in: .whitespacesAndNewlines)
-                let linkImageString = (link["imageURL"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let linkItems = item["links"] as? [[String: Any]] ?? []
+            let links = linkItems.enumerated().compactMap { index, link -> ChannelAboutLink? in
+                guard let urlString = link["url"] as? String, let url = URL(string: urlString) else { return nil }
+                let isImageLink = (link["isImageLink"] as? Bool) ?? false
+                let rawTitle = (link["title"] as? String) ?? (isImageLink ? "" : urlString)
+                let label = rawTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+                let linkImageString = ((link["imageURL"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
                 let linkImageURL = linkImageString.isEmpty ? nil : URL(string: linkImageString)
-                return ChannelAboutLink(title: label.isEmpty ? urlString : label, url: url, imageURL: linkImageURL)
+                let linkID = [url.absoluteString, label.lowercased(), linkImageString, isImageLink ? "image" : "text", String(index)]
+                    .joined(separator: "|")
+                return ChannelAboutLink(
+                    id: linkID,
+                    title: label.isEmpty ? (isImageLink ? "" : urlString) : label,
+                    url: url,
+                    imageURL: linkImageURL,
+                    isImageLink: isImageLink,
+                    occurrence: index
+                )
             }
             guard !title.isEmpty || !body.isEmpty || !links.isEmpty else { return nil }
             return ChannelAboutPanel(title: title, body: body, imageURL: imageURL, links: links)
@@ -1750,13 +3057,14 @@ struct ChannelAboutPanelView: View {
                                         image
                                             .resizable()
                                             .scaledToFit()
-                                            .frame(maxHeight: 160)
-                                            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                            .frame(maxHeight: 180)
+                                            .clipped()
                                     } placeholder: {
                                         Color.white.opacity(0.08)
-                                            .frame(height: 110)
-                                            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                            .frame(maxWidth: .infinity, minHeight: 110, maxHeight: 160)
                                     }
+                                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                                 }
                                 if !panel.body.isEmpty {
                                     Text(panel.body)
@@ -1767,21 +3075,34 @@ struct ChannelAboutPanelView: View {
                                 if !panel.links.isEmpty {
                                     VStack(alignment: .leading, spacing: 8) {
                                         ForEach(panel.links) { link in
-                                            HStack(spacing: 8) {
-                                                if let imageURL = link.imageURL {
-                                                    AsyncImage(url: imageURL) { image in
-                                                        image
-                                                            .resizable()
-                                                            .scaledToFill()
-                                                            .frame(width: 42, height: 42)
-                                                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                                                    } placeholder: {
-                                                        Color.white.opacity(0.08)
-                                                            .frame(width: 42, height: 42)
-                                                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                                            if link.isImageLink, let imageURL = link.imageURL {
+                                                Link(destination: link.url) {
+                                                    VStack(alignment: .leading, spacing: 6) {
+                                                        AsyncImage(url: imageURL) { image in
+                                                            image
+                                                                .resizable()
+                                                                .scaledToFill()
+                                                                .frame(maxWidth: .infinity, alignment: .leading)
+                                                                .aspectRatio(16.0 / 9.0, contentMode: .fit)
+                                                                .clipped()
+                                                        } placeholder: {
+                                                            Color.white.opacity(0.08)
+                                                                .frame(maxWidth: .infinity, minHeight: 120, maxHeight: 180)
+                                                        }
+                                                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+                                                        let caption = displayLinkTitle(link)
+                                                        if !caption.isEmpty {
+                                                            Text(caption)
+                                                                .font(.system(size: 11, weight: .medium))
+                                                                .foregroundStyle(.white.opacity(0.72))
+                                                                .lineLimit(2)
+                                                        }
                                                     }
                                                 }
-                                                Link(link.title, destination: link.url)
+                                                .buttonStyle(.plain)
+                                            } else {
+                                                Link(displayLinkTitle(link), destination: link.url)
                                                     .font(.system(size: 12, weight: .medium))
                                                     .foregroundColor(.purple.opacity(0.9))
                                             }
@@ -1793,6 +3114,7 @@ struct ChannelAboutPanelView: View {
                             .frame(maxWidth: .infinity, alignment: .topLeading)
                             .background(Color.white.opacity(0.06))
                             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                            .clipped()
                         }
                     }
                 }
@@ -1811,6 +3133,22 @@ struct ChannelAboutPanelView: View {
         .onChange(of: channelName) { newValue in
             store.load(channelName: newValue)
         }
+    }
+
+    private func displayLinkTitle(_ link: ChannelAboutLink) -> String {
+        let title = link.normalizedTitle
+        if title.isEmpty {
+            return link.url.host ?? link.url.absoluteString
+        }
+        if isRawURLText(title) {
+            return link.url.host ?? title
+        }
+        return title
+    }
+
+    private func isRawURLText(_ value: String) -> Bool {
+        let lower = value.lowercased()
+        return lower.hasPrefix("http://") || lower.hasPrefix("https://") || lower.contains("://")
     }
 }
 
@@ -1842,8 +3180,10 @@ final class ChannelVideosStore: NSObject, ObservableObject, WKNavigationDelegate
 
     private var webView: WKWebView?
     private var currentChannel: String?
+    private var currentOfflineState = false
     private var loadingDeadlineWorkItem: DispatchWorkItem?
     private var gqlFallbackAttempts: Set<String> = []
+    private var routeFallbackAttempts: Set<String> = []
 
     override init() {
         super.init()
@@ -1857,53 +3197,71 @@ final class ChannelVideosStore: NSObject, ObservableObject, WKNavigationDelegate
         return view
     }
 
-    func load(channelName: String, section: Section) {
+    func load(channelName: String, section: Section, isChannelOffline: Bool = false) {
         let normalized = channelName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalized.isEmpty else { return }
 
         let didChangeChannel = (normalized != currentChannel)
+        let didChangeOffline = (isChannelOffline != currentOfflineState)
         currentChannel = normalized
+        currentOfflineState = isChannelOffline
         self.section = section
 
         lastError = nil
         loadingDeadlineWorkItem?.cancel()
         isLoading = true
 
-        if didChangeChannel {
+        if didChangeChannel || didChangeOffline {
             vods = []
             clips = []
             gqlFallbackAttempts.removeAll()
+            routeFallbackAttempts.removeAll()
         }
 
-        scheduleLoadingDeadline(for: normalized, section: section)
-        scheduleGQLFallback(for: normalized, section: section)
+        scheduleLoadingDeadline(for: normalized, section: section, offline: isChannelOffline)
+        scheduleGQLFallback(for: normalized, section: section, offline: isChannelOffline)
 
-        let url: URL = {
-            switch section {
-            case .videos:
-                return URL(string: "https://www.twitch.tv/\(normalized)/videos")!
-            case .clips:
-                return URL(string: "https://www.twitch.tv/\(normalized)/clips")!
+        let url = preferredRouteURL(channel: normalized, section: section, offline: isChannelOffline)
+
+        if let currentURL = webView?.url {
+            let sameChannel = currentURL.absoluteString.contains("/\(normalized)/")
+            let samePath = currentURL.path.lowercased() == url.path.lowercased()
+            let currentQuery = currentURL.query ?? ""
+            let targetQuery = url.query ?? ""
+            if sameChannel && samePath && currentQuery == targetQuery {
+                webView?.evaluateJavaScript("window.__glitcho_scrapeChannelVideos && window.__glitcho_scrapeChannelVideos();", completionHandler: nil)
+            } else {
+                webView?.load(URLRequest(url: url))
             }
-        }()
-
-        let current = webView?.url?.absoluteString ?? ""
-        let expects = section == .videos ? "/videos" : "/clips"
-        if current.contains("/\(normalized)/") && current.contains(expects) {
-            webView?.evaluateJavaScript("window.__glitcho_scrapeChannelVideos && window.__glitcho_scrapeChannelVideos();", completionHandler: nil)
         } else {
             webView?.load(URLRequest(url: url))
         }
     }
 
-    private func scheduleLoadingDeadline(for channel: String, section: Section) {
+    private func scheduleLoadingDeadline(for channel: String, section: Section, offline: Bool) {
         loadingDeadlineWorkItem?.cancel()
 
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
             guard self.currentChannel == channel else { return }
             guard self.section == section else { return }
+            guard self.currentOfflineState == offline else { return }
             if self.isLoading {
+                let items: [ChannelVideoItem]
+                switch section {
+                case .videos: items = self.vods
+                case .clips: items = self.clips
+                }
+                if (items.isEmpty || self.isLowConfidenceVideosPayload(items, section: section)),
+                   let fallbackURL = self.fallbackRouteURL(channel: channel, section: section, offline: offline) {
+                    let fallbackKey = self.routeAttemptKey(channel: channel, section: section, offline: offline, fallback: true)
+                    if !self.routeFallbackAttempts.contains(fallbackKey) {
+                        self.routeFallbackAttempts.insert(fallbackKey)
+                        self.webView?.load(URLRequest(url: fallbackURL))
+                        self.scheduleLoadingDeadline(for: channel, section: section, offline: offline)
+                        return
+                    }
+                }
                 self.isLoading = false
             }
         }
@@ -1912,16 +3270,21 @@ final class ChannelVideosStore: NSObject, ObservableObject, WKNavigationDelegate
         DispatchQueue.main.asyncAfter(deadline: .now() + 6.0, execute: work)
     }
 
-    private func scheduleGQLFallback(for channel: String, section: Section) {
-        let key = "\(channel.lowercased())|\(section.rawValue)"
+    private func scheduleGQLFallback(for channel: String, section: Section, offline: Bool) {
+        let key = "\(channel.lowercased())|\(section.rawValue)|offline=\(offline ? "1" : "0")"
         guard !gqlFallbackAttempts.contains(key) else { return }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.2) { [weak self] in
             guard let self else { return }
             guard self.currentChannel == channel else { return }
             guard self.section == section else { return }
+            guard self.currentOfflineState == offline else { return }
 
-            let itemsEmpty = (section == .videos) ? self.vods.isEmpty : self.clips.isEmpty
+            let itemsEmpty: Bool
+            switch section {
+            case .videos: itemsEmpty = self.vods.isEmpty
+            case .clips: itemsEmpty = self.clips.isEmpty
+            }
             if itemsEmpty {
                 self.gqlFallbackAttempts.insert(key)
                 Task { await self.fetchGQLFallback(channel: channel, section: section) }
@@ -2141,11 +3504,41 @@ final class ChannelVideosStore: NSObject, ObservableObject, WKNavigationDelegate
         webView?.reload()
     }
 
+    static func preferredRouteURLForTests(channel: String, section: Section, offline: Bool) -> URL {
+        preferredRouteURL(channel: channel, section: section, offline: offline)
+    }
+
+    private static func preferredRouteURL(channel: String, section: Section, offline _: Bool) -> URL {
+        switch section {
+        case .videos:
+            return URL(string: "https://www.twitch.tv/\(channel)/videos")!
+        case .clips:
+            return URL(string: "https://www.twitch.tv/\(channel)/clips")!
+        }
+    }
+
+    private func preferredRouteURL(channel: String, section: Section, offline: Bool) -> URL {
+        Self.preferredRouteURL(channel: channel, section: section, offline: offline)
+    }
+
+    private func fallbackRouteURL(channel: String, section: Section, offline: Bool) -> URL? {
+        switch section {
+        case .videos:
+            return URL(string: "https://www.twitch.tv/\(channel)/videos?filter=archives&sort=time")
+        case .clips:
+            return URL(string: "https://www.twitch.tv/\(channel)/clips?range=all")
+        }
+    }
+
+    private func routeAttemptKey(channel: String, section: Section, offline: Bool, fallback: Bool) -> String {
+        "\(channel.lowercased())|\(section.rawValue)|offline=\(offline ? "1" : "0")|fallback=\(fallback ? "1" : "0")"
+    }
+
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
         DispatchQueue.main.async {
             self.isLoading = true
             if let channel = self.currentChannel {
-                self.scheduleLoadingDeadline(for: channel, section: self.section)
+                self.scheduleLoadingDeadline(for: channel, section: self.section, offline: self.currentOfflineState)
             }
         }
     }
@@ -2178,7 +3571,12 @@ final class ChannelVideosStore: NSObject, ObservableObject, WKNavigationDelegate
         guard let sectionString = (dict["section"] as? String)?.lowercased() else { return }
         guard let items = dict["items"] as? [[String: Any]] else { return }
 
-        let section: Section = (sectionString == "clips") ? .clips : .videos
+        let section: Section
+        if sectionString == "clips" {
+            section = .clips
+        } else {
+            section = .videos
+        }
 
         let parsed = items.compactMap { item -> ChannelVideoItem? in
             guard let id = item["id"] as? String, !id.isEmpty else { return nil }
@@ -2207,13 +3605,49 @@ final class ChannelVideosStore: NSObject, ObservableObject, WKNavigationDelegate
 
         DispatchQueue.main.async {
             if parsed.isEmpty {
-                // Avoid flicker (Twitch mutates DOM a lot).
-                let existing = (section == .clips) ? self.clips : self.vods
+                let existing: [ChannelVideoItem]
+                switch section {
+                case .videos: existing = self.vods
+                case .clips: existing = self.clips
+                }
                 if !existing.isEmpty {
                     return
                 }
-                // Keep loading state until the timeout fires.
                 return
+            }
+
+            if self.isLowConfidenceVideosPayload(parsed, section: section) {
+                let existing: [ChannelVideoItem]
+                switch section {
+                case .videos: existing = self.vods
+                case .clips: existing = self.clips
+                }
+                if !existing.isEmpty {
+                    return
+                }
+                if let channel = self.currentChannel,
+                   let fallbackURL = self.fallbackRouteURL(
+                    channel: channel,
+                    section: section,
+                    offline: self.currentOfflineState
+                   ) {
+                    let fallbackKey = self.routeAttemptKey(
+                        channel: channel,
+                        section: section,
+                        offline: self.currentOfflineState,
+                        fallback: true
+                    )
+                    if !self.routeFallbackAttempts.contains(fallbackKey) {
+                        self.routeFallbackAttempts.insert(fallbackKey)
+                        self.webView?.load(URLRequest(url: fallbackURL))
+                        self.scheduleLoadingDeadline(
+                            for: channel,
+                            section: section,
+                            offline: self.currentOfflineState
+                        )
+                        return
+                    }
+                }
             }
 
             self.loadingDeadlineWorkItem?.cancel()
@@ -2232,6 +3666,30 @@ final class ChannelVideosStore: NSObject, ObservableObject, WKNavigationDelegate
 
             self.isLoading = false
         }
+    }
+
+    private func isLowConfidenceVideosPayload(_ items: [ChannelVideoItem], section: Section) -> Bool {
+        guard section == .videos else { return false }
+        guard items.count >= 3 else { return false }
+
+        let thumbs = items.compactMap { $0.thumbnailURL?.absoluteString.lowercased() }
+        if thumbs.count < min(3, items.count) {
+            return true
+        }
+
+        var frequency: [String: Int] = [:]
+        for thumb in thumbs {
+            frequency[thumb, default: 0] += 1
+        }
+
+        let maxRepeat = frequency.values.max() ?? 0
+        let repeatRatio = Double(maxRepeat) / Double(max(1, thumbs.count))
+        if repeatRatio >= 0.75 {
+            return true
+        }
+
+        let uniqueRatio = Double(frequency.count) / Double(max(1, thumbs.count))
+        return uniqueRatio < 0.5
     }
 
     private func makeWebView() -> WKWebView {
@@ -2451,6 +3909,19 @@ final class ChannelVideosStore: NSObject, ObservableObject, WKNavigationDelegate
             }
           }
 
+          function nearestVideoContainer(anchor) {
+            try {
+              if (!anchor) return null;
+              return anchor.closest(
+                'article,[role="listitem"],li,' +
+                '[data-a-target*="video"],[data-test-selector*="video"],' +
+                '[class*="video-card"],[class*="thumbnail"]'
+              );
+            } catch (_) {
+              return null;
+            }
+          }
+
           function videoIDFromHref(href) {
             try {
               const u = href.startsWith('http') ? new URL(href) : new URL(href, window.location.origin);
@@ -2606,10 +4077,6 @@ final class ChannelVideosStore: NSObject, ObservableObject, WKNavigationDelegate
               }
             }
 
-            if (extractFromApollo()) {
-              return items.slice(0, 80);
-            }
-
             function pushFromCard(card) {
               try {
                 if (!card) return;
@@ -2661,8 +4128,9 @@ final class ChannelVideosStore: NSObject, ObservableObject, WKNavigationDelegate
                 if (!id) continue;
                 if (seen[id]) continue;
 
-                const card = a.closest('article') || a.closest('div') || a;
-                const img = (card && card.querySelector('img')) || a.querySelector('img');
+                const card = nearestVideoContainer(a) || a.closest('article') || a;
+                const img = a.querySelector('img') || (card && card.querySelector('img'));
+                if (!img) continue;
                 const thumb = bestImageURL(img);
                 const title = pickTitle(a, card, img, 'Video ' + id);
                 const duration = findDurationIn(card);
@@ -2682,6 +4150,14 @@ final class ChannelVideosStore: NSObject, ObservableObject, WKNavigationDelegate
                 if (items.length >= 80) break;
               }
             } catch (_) {}
+
+            if (items.length) {
+              return items.slice(0, 80);
+            }
+
+            if (extractFromApollo()) {
+              return items.slice(0, 80);
+            }
 
             return items;
           }
@@ -2740,10 +4216,6 @@ final class ChannelVideosStore: NSObject, ObservableObject, WKNavigationDelegate
               } catch (_) {
                 return false;
               }
-            }
-
-            if (extractFromApollo()) {
-              return items.slice(0, 80);
             }
 
             function pushFromCard(card) {
@@ -2806,8 +4278,9 @@ final class ChannelVideosStore: NSObject, ObservableObject, WKNavigationDelegate
                 if (!slug) continue;
                 if (seen[slug]) continue;
 
-                const card = a.closest('article') || a.closest('div') || a;
-                const img = (card && card.querySelector('img')) || a.querySelector('img');
+                const card = nearestVideoContainer(a) || a.closest('article') || a;
+                const img = a.querySelector('img') || (card && card.querySelector('img'));
+                if (!img) continue;
                 const thumb = bestImageURL(img);
                 const title = pickTitle(a, card, img, 'Clip ' + slug);
                 const duration = findDurationIn(card);
@@ -2827,6 +4300,14 @@ final class ChannelVideosStore: NSObject, ObservableObject, WKNavigationDelegate
                 if (items.length >= 80) break;
               }
             } catch (_) {}
+
+            if (items.length) {
+              return items.slice(0, 80);
+            }
+
+            if (extractFromApollo()) {
+              return items.slice(0, 80);
+            }
 
             return items;
           }
@@ -2927,6 +4408,497 @@ struct ChannelVideosScraperView: NSViewRepresentable {
     func updateNSView(_ nsView: WKWebView, context: Context) {
         nsView.isHidden = false
         nsView.alphaValue = 0.01
+    }
+}
+
+struct ChannelScheduleItem: Identifiable, Hashable {
+    let id: String
+    let title: String
+    let subtitle: String
+    let startAt: Date
+    let endAt: Date?
+    let isRecurring: Bool
+    let isCanceled: Bool
+}
+
+final class ChannelScheduleStore: NSObject, ObservableObject, WKNavigationDelegate, WKScriptMessageHandler {
+    @Published var items: [ChannelScheduleItem] = []
+    @Published var isLoading = false
+    @Published var lastError: String?
+
+    private var webView: WKWebView?
+    private var currentChannel: String?
+    private var loadingDeadlineWorkItem: DispatchWorkItem?
+
+    override init() {
+        super.init()
+        webView = makeWebView()
+    }
+
+    func attachWebView() -> WKWebView {
+        if let webView { return webView }
+        let view = makeWebView()
+        webView = view
+        return view
+    }
+
+    func load(channelName: String) {
+        let normalized = channelName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return }
+        guard normalized != currentChannel else { return }
+        currentChannel = normalized
+
+        loadingDeadlineWorkItem?.cancel()
+        isLoading = true
+        lastError = nil
+        items = []
+        scheduleLoadingDeadline(for: normalized)
+
+        let url = URL(string: "https://www.twitch.tv/\(normalized)/schedule")!
+        webView?.load(URLRequest(url: url))
+    }
+
+    private func scheduleLoadingDeadline(for channel: String) {
+        loadingDeadlineWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            guard self.currentChannel == channel else { return }
+            if self.isLoading {
+                self.isLoading = false
+            }
+        }
+        loadingDeadlineWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6.0, execute: work)
+    }
+
+    private func makeWebView() -> WKWebView {
+        let config = WKWebViewConfiguration()
+        let contentController = WKUserContentController()
+        config.userContentController = contentController
+        config.websiteDataStore = .default()
+        config.defaultWebpagePreferences.allowsContentJavaScript = true
+        config.mediaTypesRequiringUserActionForPlayback = [.audio, .video]
+
+        contentController.add(self, name: "channelSchedule")
+        contentController.addUserScript(Self.blockMediaScript)
+        contentController.addUserScript(Self.scrapeScheduleScript)
+
+        let webView = WKWebView(frame: .zero, configuration: config)
+        webView.navigationDelegate = self
+        webView.setValue(false, forKey: "drawsBackground")
+        if #available(macOS 12.0, *) {
+            webView.underPageBackgroundColor = .clear
+        }
+        webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15"
+        return webView
+    }
+
+    private static let scrapeScheduleScript = WKUserScript(
+        source: #"""
+        (function() {
+          if (window.__glitcho_schedule_scrape) { return; }
+          window.__glitcho_schedule_scrape = true;
+
+          function trim(s) {
+            return (s || '').replace(/\s+/g, ' ').trim();
+          }
+
+          function getApolloState() {
+            try {
+              if (window.__APOLLO_STATE__ && Object.keys(window.__APOLLO_STATE__).length) {
+                return window.__APOLLO_STATE__;
+              }
+            } catch (_) {}
+            try {
+              if (window.__INITIAL_STATE__ && window.__INITIAL_STATE__.apolloState) {
+                return window.__INITIAL_STATE__.apolloState;
+              }
+            } catch (_) {}
+            return null;
+          }
+
+          function resolveRef(state, ref) {
+            if (!state || !ref) return null;
+            if (typeof ref === 'string') return state[ref] || null;
+            return ref;
+          }
+
+          function extractFromApollo() {
+            const state = getApolloState();
+            if (!state) { return []; }
+
+            const items = [];
+            const seen = new Set();
+            const keys = Object.keys(state);
+            for (const key of keys) {
+              const node = state[key];
+              if (!node || typeof node !== 'object') { continue; }
+              const type = (node.__typename || '').toLowerCase();
+              if (!(type.includes('schedule') && type.includes('segment'))) { continue; }
+
+              const startAt = node.startAt || node.startTime || node.startsAt || node.startDate || '';
+              if (!startAt) { continue; }
+
+              const endAt = node.endAt || node.endTime || node.endsAt || node.endDate || '';
+              const title = trim(node.title || node.description || node.name || 'Scheduled stream');
+              const recurring = !!node.isRecurring;
+              const canceled = !!node.isCanceled || !!node.isCancelled || !!node.canceledUntil;
+              const category = resolveRef(state, node.category) || resolveRef(state, node.game);
+              const subtitle = trim((category && (category.displayName || category.name)) || '');
+
+              const id = String(node.id || key);
+              if (seen.has(id)) { continue; }
+              seen.add(id);
+
+              items.push({
+                id: id,
+                title: title || 'Scheduled stream',
+                subtitle: subtitle,
+                startAt: startAt,
+                endAt: endAt,
+                isRecurring: recurring,
+                isCanceled: canceled
+              });
+            }
+
+            return items;
+          }
+
+          function extractFromDOM() {
+            const cards = Array.from(document.querySelectorAll('article, [data-test-selector*="segment"], [data-a-target*="segment"]')).slice(0, 200);
+            const items = [];
+            const seen = new Set();
+
+            for (const card of cards) {
+              const timeEls = Array.from(card.querySelectorAll('time[datetime]'));
+              const startAt = trim((timeEls[0] && timeEls[0].getAttribute('datetime')) || '');
+              if (!startAt) { continue; }
+              const endAt = trim((timeEls[1] && timeEls[1].getAttribute('datetime')) || '');
+
+              const heading = card.querySelector('h1,h2,h3,[role="heading"]');
+              const title = trim((heading && heading.textContent) || '');
+              const subtitleNode = card.querySelector('p,span');
+              const subtitle = trim((subtitleNode && subtitleNode.textContent) || '');
+              const id = trim(card.getAttribute('data-a-id') || card.getAttribute('data-id') || startAt + '|' + title);
+              if (!id || seen.has(id)) { continue; }
+              seen.add(id);
+
+              items.push({
+                id: id,
+                title: title || 'Scheduled stream',
+                subtitle: subtitle,
+                startAt: startAt,
+                endAt: endAt,
+                isRecurring: false,
+                isCanceled: false
+              });
+            }
+
+            return items;
+          }
+
+          function normalize(items) {
+            return (items || [])
+              .filter(i => i && i.startAt)
+              .sort((a, b) => {
+                const av = Date.parse(a.startAt || '') || 0;
+                const bv = Date.parse(b.startAt || '') || 0;
+                return av - bv;
+              })
+              .slice(0, 120);
+          }
+
+          let lastSent = null;
+          let pending = false;
+
+          function postIfChanged() {
+            const apollo = extractFromApollo();
+            const dom = apollo.length ? [] : extractFromDOM();
+            const items = normalize(apollo.length ? apollo : dom);
+            let serialized = null;
+            try { serialized = JSON.stringify(items); } catch (_) { serialized = null; }
+            if (serialized === lastSent) { return; }
+            lastSent = serialized;
+            try {
+              window.webkit.messageHandlers.channelSchedule.postMessage({ items: items });
+            } catch (_) {}
+          }
+
+          function schedulePost() {
+            if (pending) { return; }
+            pending = true;
+            setTimeout(function() {
+              pending = false;
+              postIfChanged();
+            }, 350);
+          }
+
+          window.__glitcho_scrapeChannelSchedule = postIfChanged;
+          postIfChanged();
+          const observer = new MutationObserver(schedulePost);
+          observer.observe(document.documentElement, { childList: true, subtree: true });
+          setTimeout(postIfChanged, 1000);
+          setTimeout(postIfChanged, 2000);
+          setTimeout(postIfChanged, 4000);
+        })();
+        """#,
+        injectionTime: .atDocumentEnd,
+        forMainFrameOnly: true
+    )
+
+    private static let blockMediaScript = WKUserScript(
+        source: #"""
+        (function() {
+          if (window.__glitcho_block_media_schedule) { return; }
+          window.__glitcho_block_media_schedule = true;
+
+          function pauseAll() {
+            try {
+              document.querySelectorAll('video,audio').forEach(el => {
+                try { el.pause(); } catch (e) {}
+                try { el.muted = true; } catch (e) {}
+                try { el.volume = 0; } catch (e) {}
+                try { el.removeAttribute('autoplay'); } catch (e) {}
+              });
+            } catch (e) {}
+          }
+
+          try {
+            const origPlay = HTMLMediaElement.prototype.play;
+            HTMLMediaElement.prototype.play = function() {
+              try { this.pause(); } catch (e) {}
+              try { this.muted = true; this.volume = 0; } catch (e) {}
+              return Promise.reject(new Error('Blocked by Glitcho'));
+            };
+            window.__glitcho_origPlay_schedule = origPlay;
+          } catch (e) {}
+
+          pauseAll();
+          const observer = new MutationObserver(pauseAll);
+          observer.observe(document.documentElement, { childList: true, subtree: true });
+          setInterval(pauseAll, 2000);
+        })();
+        """#,
+        injectionTime: .atDocumentStart,
+        forMainFrameOnly: true
+    )
+
+    func reload() {
+        webView?.reload()
+    }
+
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        DispatchQueue.main.async {
+            self.isLoading = true
+            if let channel = self.currentChannel {
+                self.scheduleLoadingDeadline(for: channel)
+            }
+        }
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        webView.evaluateJavaScript("window.__glitcho_scrapeChannelSchedule && window.__glitcho_scrapeChannelSchedule();", completionHandler: nil)
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        DispatchQueue.main.async {
+            self.loadingDeadlineWorkItem?.cancel()
+            self.loadingDeadlineWorkItem = nil
+            self.lastError = error.localizedDescription
+            self.isLoading = false
+        }
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        DispatchQueue.main.async {
+            self.loadingDeadlineWorkItem?.cancel()
+            self.loadingDeadlineWorkItem = nil
+            self.lastError = error.localizedDescription
+            self.isLoading = false
+        }
+    }
+
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard message.name == "channelSchedule" else { return }
+        guard let dict = message.body as? [String: Any] else { return }
+        guard let payload = dict["items"] as? [[String: Any]] else { return }
+
+        let parsed = payload.compactMap { raw -> ChannelScheduleItem? in
+            guard let id = raw["id"] as? String, !id.isEmpty else { return nil }
+            guard let startRaw = raw["startAt"] as? String else { return nil }
+            guard let startAt = Self.parseISO8601(startRaw) else { return nil }
+
+            let title = ((raw["title"] as? String) ?? "Scheduled stream").trimmingCharacters(in: .whitespacesAndNewlines)
+            let subtitle = ((raw["subtitle"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let endAt = (raw["endAt"] as? String).flatMap(Self.parseISO8601)
+            let isRecurring = (raw["isRecurring"] as? Bool) ?? false
+            let isCanceled = (raw["isCanceled"] as? Bool) ?? false
+
+            return ChannelScheduleItem(
+                id: id,
+                title: title.isEmpty ? "Scheduled stream" : title,
+                subtitle: subtitle,
+                startAt: startAt,
+                endAt: endAt,
+                isRecurring: isRecurring,
+                isCanceled: isCanceled
+            )
+        }
+
+        DispatchQueue.main.async {
+            if parsed.isEmpty {
+                if !self.items.isEmpty {
+                    return
+                }
+                return
+            }
+
+            self.loadingDeadlineWorkItem?.cancel()
+            self.loadingDeadlineWorkItem = nil
+
+            if self.items != parsed {
+                self.items = parsed
+            }
+            self.isLoading = false
+        }
+    }
+
+    private static let iso8601FormatterWithFraction: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
+    private static let iso8601FormatterPlain: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter
+    }()
+
+    private static func parseISO8601(_ value: String) -> Date? {
+        iso8601FormatterWithFraction.date(from: value) ?? iso8601FormatterPlain.date(from: value)
+    }
+}
+
+struct ChannelScheduleScraperView: NSViewRepresentable {
+    @ObservedObject var store: ChannelScheduleStore
+
+    func makeNSView(context: Context) -> WKWebView {
+        let view = store.attachWebView()
+        view.isHidden = false
+        view.alphaValue = 0.01
+        return view
+    }
+
+    func updateNSView(_ nsView: WKWebView, context: Context) {
+        nsView.isHidden = false
+        nsView.alphaValue = 0.01
+    }
+}
+
+struct ChannelSchedulePanelView: View {
+    let channelName: String
+    @ObservedObject var store: ChannelScheduleStore
+
+    private static let dateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter
+    }()
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                if store.isLoading && store.items.isEmpty {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Loading schedule…")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundColor(.white.opacity(0.6))
+                    }
+                } else if store.items.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("No schedule available.")
+                            .font(.system(size: 12))
+                            .foregroundColor(.white.opacity(0.6))
+                        if let error = store.lastError, !error.isEmpty {
+                            Text(error)
+                                .font(.system(size: 11))
+                                .foregroundColor(.white.opacity(0.45))
+                                .lineLimit(3)
+                        }
+                    }
+                } else {
+                    ForEach(store.items) { item in
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(item.title)
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundStyle(.white.opacity(0.92))
+                                .lineLimit(2)
+
+                            Text(scheduleTimeText(item))
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundStyle(.white.opacity(0.72))
+
+                            if !item.subtitle.isEmpty {
+                                Text(item.subtitle)
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.white.opacity(0.56))
+                                    .lineLimit(2)
+                            }
+
+                            if item.isRecurring || item.isCanceled {
+                                HStack(spacing: 8) {
+                                    if item.isRecurring {
+                                        pill("Recurring")
+                                    }
+                                    if item.isCanceled {
+                                        pill("Canceled")
+                                    }
+                                }
+                            }
+                        }
+                        .padding(12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.white.opacity(0.06))
+                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .overlay(
+            ChannelScheduleScraperView(store: store)
+                .frame(width: 1200, height: 900)
+                .allowsHitTesting(false)
+                .opacity(0.001)
+        )
+        .onAppear {
+            store.load(channelName: channelName)
+        }
+        .onChange(of: channelName) { newValue in
+            store.load(channelName: newValue)
+        }
+    }
+
+    private func scheduleTimeText(_ item: ChannelScheduleItem) -> String {
+        let start = Self.dateFormatter.string(from: item.startAt)
+        if let end = item.endAt {
+            return "\(start) - \(Self.dateFormatter.string(from: end))"
+        }
+        return start
+    }
+
+    private func pill(_ title: String) -> some View {
+        Text(title)
+            .font(.system(size: 10, weight: .semibold))
+            .foregroundStyle(.white.opacity(0.88))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(Color.white.opacity(0.12))
+            .clipShape(Capsule())
     }
 }
 
@@ -3147,6 +5119,7 @@ private struct ChannelVideoCardView: View {
 struct ChannelVideosPanelView: View {
     let channelName: String
     @ObservedObject var store: ChannelVideosStore
+    let isChannelOffline: Bool
     let onSelectPlayback: (NativePlaybackRequest) -> Void
 
     private let gridColumns = [
@@ -3170,7 +5143,7 @@ struct ChannelVideosPanelView: View {
                     selection: Binding(
                         get: { store.section },
                         set: { newValue in
-                            store.load(channelName: channelName, section: newValue)
+                            store.load(channelName: channelName, section: newValue, isChannelOffline: isChannelOffline)
                         }
                     )
                 ) { $0.rawValue }
@@ -3195,7 +5168,12 @@ struct ChannelVideosPanelView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                 } else if currentItems.isEmpty {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text(store.section == .clips ? "No clips found yet." : "No videos found yet.")
+                        Text({
+                            switch store.section {
+                            case .clips: return "No clips found yet."
+                            case .videos: return "No videos found yet."
+                            }
+                        }())
                             .font(.system(size: 12))
                             .foregroundColor(.white.opacity(0.6))
 
@@ -3237,10 +5215,13 @@ struct ChannelVideosPanelView: View {
                 .opacity(0.001)
         )
         .onAppear {
-            store.load(channelName: channelName, section: store.section)
+            store.load(channelName: channelName, section: store.section, isChannelOffline: isChannelOffline)
         }
         .onChange(of: channelName) { newValue in
-            store.load(channelName: newValue, section: store.section)
+            store.load(channelName: newValue, section: store.section, isChannelOffline: isChannelOffline)
+        }
+        .onChange(of: isChannelOffline) { offline in
+            store.load(channelName: channelName, section: store.section, isChannelOffline: offline)
         }
     }
 }

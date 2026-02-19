@@ -273,8 +273,20 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
             let userID = try await fetchHelixUserID(login: login, authToken: authToken)
             let channels = try await fetchFollowedLiveHelixStreams(userID: userID, authToken: authToken)
             let now = Date()
-            if now.timeIntervalSince(lastFollowedChannelsSyncAt) > 600 || followedChannelLogins.isEmpty {
-                if let followedLogins = try? await fetchFollowedChannelsLogins(userID: userID, authToken: authToken) {
+            let liveLogins = Set(channels.map { $0.id.lowercased() })
+            let cachedFollowedLogins = Set(followedChannelLogins.map { $0.lowercased() })
+            let liveSubsetMissingInCache = !liveLogins.isSubset(of: cachedFollowedLogins)
+            let shouldRefreshFollowedLogins =
+                now.timeIntervalSince(lastFollowedChannelsSyncAt) > 60
+                || followedChannelLogins.isEmpty
+                || liveSubsetMissingInCache
+
+            if shouldRefreshFollowedLogins {
+                var followedLogins = try? await fetchFollowedChannelsLogins(userID: userID, authToken: authToken)
+                if followedLogins == nil || followedLogins?.isEmpty == true {
+                    followedLogins = try? await fetchFollowedChannelsGQL(authToken: authToken)
+                }
+                if let followedLogins, !followedLogins.isEmpty {
                     await MainActor.run {
                         if self.followedChannelLogins != followedLogins {
                             self.followedChannelLogins = followedLogins
@@ -368,7 +380,11 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
             cursor = decoded.pagination?.cursor
         } while cursor?.isEmpty == false
 
-        return channels.deduplicatedByLogin()
+        return channels
+            .deduplicatedByLogin()
+            .sorted { lhs, rhs in
+                lhs.id.localizedCaseInsensitiveCompare(rhs.id) == .orderedAscending
+            }
     }
 
     private func fetchFollowedChannelsLogins(userID: String, authToken: String) async throws -> [String] {
@@ -404,6 +420,55 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
             cursor = decoded.pagination?.cursor
         } while cursor?.isEmpty == false
 
+        var seen = Set<String>()
+        return logins.filter { seen.insert($0).inserted }.sorted()
+    }
+
+    private func fetchFollowedChannelsGQL(authToken: String) async throws -> [String] {
+        let query = """
+        query {
+          currentUser {
+            follows(first: 100) {
+              edges {
+                node {
+                  login
+                }
+              }
+            }
+          }
+        }
+        """
+        let body: [String: Any] = ["query": query]
+        guard let jsonData = try? JSONSerialization.data(withJSONObject: body) else { return [] }
+
+        var request = URLRequest(url: URL(string: "https://gql.twitch.tv/gql")!)
+        request.httpMethod = "POST"
+        request.httpBody = jsonData
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(Self.twitchWebClientID, forHTTPHeaderField: "Client-ID")
+        request.setValue("OAuth \(authToken)", forHTTPHeaderField: "Authorization")
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+            return []
+        }
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let dataObj = json["data"] as? [String: Any],
+              let currentUser = dataObj["currentUser"] as? [String: Any],
+              let follows = currentUser["follows"] as? [String: Any],
+              let edges = follows["edges"] as? [[String: Any]] else {
+            return []
+        }
+
+        var logins: [String] = []
+        for edge in edges {
+            guard let node = edge["node"] as? [String: Any],
+                  let login = node["login"] as? String else { continue }
+            let normalized = login.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if !normalized.isEmpty {
+                logins.append(normalized)
+            }
+        }
         var seen = Set<String>()
         return logins.filter { seen.insert($0).inserted }.sorted()
     }
@@ -548,7 +613,11 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
                 return TwitchChannel(id: login, name: displayName, url: normalizedURL, thumbnailURL: thumb)
             }
 
-            let channels = parsedChannels.deduplicatedByLogin()
+            let channels = parsedChannels
+                .deduplicatedByLogin()
+                .sorted { lhs, rhs in
+                    lhs.id.localizedCaseInsensitiveCompare(rhs.id) == .orderedAscending
+                }
 
             let isFromBackground = (userContentController === backgroundMessageController)
             // The main webview often posts empty snapshots while navigating non-following pages.
@@ -1703,7 +1772,7 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
                 document.querySelector('[data-a-target*="side-nav"]')) {
               extract();
             }
-          }, 5000);
+          }, 10000);
         })();
         """,
         injectionTime: .atDocumentEnd,

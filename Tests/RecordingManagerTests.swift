@@ -41,6 +41,21 @@ final class RecordingManagerTests: XCTestCase {
         return try await body()
     }
 
+    private func withConcurrencyLimit<T>(_ limit: Int, _ body: () async throws -> T) async throws -> T {
+        let defaults = UserDefaults.standard
+        let key = "recordingConcurrencyLimit"
+        let previous = defaults.object(forKey: key)
+        defaults.set(limit, forKey: key)
+        defer {
+            if let previous {
+                defaults.set(previous, forKey: key)
+            } else {
+                defaults.removeObject(forKey: key)
+            }
+        }
+        return try await body()
+    }
+
     private func makeFakeStreamlinkExecutable(in directory: URL) throws -> URL {
         let executable = directory.appendingPathComponent("fake-streamlink")
         let script = """
@@ -63,6 +78,66 @@ final class RecordingManagerTests: XCTestCase {
 
         : > "$output"
         sleep 60
+        """
+        try script.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        return executable
+    }
+
+    private func makeSlowTerminationStreamlinkExecutable(in directory: URL) throws -> URL {
+        let executable = directory.appendingPathComponent("slow-stop-streamlink")
+        let script = """
+        #!/bin/sh
+        set -eu
+
+        output=""
+        while [ "$#" -gt 0 ]; do
+          if [ "$1" = "--output" ]; then
+            shift
+            output="${1:-}"
+            break
+          fi
+          shift
+        done
+
+        if [ -z "$output" ]; then
+          exit 2
+        fi
+
+        : > "$output"
+        trap 'sleep 1; exit 0' TERM INT
+        while true; do
+          sleep 1
+        done
+        """
+        try script.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        return executable
+    }
+
+    private func makeFailingStreamlinkExecutable(in directory: URL) throws -> URL {
+        let executable = directory.appendingPathComponent("failing-streamlink")
+        let script = """
+        #!/bin/sh
+        set -eu
+
+        output=""
+        while [ "$#" -gt 0 ]; do
+          if [ "$1" = "--output" ]; then
+            shift
+            output="${1:-}"
+            break
+          fi
+          shift
+        done
+
+        if [ -z "$output" ]; then
+          exit 2
+        fi
+
+        : > "$output"
+        echo "streamlink failed" 1>&2
+        exit 1
         """
         try script.write(to: executable, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
@@ -209,6 +284,44 @@ final class RecordingManagerTests: XCTestCase {
         }
     }
 
+    func testRecorderOrchestrator_TracksStateTransitionsAndConcurrencySetting() {
+        let orchestrator = RecorderOrchestrator(maxConcurrentRecordings: 3, retryDelay: 90)
+
+        XCTAssertEqual(orchestrator.maxConcurrentRecordings, 3)
+        XCTAssertEqual(orchestrator.state(for: "streamera"), .idle)
+
+        orchestrator.setQueued(for: "StreamerA")
+        XCTAssertEqual(orchestrator.state(for: "streamera"), .queued)
+
+        orchestrator.setRecording(for: "streamera")
+        XCTAssertEqual(orchestrator.state(for: "streamera"), .recording)
+
+        orchestrator.setStopping(for: "streamera")
+        XCTAssertEqual(orchestrator.state(for: "streamera"), .stopping)
+
+        orchestrator.setIdle(for: "streamera")
+        XCTAssertEqual(orchestrator.state(for: "streamera"), .idle)
+    }
+
+    func testRecorderOrchestrator_ScheduleRetrySetsMetadataAndNextRetryTimestamp() {
+        let now = Date(timeIntervalSinceReferenceDate: 1_000)
+        let orchestrator = RecorderOrchestrator(maxConcurrentRecordings: 2, retryDelay: 45)
+
+        let nextRetryAt = orchestrator.scheduleRetry(for: "StreamerA", now: now, errorMessage: "boom")
+        XCTAssertEqual(orchestrator.state(for: "streamera"), .retrying)
+
+        guard let metadata = orchestrator.retryMetadata(for: "streamera") else {
+            XCTFail("Expected retry metadata")
+            return
+        }
+
+        XCTAssertEqual(metadata.retryCount, 1)
+        XCTAssertEqual(metadata.lastFailureAt, now)
+        XCTAssertEqual(metadata.nextRetryAt, now.addingTimeInterval(45))
+        XCTAssertEqual(metadata.nextRetryAt, nextRetryAt)
+        XCTAssertEqual(metadata.lastErrorMessage, "boom")
+    }
+
     func testDeleteRecording_RemovesFile() async throws {
         try await withTemporaryDirectory { dir in
             let url = dir.appendingPathComponent("sample.mp4")
@@ -299,6 +412,117 @@ final class RecordingManagerTests: XCTestCase {
 
                 manager.toggleRecording(target: "twitch.tv/streamerb", channelName: "Streamer B")
                 XCTAssertTrue(await waitUntil { manager.activeRecordingCount == 0 })
+            }
+        }
+    }
+
+    func testRecordingManager_QueuesWhenConcurrencyLimitReachedAndStartsWhenSlotFrees() async throws {
+        try await withTemporaryDirectory { dir in
+            try await withRecordingsDirectory(dir) {
+                try await withConcurrencyLimit(1) {
+                    let fakeStreamlink = try makeFakeStreamlinkExecutable(in: dir)
+                    let manager = RecordingManager()
+                    manager._resolveStreamlinkPathOverride = { fakeStreamlink.path }
+
+                    XCTAssertTrue(manager.startRecording(target: "twitch.tv/streamera", channelName: "Streamer A"))
+                    XCTAssertTrue(await waitUntil { manager.isRecording(channelLogin: "streamera") })
+
+                    XCTAssertTrue(manager.startRecording(target: "twitch.tv/streamerb", channelName: "Streamer B"))
+                    XCTAssertEqual(manager.recorderOrchestrator.state(for: "streamerb"), .queued)
+                    XCTAssertFalse(manager.isRecording(channelLogin: "streamerb"))
+
+                    manager.stopRecording(channelLogin: "streamera")
+
+                    XCTAssertTrue(await waitUntil {
+                        manager.recorderOrchestrator.state(for: "streamerb") == .recording
+                            && manager.isRecording(channelLogin: "streamerb")
+                    })
+
+                    manager.stopRecording()
+                    XCTAssertTrue(await waitUntil { manager.activeRecordingCount == 0 })
+                }
+            }
+        }
+    }
+
+    func testRecordingManager_StopQueuedRecordingCancelsQueue() async throws {
+        try await withTemporaryDirectory { dir in
+            try await withRecordingsDirectory(dir) {
+                try await withConcurrencyLimit(1) {
+                    let fakeStreamlink = try makeFakeStreamlinkExecutable(in: dir)
+                    let manager = RecordingManager()
+                    manager._resolveStreamlinkPathOverride = { fakeStreamlink.path }
+
+                    XCTAssertTrue(manager.startRecording(target: "twitch.tv/streamera", channelName: "Streamer A"))
+                    XCTAssertTrue(await waitUntil { manager.isRecording(channelLogin: "streamera") })
+
+                    XCTAssertTrue(manager.startRecording(target: "twitch.tv/streamerb", channelName: "Streamer B"))
+                    XCTAssertEqual(manager.recorderOrchestrator.state(for: "streamerb"), .queued)
+
+                    manager.stopRecording(channelLogin: "streamerb")
+                    XCTAssertEqual(manager.recorderOrchestrator.state(for: "streamerb"), .idle)
+
+                    manager.stopRecording(channelLogin: "streamera")
+                    XCTAssertTrue(await waitUntil {
+                        manager.activeRecordingCount == 0
+                            && !manager.isRecording(channelLogin: "streamerb")
+                            && manager.recorderOrchestrator.state(for: "streamerb") == .idle
+                    })
+                }
+            }
+        }
+    }
+
+    func testRecordingManager_UpdatesOrchestratorStateOnStartAndStop() async throws {
+        try await withTemporaryDirectory { dir in
+            try await withRecordingsDirectory(dir) {
+                let slowStopStreamlink = try makeSlowTerminationStreamlinkExecutable(in: dir)
+                let manager = RecordingManager()
+                manager._resolveStreamlinkPathOverride = { slowStopStreamlink.path }
+
+                XCTAssertEqual(manager.recorderOrchestrator.state(for: "streamera"), .idle)
+                XCTAssertTrue(manager.startRecording(target: "twitch.tv/streamera", channelName: "Streamer A"))
+                XCTAssertTrue(await waitUntil {
+                    manager.recorderOrchestrator.state(for: "streamera") == .recording
+                })
+
+                manager.stopRecording(channelLogin: "streamera")
+                XCTAssertEqual(manager.recorderOrchestrator.state(for: "streamera"), .stopping)
+
+                XCTAssertTrue(await waitUntil {
+                    manager.recorderOrchestrator.state(for: "streamera") == .idle
+                })
+                XCTAssertEqual(manager.activeRecordingCount, 0)
+            }
+        }
+    }
+
+    func testRecordingManager_SchedulesRetryMetadataAfterUnexpectedTermination() async throws {
+        try await withTemporaryDirectory { dir in
+            try await withRecordingsDirectory(dir) {
+                let failingStreamlink = try makeFailingStreamlinkExecutable(in: dir)
+                let manager = RecordingManager()
+                manager._resolveStreamlinkPathOverride = { failingStreamlink.path }
+
+                XCTAssertTrue(manager.startRecording(target: "twitch.tv/streamera", channelName: "Streamer A"))
+                XCTAssertTrue(await waitUntil {
+                    manager.recorderOrchestrator.state(for: "streamera") == .retrying
+                })
+
+                guard let metadata = manager.recorderOrchestrator.retryMetadata(for: "streamera") else {
+                    XCTFail("Expected retry metadata after failure")
+                    return
+                }
+
+                XCTAssertEqual(metadata.retryCount, 1)
+                XCTAssertEqual(metadata.lastErrorMessage, "streamlink failed")
+                XCTAssertNotNil(metadata.lastFailureAt)
+                XCTAssertNotNil(metadata.nextRetryAt)
+
+                if let lastFailureAt = metadata.lastFailureAt,
+                   let nextRetryAt = metadata.nextRetryAt {
+                    XCTAssertGreaterThan(nextRetryAt, lastFailureAt)
+                }
             }
         }
     }

@@ -257,13 +257,6 @@ final class RecordingManager: ObservableObject {
     func startRecording(target: String, channelName: String?, quality: String = "best") -> Bool {
         errorMessage = nil
 
-        if !LicenseManager.shared.canUseRecording {
-            let message = "No license detected. Email j.christophe@devjc.net for a Pro license key."
-            errorMessage = message
-            GlitchoTelemetry.track("recording_start_blocked_unlicensed")
-            return false
-        }
-
         let resolvedChannelLogin = channelLogin(from: target)
         if let resolvedChannelLogin,
            isRecordingInBackgroundAgent(channelLogin: resolvedChannelLogin) {

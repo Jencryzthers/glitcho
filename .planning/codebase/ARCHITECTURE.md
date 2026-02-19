@@ -1,188 +1,121 @@
 # Architecture
 
-**Analysis Date:** 2026-02-04
+**Analysis Date:** 2026-02-13
 
-## Pattern Overview
+## Overview
 
-**Overall:** SwiftUI-based macOS client with dual-layer web integration. The app bridges browser automation (WKWebView for Twitch) with native playback (AVPlayer via Streamlink).
+Glitcho is a macOS-only SwiftUI app with a hybrid Twitch architecture:
+- `WKWebView` for Twitch auth/session and scraped metadata.
+- Native AVKit playback driven by Streamlink.
+- A local recording/runtime subsystem with orchestration, retention, and background agent management.
+- Optional Pro-licensed video enhancement and companion control APIs.
 
-**Key Characteristics:**
-- Web-first approach for account management and navigation, but native-first for media playback
-- DOM manipulation and JavaScript injection for UI customization and data extraction
-- Process-based external tool management (Streamlink for streams, FFmpeg for remuxing)
-- Observable state propagation through SwiftUI environment and AppStorage
-- Separation of concerns: web layer handles login/browsing, native layer handles playback/recording
+## Layered Design
 
-## Layers
+### 1) App Shell and Navigation
+- Files: `Sources/Glitcho/App.swift`, `Sources/Glitcho/ContentView.swift`
+- Responsibilities:
+  - Window setup (main/settings/about/chat)
+  - Sidebar and route state
+  - Global toasts, confirmation dialogs, recording action intents
 
-**Presentation (SwiftUI Views):**
-- Purpose: Render UI and handle user interactions
-- Location: `Sources/Glitcho/` (all `.swift` files except utility/manager classes)
-- Contains: ContentView, Sidebar, player views, settings dialogs, recordings library
-- Depends on: RecordingManager, WebViewStore, UpdateChecker, NotificationManager
-- Used by: App entry point, WindowGroup
+### 2) Twitch Web Integration
+- File: `Sources/Glitcho/WebViewStore.swift`
+- Responsibilities:
+  - Embedded Twitch web session
+  - CSS/JS injection for UI cleanup and scraping
+  - Following/profile scraping and live-channel synchronization
+  - Native playback request emission
 
-**Web Integration Layer:**
-- Purpose: Load Twitch in WKWebView, inject styling/scripts, extract profile/live list data
-- Location: `Sources/Glitcho/WebViewStore.swift`
-- Contains: WKWebView setup, JavaScript injection (12 separate user scripts), message handlers, navigation policy
-- Depends on: WebKit, Foundation
-- Used by: ContentView (for browsing), Sidebar (for following list and profile data)
+### 3) Native Playback and Channel Details
+- File: `Sources/Glitcho/StreamlinkPlayer.swift`
+- Responsibilities:
+  - Streamlink URL resolution and `AVPlayer`/`AVPlayerView` ownership
+  - Playback overlay controls (play/pause, volume, PiP, fullscreen, chat actions)
+  - Fullscreen token flow that promotes native player fullscreen mode
+  - Details panels (`About`, `Videos`, `Schedule`) rendered as native SwiftUI
+  - Video routing fallback logic for online/offline parity
 
-**Playback Layer:**
-- Purpose: Resolve stream URLs via Streamlink and play via AVPlayer
-- Location: `Sources/Glitcho/StreamlinkPlayer.swift`
-- Contains: StreamlinkManager (runs Streamlink process), NativeVideoPlayer (wraps AVPlayerViewController)
-- Depends on: AVKit, Foundation, Process APIs
-- Used by: ContentView (NativePlaybackRequest handling)
+### 4) Recording Engine and Library
+- Files: `Sources/Glitcho/RecordingManager.swift`, `Sources/Glitcho/RecorderOrchestrator.swift`, `Sources/Glitcho/RecordingsLibraryView.swift`, `Sources/Glitcho/AutoRecordMode.swift`
+- Responsibilities:
+  - Recording session/process lifecycle
+  - Auto-record filtering (pinned/followed/custom allowlist + blocklist override)
+  - Debounce/cooldown + concurrency caps
+  - Retention policy enforcement (age/global/per-channel limits)
+  - Library UI for search/sort/layout/grouping and bulk export/delete
 
-**Recording & File Management Layer:**
-- Purpose: Record streams via Streamlink, manage file organization, remux MPEG-TS to MP4
-- Location: `Sources/Glitcho/RecordingManager.swift`
-- Contains: Recording orchestration, file management, Streamlink/FFmpeg installation logic, MPEG-TS detection
-- Depends on: Foundation, Process APIs, UserDefaults
-- Used by: ContentView, SettingsView
+### 5) Background Recorder Agent
+- Files: `Sources/Glitcho/BackgroundRecorderAgentManager.swift`, product `GlitchoRecorderAgent`
+- Responsibilities:
+  - LaunchAgent provisioning/restart/stop
+  - Deterministic control results + user-facing feedback wiring
+  - Session restart/kill hooks from UI
 
-**Utility & Support:**
-- Purpose: Notifications, update checking, UI helpers, environment configuration
-- Location: Multiple files (UpdateChecker, NotificationManager, PictureInPictureController, etc.)
-- Depends on: Notification framework, URLSession, various AppKit components
-- Used by: App, ContentView, SettingsView
+### 6) Licensing and Entitlement Gating
+- Files: `Sources/Glitcho/LicenseManager.swift`, `Sources/Glitcho/KeychainHelper.swift`, `Sources/Glitcho/RecordingFeatureVisibilityPolicy.swift`
+- Responsibilities:
+  - Server license validation (`POST /license/validate`)
+  - Optional P256 response signature verification
+  - Cached entitlement + offline grace behavior
+  - UI visibility gating for recording/pro controls
 
-## Data Flow
+### 7) Pro Video Enhancement Pipeline
+- Files: `Sources/Glitcho/MotionInterpolation.swift`, `Sources/Glitcho/StreamlinkPlayer.swift`, `Sources/Glitcho/SettingsView.swift`
+- Responsibilities:
+  - Motion smoothening runtime (capability and fallback aware)
+  - 4K upscaler toggle and aspect crop modes (`Source`, `21:9`, `32:9`)
+  - Image optimization controls
+  - Runtime diagnostics/status badge publication
 
-**User Login & Profile Retrieval:**
-1. User navigates to Twitch login page in WebView
-2. JavaScript `profileScript` runs at document end, extracts user info from DOM/cookies/localStorage
-3. Profile data sent via WKScriptMessageHandler to `WebViewStore.profileScript` message
-4. `WebViewStore` publishes @Published properties: `isLoggedIn`, `profileName`, `profileLogin`, `profileAvatarURL`
-5. Sidebar reads these Published properties and updates UI
+### 8) Companion API
+- Files: `Sources/Glitcho/CompanionAPIServer.swift`, `Sources/Glitcho/CompanionAPIClient.swift`, `Sources/Glitcho/CompanionAPIModels.swift`
+- Responsibilities:
+  - Local control/status endpoint hosting
+  - Client integration for remote/automation workflows
 
-**Live Channels Detection & Notifications:**
-1. Background WKWebView loads `https://www.twitch.tv/following` on login
-2. JavaScript `followedLiveScript` extracts live channel cards every 5 seconds
-3. Data sent via WKScriptMessageHandler to `WebViewStore`
-4. `WebViewStore` publishes `followedLive` array
-5. ContentView observes change, calls `handleFollowedLiveChange()`:
-   - Filters new live channels
-   - Sends notifications if enabled
-   - Triggers auto-recording if configured
-6. Sidebar renders live channels with indicators
+### 9) Telemetry and Observability
+- File: `Sources/Glitcho/Telemetry.swift`
+- Responsibilities:
+  - Structured local `OSLog` telemetry events for playback, recording, licensing, and motion runtime behavior
 
-**Native Playback Trigger:**
-1. User clicks channel in sidebar or navigates to channel URL in web view
-2. URL change observed in WebViewStore (either through navigation or SPA route change)
-3. `nativePlaybackRequestIfNeeded()` determines if URL is playable (channel root, VOD, clip)
-4. Creates `NativePlaybackRequest` with `kind`, `streamlinkTarget`, `channelName`
-5. Sets `shouldSwitchToNativePlayback` published property
-6. ContentView observes change, switches `detailMode` to `.native`
-7. `HybridTwitchView` renders with NativeVideoPlayer
-8. NativeVideoPlayer creates StreamlinkManager task:
-   - Calls `getStreamURL(target:quality:)` which spawns Streamlink process
-   - Streamlink outputs direct HLS/DASH playlist URL
-   - AVPlayerViewController displays video
-9. User stops viewing, detail mode switches back to `.web`, WebView resumes normal playback
+## Primary Runtime Flows
 
-**Recording Session:**
-1. User clicks record button or auto-record triggers
-2. `RecordingManager.startRecording()` called with target and channel name
-3. Verifies Streamlink availability, creates recordings directory
-4. Spawns Process running: `streamlink [target] [quality] --twitch-disable-ads --output [file.mp4]`
-5. Sets `isRecording = true`, displays recording badge
-6. Process runs asynchronously; stderr piped for error handling
-7. On process termination:
-   - Sets `isRecording = false`
-   - Calls `prepareRecordingForPlayback()` if successful
-8. `prepareRecordingForPlayback()` checks if file is MPEG-TS (by sync byte pattern)
-9. If needed, spawns FFmpeg: `ffmpeg -i [input.ts] -c copy -movflags +faststart [output.mp4]`
-10. Atomically replaces original with remuxed MP4
-11. Cleanup and error handling
+### A) Twitch Session and Following Sync
+1. `WebViewStore` loads Twitch.
+2. JS scrapers emit profile/following/live payloads via script handlers.
+3. `ContentView` and sidebar react to published store state.
 
-**Recording Playback:**
-1. RecordingsLibraryView reads recordings directory via `recordingManager.listRecordings()`
-2. Parses filenames to extract channel name and timestamp
-3. User selects recording to play
-4. NativeVideoPlayer displays with AVPlayer (no Streamlink needed—local file)
+### B) Native Playback Start
+1. A Twitch URL/user action maps to `NativePlaybackRequest`.
+2. `StreamlinkPlayer` resolves media URL via Streamlink process.
+3. `AVPlayer` begins playback with native controls + Glitcho overlay actions.
 
-## Key Abstractions
+### C) Auto-record Decision
+1. Live-channel updates feed `RecordingManager` candidate evaluation.
+2. `AutoRecordMode`, allowlist, and blocklist policies are applied.
+3. `RecorderOrchestrator`/manager queue and spawn sessions respecting concurrency/debounce/cooldown.
 
-**NativePlaybackRequest:**
-- Purpose: Encapsulates a request to play media (live channel, VOD, or clip)
-- Location: `Sources/Glitcho/WebViewStore.swift` (struct definition)
-- Pattern: Value type passed through @Published property changes
-- Contains: `kind` (enum), `streamlinkTarget` (URL string), `channelName` (optional)
+### D) Recording Finalization
+1. Session stops (manual or process termination).
+2. Optional post-processing/remux prep runs (FFmpeg path-dependent).
+3. Retention enforcement may prune old entries.
+4. Library view refreshes from filesystem index.
 
-**PinnedChannel:**
-- Purpose: Represents a user-pinned favorite channel with notification preferences
-- Location: `Sources/Glitcho/PinnedChannel.swift`
-- Pattern: Codable struct for persistence via JSON encoding in UserDefaults
-- Contains: login, displayName, thumbnailURL, notifyEnabled, pinnedAt
+### E) Licensing
+1. User enters key/server/public key in Settings.
+2. `LicenseManager` validates and verifies signature (if configured).
+3. Entitlement cache persists for offline grace.
+4. UI feature policy updates instantly.
 
-**TwitchChannel:**
-- Purpose: Represents a live channel extracted from web DOM
-- Location: `Sources/Glitcho/WebViewStore.swift` (struct definition)
-- Pattern: Lightweight value type, Identifiable for SwiftUI lists
-- Contains: id (URL string), name, url, thumbnailURL
+### F) Channel Details Native Rendering
+1. About/Videos/Schedule stores load channel routes.
+2. Scrapers parse payloads from Twitch pages/scripts.
+3. SwiftUI cards render, including tappable linked images in About.
 
-**RecordingEntry:**
-- Purpose: Represents a single recorded file on disk
-- Location: `Sources/Glitcho/RecordingManager.swift` (struct definition)
-- Pattern: Parsed from filename; recordedAt optional for malformed names
-- Contains: url, channelName, recordedAt (Date)
+## Architectural Notes
 
-## Entry Points
-
-**App Initialization:**
-- Location: `Sources/Glitcho/App.swift`
-- Triggers: macOS launches app
-- Responsibilities: Create TwitchGlassApp, set up StateObjects (UpdateChecker, NotificationManager), configure window groups (main, settings, about, chat)
-
-**Content View:**
-- Location: `Sources/Glitcho/ContentView.swift`
-- Triggers: App body renders WindowGroup
-- Responsibilities: Manage overall UI layout (sidebar + detail split view), handle mode switching (web/native/recordings), coordinate state between components
-
-**WebViewStore Initialization:**
-- Location: `Sources/Glitcho/WebViewStore.swift` init
-- Triggers: ContentView creates @StateObject
-- Responsibilities: Set up WKWebView with config, inject all user scripts, configure message handlers, start background Following page loader, set up KVO observers for navigation
-
-## Error Handling
-
-**Strategy:** Multi-level fallback with user-facing messaging.
-
-**Patterns:**
-- **Streamlink Missing:** RecordingManager checks multiple paths (custom path, bundled, homebrew, usr/local, usr/bin); if all fail, shows error in UI with button to install or set custom path
-- **FFmpeg Missing:** Similar fallback chain; remuxing fails gracefully with user notification
-- **Recording Process Error:** Captures stderr from terminated process, displays error message with command context
-- **Stream URL Resolution:** StreamlinkManager catches Process errors and throws localized NSError with stderr output
-- **JavaScript Injection Errors:** Silent failures; if profile extraction fails, user remains unauthenticated visually but can still browse web view
-
-## Cross-Cutting Concerns
-
-**Logging:** Printf-style logging via `print()` and `debug()` statements; tagged logs like `[Streamlink]`, `[Enhanced Adblock]`, `[Purple Adblock]` in JavaScript. No external logging framework.
-
-**Validation:**
-- Channel login: normalized (lowercased, trimmed, `@` prefix removed)
-- Recording filenames: sanitized spaces to underscores, validated against filesystem
-- URLs: normalized to HTTPS, checked for Twitch domain before switching to native playback
-
-**Authentication:**
-- Handled entirely by Twitch web view (OAuth redirect flow)
-- App never stores credentials; relies on WKWebView cookie/session management
-- Logout clears all website data (WKWebsiteDataStore) and resets UI state
-
-**Performance:**
-- WKWebView runs on main thread (required by AppKit)
-- Streamlink process runs on background queue or as async Process with completion handler
-- Following list updates every 2 minutes via background timer
-- JavaScript extraction (profile, following, ads) runs at document lifecycle points
-
-**State Persistence:**
-- User preferences via UserDefaults (@AppStorage): pinnedChannelsJSON, liveAlertsEnabled, sidebarTint, recordingsDirectory, paths to Streamlink/FFmpeg
-- App-only state (temporary): currentPlaybackRequest, detailMode, showSettingsModal
-- No network requests to backend; all data from Twitch web view
-
----
-
-*Architecture analysis: 2026-02-04*
+- The app is macOS-focused; prior iOS/iPadOS scaffolding has been removed.
+- Twitch DOM scraping remains a deliberate but fragile dependency.
+- Process-heavy paths (Streamlink/FFmpeg/agent) are encapsulated behind manager/orchestrator abstractions to limit spawn storms and improve cleanup behavior.
+- New features are expected to emit telemetry and user feedback surfaces (toast/status/confirmations).

@@ -1,41 +1,50 @@
-# Twitch App Agent Notes
+# Glitcho Agent Notes
 
-## What’s implemented
-- **SwiftUI macOS app (SwiftPM)** embedding Twitch via `WKWebView` with a glass UI.
-- **App build script** packages `.app` and adds icon, signing, quarantine removal: `Scripts/make_app.sh`.
-- **Sidebar** with native search, Explore links, Following Live list, and account/profile section.
-- **Background loader** preloads `https://www.twitch.tv/following` so Following Live can populate without manual navigation.
-- **UI restyling** via injected CSS/JS to hide Twitch top nav + left nav and soften cards/player for native feel.
+## What is implemented
+- **SwiftUI macOS app (SwiftPM)** with a hybrid Twitch integration:
+  - native sidebar/navigation
+  - `WKWebView` for Twitch surfaces
+  - native AVKit player pipeline via Streamlink
+- **Packaging script** to create signed app bundle: `Scripts/make_app.sh`.
+- **Native channel experience** with tabs for `About`, `Videos`, and `Schedule` rendered in SwiftUI from scrape/API data.
+- **Recording stack** with:
+  - manual and auto-record
+  - `RecorderOrchestrator` state/retry/concurrency metadata
+  - background `GlitchoRecorderAgent` LaunchAgent management
+  - retention policy enforcement
+  - recordings library bulk actions/export
+- **Pro licensing/paywall** with server validation, local cache, optional P256 signature verification, and offline grace.
+- **Companion API** local HTTP control service for status + recording actions.
+- **Motion/video enhancement pipeline** (license-gated) including motion smoothening, 4K upscaler, image optimization, and aspect crop modes.
 
 ## Key files
-- `Sources/Twitch/App.swift` – main app scene.
-- `Sources/Twitch/ContentView.swift` – sidebar layout, account section, logo header.
-- `Sources/Twitch/WebViewStore.swift` – WKWebView config, CSS/JS injection, following live scraper, profile scraper.
-- `Scripts/make_app.sh` – builds `.app`, sets Info.plist, copies icon, ad‑hoc codesign, clears quarantine.
-- `Resources/AppIcon.icns` – app icon bundle.
-- `Resources/sidebar_logo.png` – sidebar logo (local asset).
+- `Sources/Glitcho/App.swift` - app scenes/windows.
+- `Sources/Glitcho/ContentView.swift` - main app split UI, routing, toasts/dialogs.
+- `Sources/Glitcho/WebViewStore.swift` - Twitch web integration + scraping/state sync.
+- `Sources/Glitcho/StreamlinkPlayer.swift` - native player, overlay controls, About/Videos/Schedule panels.
+- `Sources/Glitcho/RecordingManager.swift` - recording lifecycle, retention, Streamlink/FFmpeg handling.
+- `Sources/Glitcho/RecorderOrchestrator.swift` - recording job states and retry metadata.
+- `Sources/Glitcho/BackgroundRecorderAgentManager.swift` - LaunchAgent lifecycle and control actions.
+- `Sources/Glitcho/RecordingsLibraryView.swift` - recordings UI, bulk operations, export flow.
+- `Sources/Glitcho/LicenseManager.swift` - entitlement validation/cache/grace/signature verification.
+- `Sources/Glitcho/CompanionAPIServer.swift` - local remote-control API server.
+- `Sources/Glitcho/MotionInterpolation.swift` - motion interpolation/render runtime.
+- `Scripts/make_app.sh` - builds `Build/Glitcho.app`.
+- `Scripts/start_activation_server.sh` / `Scripts/stop_activation_server.sh` - local activation server operations.
 
-## Current UX behavior
-- **Top nav + left nav** on Twitch web are hidden via injected CSS.
-- **Glass styling** applies to Twitch cards and player controls.
-- **Following Live** tries to parse from:
-  - `/following` or `/directory/following` page cards
-  - Twitch side nav (if available)
-- **Profile info** is scraped from the web session and shown in the sidebar (avatar/name + actions).
-- **Autoplay** is attempted once with a short retry to avoid loop.
-
-## Build/Run
+## Build / Run
 - Build: `./Scripts/make_app.sh`
-- Output: `Build/Twitch.app`
+- Run: `open Build/Glitcho.app`
 
-## Notes / caveats
-- Twitch DOM changes may break CSS/JS selectors.
-- Following Live relies on DOM scraping; if it fails, update selectors in `WebViewStore.swift`.
-- User agent is set to Safari‑like to reduce Twitch playback errors (#3000).
+## Current caveats
+- Twitch DOM changes can break scraper selectors and scrape payload quality.
+- Recording quality and capture reliability still depend on upstream Twitch/Streamlink behavior.
+- Performance profile should be validated after large recording pipeline changes via `Scripts/profile_recording_runtime.sh`.
 
-## Pending issues
-- Following Live sometimes still shows placeholder text; adjust scraper in `WebViewStore.swift`.
-- Stream autoplay may still fail for some channels; can add smarter play detection.
+## Pending focus areas
+- Expand orchestrator into full deterministic scheduling path beyond metadata-first integration.
+- Add deeper integration coverage for background agent restart/kill and recovery intent flows.
+- Continue reducing UI/layout regressions when Twitch changes web markup.
 
 <skills_system priority="1">
 
