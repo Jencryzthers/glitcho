@@ -8,6 +8,10 @@ Glitcho is a macOS-native Twitch client built with SwiftUI and AVKit. It combine
 - iOS/iPadOS scaffold and IPA tooling have been removed from this repo.
 - Includes a separate Docker-hosted promo website (`apps/commerce`) for app showcase, download, and donation.
 
+![promo-4-1280](https://github.com/user-attachments/assets/1fdea339-ca5f-4380-9906-cca97339ffae)
+![promo-2-1280](https://github.com/user-attachments/assets/5ef17ec8-c136-411d-8e3a-b49f888571a4)
+![promo-1-1280](https://github.com/user-attachments/assets/1deb5e3b-fb68-4fa4-a42b-3f1feeb5d63f)
+
 ## Core Features
 
 ### Playback and Streamer Experience
