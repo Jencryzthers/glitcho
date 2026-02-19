@@ -2,6 +2,8 @@
 
 Glitcho is a macOS-native Twitch client built with SwiftUI and AVKit. It combines a focused Twitch browsing experience with native playback, DVR-style recording controls, a background recorder agent, and advanced video enhancement features.
 
+You can also view more information : https://glitcho.devjc.net
+
 ## Scope
 
 - macOS app (SwiftPM) only.
