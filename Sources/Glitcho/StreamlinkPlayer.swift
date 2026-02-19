@@ -3203,6 +3203,7 @@ final class ChannelVideosStore: NSObject, ObservableObject, WKNavigationDelegate
 
         let didChangeChannel = (normalized != currentChannel)
         let didChangeOffline = (isChannelOffline != currentOfflineState)
+        let didChangeSection = (section != self.section)
         currentChannel = normalized
         currentOfflineState = isChannelOffline
         self.section = section
@@ -3211,7 +3212,7 @@ final class ChannelVideosStore: NSObject, ObservableObject, WKNavigationDelegate
         loadingDeadlineWorkItem?.cancel()
         isLoading = true
 
-        if didChangeChannel || didChangeOffline {
+        if didChangeChannel || didChangeOffline || didChangeSection {
             vods = []
             clips = []
             gqlFallbackAttempts.removeAll()
@@ -3610,8 +3611,10 @@ final class ChannelVideosStore: NSObject, ObservableObject, WKNavigationDelegate
                 case .videos: existing = self.vods
                 case .clips: existing = self.clips
                 }
-                if !existing.isEmpty {
-                    return
+                if existing.isEmpty {
+                    self.loadingDeadlineWorkItem?.cancel()
+                    self.loadingDeadlineWorkItem = nil
+                    self.isLoading = false
                 }
                 return
             }
@@ -4746,15 +4749,15 @@ final class ChannelScheduleStore: NSObject, ObservableObject, WKNavigationDelega
         }
 
         DispatchQueue.main.async {
+            self.loadingDeadlineWorkItem?.cancel()
+            self.loadingDeadlineWorkItem = nil
+
             if parsed.isEmpty {
-                if !self.items.isEmpty {
-                    return
+                if self.items.isEmpty {
+                    self.isLoading = false
                 }
                 return
             }
-
-            self.loadingDeadlineWorkItem?.cancel()
-            self.loadingDeadlineWorkItem = nil
 
             if self.items != parsed {
                 self.items = parsed

@@ -920,6 +920,16 @@ final class AboutTabStore: NSObject, ObservableObject, WKNavigationDelegate, WKS
         webView = makeWebView()
     }
 
+    deinit {
+        loadingDeadlineWorkItem?.cancel()
+        parseTask?.cancel()
+        if let webView {
+            webView.navigationDelegate = nil
+            webView.configuration.userContentController.removeScriptMessageHandler(forName: "aboutPayload")
+            webView.stopLoading()
+        }
+    }
+
     func attachWebView() -> WKWebView {
         if let webView { return webView }
         let created = makeWebView()
