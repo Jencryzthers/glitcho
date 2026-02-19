@@ -270,6 +270,26 @@ final class AboutHTMLParser {
     )
     private let whitespaceRegex = try! NSRegularExpression(pattern: #"[ \t]{2,}"#)
     private let newlinesRegex = try! NSRegularExpression(pattern: #"\n{3,}"#)
+    private let ignoredNavigationTitles: Set<String> = [
+        "home", "about", "schedule", "video", "videos", "chat", "stream"
+    ]
+    private let socialDomainHints: [String] = [
+        "discord.gg",
+        "discord.com",
+        "twitter.com",
+        "x.com",
+        "youtube.com",
+        "youtu.be",
+        "instagram.com",
+        "tiktok.com",
+        "facebook.com",
+        "fb.com",
+        "reddit.com",
+        "threads.net",
+        "bsky.app",
+        "linktr.ee",
+        "beacons.ai"
+    ]
 
     fileprivate func parse(payload: AboutRawPayload) -> AboutParseOutput {
         let start = CFAbsoluteTimeGetCurrent()
@@ -335,7 +355,9 @@ final class AboutHTMLParser {
             panels = [fallbackPanel]
         }
 
-        let dedupedSocialLinks = dedupeLinks(socialLinks).prefix(14)
+        let dedupedSocialLinks = dedupeLinks(socialLinks)
+            .filter { isSocialNetworkLink($0) }
+            .prefix(14)
 
         return AboutModel(
             channelName: payload.channelName,
@@ -430,6 +452,9 @@ final class AboutHTMLParser {
 
             let textTitle = self.cleanedText(self.stripTags(inner))
             let derivedTitle = textTitle.isEmpty ? (url.host ?? url.absoluteString) : textTitle
+            if self.shouldDropNavigationCrumb(title: derivedTitle) {
+                return ""
+            }
             let domain = self.normalizedDomain(for: url)
             let link = AboutLinkModel(
                 id: AboutHash.signature([url.absoluteString, derivedTitle.lowercased(), containsImage ? "image" : "text", String(linkIndex)]),
@@ -473,6 +498,7 @@ final class AboutHTMLParser {
         working = decodeHTMLEntities(working)
         working = compactBareURLs(in: working)
         working = normalizeWhitespacePreservingNewlines(working)
+        working = formatAsParagraphs(working)
 
         let blocks = buildBlocks(from: working, linkTokens: linkTokens, boldTokens: boldTokens)
         let plainText = blocks
@@ -540,6 +566,21 @@ final class AboutHTMLParser {
             }
 
             guard !tokens.isEmpty else { return nil }
+            let tokenText = tokens
+                .map {
+                    switch $0 {
+                    case .text(let value):
+                        return value
+                    case .emphasis(let value):
+                        return value
+                    case .link(let title, _):
+                        return title
+                    }
+                }
+                .joined(separator: " ")
+            if isSeparatorOnlyLine(tokenText) || shouldDropNavigationCrumbLine(tokenText) {
+                return nil
+            }
             return AboutRichTextBlock(
                 id: AboutHash.signature([String(index), tokens.map { "\($0)" }.joined(separator: "|")]),
                 tokens: tokens
@@ -647,6 +688,13 @@ final class AboutHTMLParser {
             }
         }
         return deduped
+    }
+
+    private func isSocialNetworkLink(_ link: AboutLinkModel) -> Bool {
+        let domain = link.domain.lowercased()
+        return socialDomainHints.contains(where: { hint in
+            domain == hint || domain.hasSuffix(".\(hint)")
+        })
     }
 
     private func dedupePanels(_ panels: [AboutPanelModel]) -> [AboutPanelModel] {
@@ -761,6 +809,43 @@ final class AboutHTMLParser {
             return self.normalizedDomain(for: normalized)
         }
         return output
+    }
+
+    private func formatAsParagraphs(_ value: String) -> String {
+        var output = value
+        output = output.replacingOccurrences(of: "•", with: "\n• ")
+        output = output.replacingOccurrences(of: " · ", with: "\n")
+        output = replaceMatches(in: output, regex: newlinesRegex) { _, _ in "\n\n" }
+        return output.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func shouldDropNavigationCrumb(title: String) -> Bool {
+        let normalized = title
+            .folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current)
+            .lowercased()
+            .replacingOccurrences(of: #"[^a-z0-9]+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return ignoredNavigationTitles.contains(normalized)
+    }
+
+    private func shouldDropNavigationCrumbLine(_ value: String) -> Bool {
+        let normalizedWords = value
+            .folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current)
+            .lowercased()
+            .replacingOccurrences(of: #"[^a-z0-9]+"#, with: " ", options: .regularExpression)
+            .split(whereSeparator: \.isWhitespace)
+            .map(String.init)
+        guard !normalizedWords.isEmpty else { return false }
+        return normalizedWords.allSatisfy { ignoredNavigationTitles.contains($0) }
+    }
+
+    private func isSeparatorOnlyLine(_ value: String) -> Bool {
+        let stripped = value.replacingOccurrences(
+            of: #"[\s•·|/\\\-]+"#,
+            with: "",
+            options: .regularExpression
+        )
+        return stripped.isEmpty
     }
 
     private func cleanedText(_ value: String) -> String {
@@ -1166,7 +1251,10 @@ final class AboutTabStore: NSObject, ObservableObject, WKNavigationDelegate, WKS
             } else {
               const metaAvatar = document.querySelector('meta[property="og:image"]');
               if (metaAvatar) {
-                avatarURL = metaAvatar.getAttribute('content') || '';
+                const ogURL = metaAvatar.getAttribute('content') || '';
+                if (ogURL.includes('profile_image') || ogURL.includes('profile-image') || ogURL.includes('jtv_user_pictures')) {
+                  avatarURL = ogURL;
+                }
               }
             }
 
@@ -1206,13 +1294,18 @@ final class AboutTabStore: NSObject, ObservableObject, WKNavigationDelegate, WKS
           }
 
           postIfChanged();
+          if (window.__glitcho_about_observer) {
+            try { window.__glitcho_about_observer.disconnect(); } catch (_) {}
+          }
           const observer = new MutationObserver(schedule);
           observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true });
+          window.__glitcho_about_observer = observer;
 
           setTimeout(postIfChanged, 600);
           setTimeout(postIfChanged, 1300);
           setTimeout(postIfChanged, 2200);
           setTimeout(postIfChanged, 4200);
+          setTimeout(function() { observer.disconnect(); }, 10000);
         })();
         """#,
         injectionTime: .atDocumentEnd,
@@ -1406,15 +1499,11 @@ struct AboutTabView: View {
     let channelName: String
     @ObservedObject var store: AboutTabStore
 
-    @State private var lightboxImage: AboutImageModel?
-
     var body: some View {
-        GeometryReader { geometry in
-            let availableWidth = max(0, geometry.size.width - 48)
-
+        GeometryReader { _ in
             ScrollView {
                 if let model = store.model {
-                    aboutContent(model: model, availableWidth: availableWidth)
+                    aboutContent(model: model)
                 } else if store.isLoading {
                     AboutLoadingStateView()
                         .padding(24)
@@ -1432,9 +1521,6 @@ struct AboutTabView: View {
                     .allowsHitTesting(false)
                     .opacity(0.001)
             )
-            .sheet(item: $lightboxImage) { image in
-                ImageLightbox(image: image)
-            }
         }
         .onAppear {
             store.load(channelName: channelName)
@@ -1445,94 +1531,68 @@ struct AboutTabView: View {
     }
 
     @ViewBuilder
-    private func aboutContent(model: AboutModel, availableWidth: CGFloat) -> some View {
-        let imagePanels = model.panels.filter { !$0.images.isEmpty }
-        let textPanels = model.panels.filter { $0.images.isEmpty && !$0.bodyText.isEmpty }
-
-        VStack(alignment: .leading, spacing: 0) {
-            // ── Profile header ──
+    private func aboutContent(model: AboutModel) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
             AboutProfileHeader(
                 displayName: model.displayName,
                 avatarURL: model.avatarURL,
                 bioBlocks: model.bioBlocks,
-                socialLinks: model.socialLinks,
                 onAvatarLoaded: { source in store.recordImageLoaded(source: source) }
             )
-            .padding(.horizontal, 24)
-            .padding(.top, 20)
-            .padding(.bottom, 28)
 
-            // ── Panel images as full-width banner row ──
-            if !imagePanels.isEmpty {
-                AboutPanelBannerRow(
-                    panels: imagePanels,
-                    availableWidth: availableWidth,
-                    onImageTap: { lightboxImage = $0 },
-                    onImageLoaded: { source in store.recordImageLoaded(source: source) }
-                )
-                .padding(.horizontal, 24)
-                .padding(.bottom, 28)
-            }
-
-            // ── Text panels in horizontal flowing grid ──
-            if !textPanels.isEmpty {
-                AboutTextPanelsGrid(
-                    panels: textPanels,
-                    availableWidth: availableWidth
-                )
-                .padding(.horizontal, 24)
-                .padding(.bottom, 24)
+            if !model.socialLinks.isEmpty {
+                AboutLinksCard(links: model.socialLinks)
             }
         }
+        .padding(12)
         .frame(maxWidth: .infinity, alignment: .topLeading)
     }
 }
 
-// MARK: - Profile Header (avatar + bio + links in one horizontal section)
+// MARK: - Profile Header
 
 private struct AboutProfileHeader: View {
     let displayName: String
     let avatarURL: URL?
     let bioBlocks: [AboutRichTextBlock]
-    let socialLinks: [AboutLinkModel]
     let onAvatarLoaded: (AboutImageDataSource) -> Void
 
     var body: some View {
-        HStack(alignment: .top, spacing: 20) {
-            // Avatar
-            AboutAvatarView(
-                avatarURL: avatarURL,
-                size: 88,
-                onAvatarLoaded: onAvatarLoaded
-            )
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .center, spacing: 12) {
+                AboutAvatarView(
+                    avatarURL: avatarURL,
+                    size: 48,
+                    onAvatarLoaded: onAvatarLoaded
+                )
 
-            // Name + Bio
-            VStack(alignment: .leading, spacing: 8) {
                 Text(displayName)
-                    .font(.system(size: 26, weight: .bold))
-                    .foregroundStyle(.white.opacity(0.95))
-
-                if !bioBlocks.isEmpty {
-                    RichTextRenderer(blocks: bioBlocks)
-                }
+                    .font(.system(size: 15, weight: .bold))
+                    .foregroundStyle(.white.opacity(0.92))
             }
-            .frame(minWidth: 200, maxWidth: .infinity, alignment: .topLeading)
 
-            // Social links (compact column on the right)
-            if !socialLinks.isEmpty {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("LINKS")
-                        .font(.system(size: 10, weight: .bold))
-                        .foregroundStyle(.white.opacity(0.35))
-                        .tracking(1)
-
-                    ForEach(socialLinks.prefix(8)) { link in
-                        AboutCompactLinkRow(link: link)
-                    }
-                }
-                .frame(width: 220, alignment: .topLeading)
+            if !bioBlocks.isEmpty {
+                RichTextRenderer(blocks: bioBlocks)
             }
         }
+        .padding(12)
+        .background(Color.white.opacity(0.06))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+}
+
+private struct AboutLinksCard: View {
+    let links: [AboutLinkModel]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(links.prefix(8)) { link in
+                AboutCompactLinkRow(link: link)
+            }
+        }
+        .padding(12)
+        .background(Color.white.opacity(0.06))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 }
 
@@ -1566,7 +1626,7 @@ private struct AboutCompactLinkRow: View {
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 7)
-            .background(isHovered ? Color.white.opacity(0.08) : Color.white.opacity(0.04))
+            .background(isHovered ? Color.white.opacity(0.08) : Color.clear)
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         }
         .buttonStyle(.plain)
@@ -1593,45 +1653,21 @@ private struct AboutCompactLinkRow: View {
     }
 }
 
-// MARK: - Panel Banners (image panels as horizontal scrolling row)
+// MARK: - Image Panels
 
-private struct AboutPanelBannerRow: View {
+private struct AboutImagePanelsSection: View {
     let panels: [AboutPanelModel]
-    let availableWidth: CGFloat
     let onImageTap: (AboutImageModel) -> Void
     let onImageLoaded: (AboutImageDataSource) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            let allImages = panels.flatMap { $0.images }
-            let bannerHeight: CGFloat = 200
-            let singleRow = allImages.count <= 3
-
-            if singleRow {
-                HStack(spacing: 12) {
-                    ForEach(allImages) { image in
-                        AboutBannerImageCard(
-                            image: image,
-                            height: bannerHeight,
-                            onTap: { onImageTap(image) },
-                            onImageLoaded: onImageLoaded
-                        )
-                    }
-                }
-            } else {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 12) {
-                        ForEach(allImages) { image in
-                            AboutBannerImageCard(
-                                image: image,
-                                height: bannerHeight,
-                                onTap: { onImageTap(image) },
-                                onImageLoaded: onImageLoaded
-                            )
-                            .frame(width: min(360, availableWidth * 0.45))
-                        }
-                    }
-                }
+            ForEach(panels.flatMap { $0.images }) { image in
+                AboutBannerImageCard(
+                    image: image,
+                    onTap: { onImageTap(image) },
+                    onImageLoaded: onImageLoaded
+                )
             }
         }
     }
@@ -1640,10 +1676,8 @@ private struct AboutPanelBannerRow: View {
 private struct AboutBannerImageCard: View {
     @Environment(\.openURL) private var openURL
     let image: AboutImageModel
-    let height: CGFloat
     let onTap: () -> Void
     let onImageLoaded: (AboutImageDataSource) -> Void
-    @State private var isHovered = false
 
     var body: some View {
         Button(action: {
@@ -1657,7 +1691,7 @@ private struct AboutBannerImageCard: View {
                 AboutRemoteImage(
                     url: image.url,
                     aspectRatio: image.aspectHint ?? (16.0 / 9.0),
-                    maxHeight: height,
+                    maxHeight: 240,
                     onImageLoaded: onImageLoaded
                 )
 
@@ -1689,17 +1723,11 @@ private struct AboutBannerImageCard: View {
                 }
             }
             .frame(maxWidth: .infinity)
-            .frame(height: height)
+            .padding(12)
+            .background(Color.white.opacity(0.06))
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .stroke(Color.white.opacity(isHovered ? 0.2 : 0.08), lineWidth: 1)
-            )
-            .scaleEffect(isHovered ? 1.01 : 1.0)
-            .animation(.easeOut(duration: 0.15), value: isHovered)
         }
         .buttonStyle(.plain)
-        .onHover { isHovered = $0 }
         .contextMenu {
             Button("Open Image") { openURL(image.url) }
             if let linked = image.linkedURL {
@@ -1713,25 +1741,6 @@ private struct AboutBannerImageCard: View {
     }
 }
 
-// MARK: - Text Panels Grid (horizontal flowing cards)
-
-private struct AboutTextPanelsGrid: View {
-    let panels: [AboutPanelModel]
-    let availableWidth: CGFloat
-
-    var body: some View {
-        let columns = availableWidth >= 700
-            ? [GridItem(.adaptive(minimum: 280, maximum: 400), spacing: 16, alignment: .top)]
-            : [GridItem(.flexible(minimum: 240), spacing: 16, alignment: .top)]
-
-        LazyVGrid(columns: columns, alignment: .leading, spacing: 16) {
-            ForEach(panels) { panel in
-                AboutTextPanelCard(panel: panel)
-            }
-        }
-    }
-}
-
 private struct AboutTextPanelCard: View {
     let panel: AboutPanelModel
 
@@ -1739,8 +1748,8 @@ private struct AboutTextPanelCard: View {
         VStack(alignment: .leading, spacing: 10) {
             if !panel.title.isEmpty {
                 Text(panel.title)
-                    .font(.system(size: 15, weight: .bold))
-                    .foregroundStyle(.white.opacity(0.94))
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.92))
                     .lineLimit(2)
             }
 
@@ -1757,28 +1766,10 @@ private struct AboutTextPanelCard: View {
                 }
             }
         }
-        .padding(16)
+        .padding(12)
         .frame(maxWidth: .infinity, alignment: .topLeading)
-        .background(Color.white.opacity(0.04))
-        .overlay(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(Color.white.opacity(0.08), lineWidth: 1)
-        )
-        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-    }
-}
-
-// AboutHeaderView kept for backward compatibility with tests
-struct AboutHeaderView: View {
-    let displayName: String
-    let avatarURL: URL?
-    let bioText: String
-    let panelCount: Int
-    let lastUpdated: Date
-    let onAvatarLoaded: (AboutImageDataSource) -> Void
-
-    var body: some View {
-        EmptyView()
+        .background(Color.white.opacity(0.06))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 }
 
@@ -1810,25 +1801,9 @@ private struct AboutAvatarView: View {
         .clipShape(Circle())
         .overlay(
             Circle()
-                .stroke(Color.white.opacity(0.16), lineWidth: 1)
+                .stroke(Color.white.opacity(0.08), lineWidth: 1)
         )
-        .shadow(color: .black.opacity(0.22), radius: 6, x: 0, y: 2)
-        .drawingGroup(opaque: false, colorMode: .extendedLinear)
     }
-}
-
-// Legacy types kept as stubs for backward compatibility
-struct AboutInfoSidebar: View {
-    let bioBlocks: [AboutRichTextBlock]
-    let socialLinks: [AboutLinkModel]
-    var body: some View { EmptyView() }
-}
-
-struct PanelCardView: View {
-    let panel: AboutPanelModel
-    let onImageTap: (AboutImageModel) -> Void
-    let onImageLoaded: (AboutImageDataSource) -> Void
-    var body: some View { EmptyView() }
 }
 
 struct RichTextRenderer: View {
@@ -1838,8 +1813,8 @@ struct RichTextRenderer: View {
         VStack(alignment: .leading, spacing: 8) {
             ForEach(blocks) { block in
                 Text(attributed(block))
-                    .font(.system(size: 13, weight: .regular))
-                    .foregroundStyle(.white.opacity(0.78))
+                    .font(.system(size: 11, weight: .regular))
+                    .foregroundStyle(.white.opacity(0.56))
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -1848,25 +1823,59 @@ struct RichTextRenderer: View {
 
     private func attributed(_ block: AboutRichTextBlock) -> AttributedString {
         var output = AttributedString()
+        var previousToken: AboutInlineToken?
         for token in block.tokens {
+            if let previousToken, shouldInsertSpace(between: previousToken, and: token) {
+                output.append(AttributedString(" "))
+            }
             switch token {
             case .text(let value):
                 var segment = AttributedString(value)
-                segment.foregroundColor = .white.opacity(0.78)
+                segment.foregroundColor = .white.opacity(0.56)
                 output.append(segment)
             case .emphasis(let value):
                 var segment = AttributedString(value)
                 segment.inlinePresentationIntent = .stronglyEmphasized
-                segment.foregroundColor = .white.opacity(0.9)
+                segment.foregroundColor = .white.opacity(0.72)
                 output.append(segment)
             case .link(let title, let url):
                 var segment = AttributedString(title)
                 segment.link = url
-                segment.foregroundColor = .purple.opacity(0.95)
+                segment.foregroundColor = .purple.opacity(0.85)
                 output.append(segment)
             }
+            previousToken = token
         }
         return output
+    }
+
+    private func tokenText(_ token: AboutInlineToken) -> String {
+        switch token {
+        case .text(let value):
+            return value
+        case .emphasis(let value):
+            return value
+        case .link(let title, _):
+            return title
+        }
+    }
+
+    private func shouldInsertSpace(between previous: AboutInlineToken, and current: AboutInlineToken) -> Bool {
+        let previousText = tokenText(previous)
+        let currentText = tokenText(current)
+        guard let previousLast = previousText.last, let currentFirst = currentText.first else {
+            return false
+        }
+        if previousLast.isWhitespace || currentFirst.isWhitespace {
+            return false
+        }
+        if ",.!?:;)]}".contains(currentFirst) {
+            return false
+        }
+        if "([{".contains(previousLast) {
+            return false
+        }
+        return true
     }
 }
 
@@ -1934,17 +1943,23 @@ struct AboutRemoteImage: View {
             return
         }
         phase = .loading
-        do {
-            let result = try await AboutImageDataCache.shared.data(for: url)
-            guard let image = NSImage(data: result.data) else {
-                phase = .failed
-                return
+        for attempt in 0..<2 {
+            if attempt > 0 {
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
             }
-            phase = .success(image)
-            onImageLoaded(result.source)
-        } catch {
-            phase = .failed
+            do {
+                let result = try await AboutImageDataCache.shared.data(for: url)
+                guard let image = NSImage(data: result.data) else {
+                    continue
+                }
+                phase = .success(image)
+                onImageLoaded(result.source)
+                return
+            } catch {
+                continue
+            }
         }
+        phase = .failed
     }
 }
 
@@ -2033,14 +2048,14 @@ private struct AboutLoadingStateView: View {
                 ProgressView()
                     .controlSize(.small)
                 Text("Loading About panels…")
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.62))
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.6))
             }
 
-            ForEach(0..<3, id: \.self) { _ in
+            ForEach(0..<2, id: \.self) { _ in
                 RoundedRectangle(cornerRadius: 12, style: .continuous)
                     .fill(Color.white.opacity(0.05))
-                    .frame(height: 160)
+                    .frame(height: 100)
                     .overlay(AboutShimmerPlaceholder().clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous)))
             }
         }
@@ -2054,23 +2069,19 @@ private struct AboutErrorStateView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Label("Could not load About", systemImage: "exclamationmark.triangle.fill")
-                .font(.system(size: 14, weight: .semibold))
+                .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(.orange)
 
             Text(message)
-                .font(.system(size: 13))
+                .font(.system(size: 12))
                 .foregroundStyle(.white.opacity(0.68))
 
             Button("Retry", action: onRetry)
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)
         }
-        .padding(16)
-        .background(Color.white.opacity(0.05))
-        .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(Color.white.opacity(0.08), lineWidth: 1)
-        )
+        .padding(12)
+        .background(Color.white.opacity(0.06))
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 }
@@ -2081,21 +2092,17 @@ private struct AboutEmptyStateView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("No About content available.")
-                .font(.system(size: 14, weight: .semibold))
+                .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(.white.opacity(0.86))
             Text("This channel has no panels or the layout could not be parsed.")
-                .font(.system(size: 12))
+                .font(.system(size: 11))
                 .foregroundStyle(.white.opacity(0.58))
             Button("Retry", action: onRetry)
                 .buttonStyle(.bordered)
                 .controlSize(.small)
         }
-        .padding(14)
-        .background(Color.white.opacity(0.05))
-        .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(Color.white.opacity(0.08), lineWidth: 1)
-        )
+        .padding(12)
+        .background(Color.white.opacity(0.06))
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 }
