@@ -1645,6 +1645,7 @@ struct HybridTwitchView: View {
                                     case .schedule:
                                         ChannelSchedulePanelView(
                                             channelName: channel,
+                                            isChannelOffline: isStreamOffline,
                                             store: scheduleStore
                                         )
                                     }
@@ -3263,6 +3264,9 @@ final class ChannelVideosStore: NSObject, ObservableObject, WKNavigationDelegate
                         return
                     }
                 }
+                if items.isEmpty, self.lastError == nil {
+                    self.lastError = "Unable to load \(section == .clips ? "clips" : "videos") (timeout)."
+                }
                 self.isLoading = false
             }
         }
@@ -4445,10 +4449,10 @@ final class ChannelScheduleStore: NSObject, ObservableObject, WKNavigationDelega
         return view
     }
 
-    func load(channelName: String) {
+    func load(channelName: String, force: Bool = false) {
         let normalized = channelName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalized.isEmpty else { return }
-        guard normalized != currentChannel else { return }
+        guard force || normalized != currentChannel else { return }
         currentChannel = normalized
 
         loadingDeadlineWorkItem?.cancel()
@@ -4601,8 +4605,14 @@ final class ChannelScheduleStore: NSObject, ObservableObject, WKNavigationDelega
           }
 
           function normalize(items) {
+            const now = Date.now();
             return (items || [])
               .filter(i => i && i.startAt)
+              .filter(i => {
+                const end = Date.parse(i.endAt || '') || 0;
+                const start = Date.parse(i.startAt || '') || 0;
+                return (end || start) >= now;
+              })
               .sort((a, b) => {
                 const av = Date.parse(a.startAt || '') || 0;
                 const bv = Date.parse(b.startAt || '') || 0;
@@ -4801,6 +4811,7 @@ struct ChannelScheduleScraperView: NSViewRepresentable {
 
 struct ChannelSchedulePanelView: View {
     let channelName: String
+    let isChannelOffline: Bool
     @ObservedObject var store: ChannelScheduleStore
 
     private static let dateFormatter: DateFormatter = {
@@ -4883,6 +4894,9 @@ struct ChannelSchedulePanelView: View {
         }
         .onChange(of: channelName) { newValue in
             store.load(channelName: newValue)
+        }
+        .onChange(of: isChannelOffline) { _ in
+            store.load(channelName: channelName, force: true)
         }
     }
 
@@ -5161,12 +5175,20 @@ struct ChannelVideosPanelView: View {
 
             ScrollView {
                 if currentItems.isEmpty && store.isLoading {
-                    HStack(spacing: 8) {
-                        ProgressView()
-                            .controlSize(.small)
-                        Text("Loading…")
-                            .font(.system(size: 12, weight: .medium))
-                            .foregroundColor(.white.opacity(0.6))
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack(spacing: 8) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Loading…")
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundColor(.white.opacity(0.6))
+                        }
+                        if let error = store.lastError, !error.isEmpty {
+                            Text(error)
+                                .font(.system(size: 11))
+                                .foregroundColor(.white.opacity(0.45))
+                                .lineLimit(3)
+                        }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                 } else if currentItems.isEmpty {

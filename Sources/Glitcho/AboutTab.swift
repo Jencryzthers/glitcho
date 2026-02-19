@@ -1070,6 +1070,10 @@ final class AboutTabStore: NSObject, ObservableObject, WKNavigationDelegate, WKS
 
             if (!nodes.length) {
               nodes = Array.from(container.querySelectorAll('section,article')).filter(node => {
+                const tag = (node.tagName || '').toLowerCase();
+                const role = (node.getAttribute('role') || '').toLowerCase();
+                if (role === 'navigation' || role === 'banner' || tag === 'nav') { return false; }
+                if (node.closest('nav,[role="navigation"],[data-a-target="side-nav"]')) { return false; }
                 const txt = trim(node.textContent || '');
                 const hasImage = !!node.querySelector('img[src]');
                 return txt.length > 0 || hasImage;
