@@ -1,6 +1,6 @@
 # Glitcho
 
-Glitcho is a macOS-native Twitch client built with SwiftUI and AVKit. It combines a focused Twitch browsing experience with native playback, DVR-style recording controls, a background recorder agent, and license-gated Pro video enhancement features.
+Glitcho is a macOS-native Twitch client built with SwiftUI and AVKit. It combines a focused Twitch browsing experience with native playback, DVR-style recording controls, a background recorder agent, and advanced video enhancement features.
 
 ## Scope
 
@@ -21,8 +21,8 @@ Glitcho is a macOS-native Twitch client built with SwiftUI and AVKit. It combine
 - Collapsible details panel under the player (`About / Videos / Schedule`) with persistent state.
 - About panel scraper converts hyperlink images to tappable native image cards.
 
-### Recording (Pro)
-- License-gated recording with start/stop confirmation flows.
+### Recording
+- Start/stop confirmation flows.
 - Auto-record modes:
   - Only pinned
   - Only followed
@@ -42,21 +42,11 @@ Glitcho is a macOS-native Twitch client built with SwiftUI and AVKit. It combine
   - Keep last N globally
   - Keep last N per channel
 
-### Pro Video Enhancements
+### Video Enhancements
 - Motion smoothening (target refresh based on display capability, up to 120Hz).
 - 4K upscaler toggle.
 - Image optimize pipeline and tuning controls (contrast, lighting, denoiser, neural clarity).
 - Aspect crop modes (`Source`, `21:9`, `32:9`).
-
-### Licensing and Entitlement
-- Recording and Pro enhancement gating via license validation.
-- Server-side validation endpoint (`POST /license/validate`).
-- Local entitlement cache + offline grace fallback.
-- Optional P256 signature verification (public key in app settings).
-- Optional standalone promo website with:
-  - Landing page with app screenshots
-  - Download page and `.zip` distribution flow
-  - Donation link (`paypal.me/jcproulx`)
 
 ### Companion API
 - Local HTTP endpoint for remote automation/control.
@@ -67,7 +57,7 @@ Glitcho is a macOS-native Twitch client built with SwiftUI and AVKit. It combine
 
 - macOS 13+ (Swift package target).
 - Xcode Command Line Tools / Swift 5.9+.
-- Network access for Twitch and optional license validation.
+- Network access for Twitch.
 - `Streamlink` for native playback/recording (installable from app settings).
 - Optional `FFmpeg` for remuxing transport-stream recordings for playback.
 
@@ -94,34 +84,23 @@ xattr -dr com.apple.quarantine /Applications/Glitcho.app
 ## First-Run Setup
 
 1. Launch app and sign in to Twitch.
-2. On first open, Glitcho shows a license popup with:
-   - `Email for Pro license key` (opens mail app to contact support)
-   - `I already have a key` (opens license settings flow)
-3. Open `Settings`:
+2. Open `Settings`:
    - Configure `Streamlink` (and optionally `FFmpeg`).
-   - Enter license key for recording/Pro features.
-4. Pick channels from sidebar/following and start playback.
+3. Pick channels from sidebar/following and start playback.
 
 ## Scripts
 
 - `Scripts/make_app.sh`
   - Build and package `Glitcho.app` + bundled `GlitchoRecorderAgent`.
-- `Scripts/start_activation_server.sh`
-  - Boot Dockerized license validation server and generate public key output.
-- `Scripts/stop_activation_server.sh`
-  - Stop Dockerized license server.
 - `Scripts/start_commerce_site.sh`
-  - Boot Dockerized promo/download website (`/` + `/download` + `/license/validate` endpoint).
+  - Boot Dockerized promo/download website (`/` + `/download`).
 - `Scripts/stop_commerce_site.sh`
   - Stop Dockerized commerce website stack.
-- `Scripts/license_server_example.mjs`
-  - Reference standalone validation server implementation.
 - `Scripts/profile_recording_runtime.sh`
   - Capture CPU/RAM/process-count baseline and after-fix recording metrics.
 
 ## Docs
 
-- `docs/licensing-server.md` - license server deployment/validation reference.
 - `docs/commerce-site.md` - commerce website setup, endpoints, and operations guide.
 - `docs/perf/recording-profiling.md` - performance profiling workflow.
 - `docs/plans/2026-02-12-dvr-phase0-kickoff.md` - DVR phase plan and status snapshot.
@@ -142,8 +121,6 @@ xattr -dr com.apple.quarantine /Applications/Glitcho.app
   - LaunchAgent install/sync/restart/kill lifecycle.
 - `Sources/Glitcho/RecordingsLibraryView.swift`
   - Recording library UI, bulk actions, export workflow.
-- `Sources/Glitcho/LicenseManager.swift`
-  - License key storage, validation, signature verification, offline grace.
 - `Sources/Glitcho/CompanionAPIServer.swift`
   - Local automation API runtime.
 - `Sources/Glitcho/MotionInterpolation.swift`
@@ -154,14 +131,10 @@ xattr -dr com.apple.quarantine /Applications/Glitcho.app
 - Stream not loading:
   - Verify channel is live.
   - Confirm `Streamlink` path in `Settings -> Recording Tools`.
-- Recording unavailable:
-  - Validate license in `Settings -> Pro License`.
 - Recording playback conversion issues:
   - Configure `FFmpeg` binary in settings.
 - Companion API not reachable:
   - Verify enabled state, port, and token in settings.
-- License signature invalid:
-  - Ensure app public key matches server signing key raw P256 public key (Base64).
 
 ## Privacy and Telemetry
 
