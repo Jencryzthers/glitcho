@@ -4,6 +4,8 @@ All notable user-visible changes are tracked here.
 
 ## Unreleased
 
+## 1.3.1 - 2026-02-19
+
 ### Added
 - Collapsible streamer details section under the native player (`About / Videos / Schedule`) with persistent state.
 - Overlay control toggle for collapsing/expanding the details section directly from the player toolbar.
