@@ -745,6 +745,7 @@ struct RecordingsLibraryView: View {
                             isChecked: selectedRecordingIDs.contains(recording.id),
                             thumbnailRefreshToken: thumbnailRefreshToken,
                             isDeleteDisabled: isDeleteDisabled,
+                            recordingManager: recordingManager,
                             onSelect: {
                                 if isMultiSelectMode {
                                     toggleSelection(for: recording)
@@ -790,6 +791,7 @@ struct RecordingsLibraryView: View {
                                 isChecked: selectedRecordingIDs.contains(recording.id),
                                 thumbnailRefreshToken: thumbnailRefreshToken,
                                 isDeleteDisabled: isDeleteDisabled,
+                                recordingManager: recordingManager,
                                 onSelect: {
                                     if isMultiSelectMode {
                                         toggleSelection(for: recording)
@@ -1065,12 +1067,14 @@ struct RecordingsLibraryView: View {
         Task {
             do {
                 if url.pathExtension == "glitcho" {
-                    let tempURL = recordingManager.effectiveEncryptionManager.tempPlaybackURL()
-                    try recordingManager.effectiveEncryptionManager.decryptFile(
-                        named: url.lastPathComponent,
-                        in: recordingManager.recordingsDirectory(),
-                        to: tempURL
-                    )
+                    let mgr = recordingManager.effectiveEncryptionManager
+                    let directory = recordingManager.recordingsDirectory()
+                    // Decrypting a full video on the main actor blocks the UI — use a detached task.
+                    let tempURL = try await Task.detached(priority: .userInitiated) {
+                        let tmp = mgr.tempPlaybackURL()
+                        try mgr.decryptFile(named: url.lastPathComponent, in: directory, to: tmp)
+                        return tmp
+                    }.value
                     let result = try await recordingManager.prepareRecordingForPlayback(at: tempURL)
                     if self.selectedRecording?.url != selected.url { return }
                     playbackURL = result.url
@@ -1176,6 +1180,7 @@ struct RecordingGridCard: View {
     let isChecked: Bool
     let thumbnailRefreshToken: UUID
     let isDeleteDisabled: Bool
+    let recordingManager: RecordingManager?
     let onSelect: () -> Void
     let onToggleSelection: () -> Void
     let onDelete: () -> Void
@@ -1184,7 +1189,7 @@ struct RecordingGridCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             ZStack(alignment: .topTrailing) {
-                RecordingThumbnailView(url: recording.url)
+                RecordingThumbnailView(url: recording.url, recordingManager: recordingManager)
                     .id("\(recording.url.path):\(thumbnailRefreshToken.uuidString)")
                     .frame(height: 94)
                     .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
@@ -1253,6 +1258,7 @@ struct RecordingRow: View {
     let isChecked: Bool
     let thumbnailRefreshToken: UUID
     let isDeleteDisabled: Bool
+    let recordingManager: RecordingManager?
     let onSelect: () -> Void
     let onToggleSelection: () -> Void
     let onDelete: () -> Void
@@ -1269,7 +1275,7 @@ struct RecordingRow: View {
                 .buttonStyle(.plain)
             }
 
-            RecordingThumbnailView(url: recording.url)
+            RecordingThumbnailView(url: recording.url, recordingManager: recordingManager)
                 .id("\(recording.url.path):\(thumbnailRefreshToken.uuidString)")
                 .frame(width: 120, height: 68)
                 .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
@@ -1325,9 +1331,9 @@ struct RecordingThumbnailView: View {
     @StateObject private var previewController: RecordingPreviewController
     @State private var isHovered = false
 
-    init(url: URL) {
+    init(url: URL, recordingManager: RecordingManager? = nil) {
         self.url = url
-        _loader = StateObject(wrappedValue: RecordingThumbnailLoader(url: url))
+        _loader = StateObject(wrappedValue: RecordingThumbnailLoader(url: url, recordingManager: recordingManager))
         _previewController = StateObject(wrappedValue: RecordingPreviewController(url: url))
     }
 
@@ -1340,12 +1346,19 @@ struct RecordingThumbnailView: View {
                 Image(nsImage: image)
                     .resizable()
                     .scaledToFill()
-            } else {
+            } else if loader.isLoading {
                 ZStack {
                     Color.white.opacity(0.08)
                     ProgressView()
                         .scaleEffect(0.5)
                         .tint(.white.opacity(0.4))
+                }
+            } else {
+                ZStack {
+                    Color.white.opacity(0.08)
+                    Image(systemName: "film")
+                        .font(.system(size: 20))
+                        .foregroundStyle(.white.opacity(0.25))
                 }
             }
         }
@@ -1364,16 +1377,56 @@ struct RecordingThumbnailView: View {
 
 final class RecordingThumbnailLoader: ObservableObject {
     @Published var image: NSImage?
+    @Published var isLoading = true
     private let url: URL
+    private let recordingManager: RecordingManager?
 
-    init(url: URL) {
+    init(url: URL, recordingManager: RecordingManager? = nil) {
         self.url = url
+        self.recordingManager = recordingManager
         loadThumbnail()
     }
 
     private func loadThumbnail() {
         if url.pathExtension == "glitcho" {
-            // Encrypted file — skip thumbnail (would require decryption).
+            let hashFilename = url.lastPathComponent
+            let thumbURL = RecordingEncryptionManager.thumbnailURL(for: hashFilename)
+
+            if FileManager.default.fileExists(atPath: thumbURL.path) {
+                // Cache hit — load directly.
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let nsImage = NSImage(contentsOf: thumbURL)
+                    DispatchQueue.main.async {
+                        self.image = nsImage
+                        self.isLoading = false
+                    }
+                }
+            } else if let rm = recordingManager {
+                // Cache miss — decrypt, remux if needed, extract frame, write to cache.
+                let directory = url.deletingLastPathComponent()
+                Task {
+                    let mgr = await MainActor.run { rm.effectiveEncryptionManager }
+                    let tempURL = mgr.tempPlaybackURL()
+                    defer { try? FileManager.default.removeItem(at: tempURL) }
+                    guard (try? mgr.decryptFile(named: hashFilename, in: directory, to: tempURL)) != nil else {
+                        self.isLoading = false
+                        return
+                    }
+                    // Remux MPEG-TS-in-MP4 containers so AVAssetImageGenerator can read them.
+                    let videoURL = (try? await rm.prepareRecordingForPlayback(at: tempURL))?.url ?? tempURL
+                    await Task.detached(priority: .userInitiated) {
+                        mgr.generateThumbnailSidecar(for: videoURL, hashFilename: hashFilename)
+                    }.value
+                    let nsImage = FileManager.default.fileExists(atPath: thumbURL.path)
+                        ? NSImage(contentsOf: thumbURL)
+                        : nil
+                    self.image = nsImage
+                    self.isLoading = false
+                }
+            } else {
+                // No manager available — show placeholder.
+                isLoading = false
+            }
             return
         }
 
@@ -1384,11 +1437,11 @@ final class RecordingThumbnailLoader: ObservableObject {
 
         DispatchQueue.global(qos: .userInitiated).async {
             let time = CMTime(seconds: 1.0, preferredTimescale: 600)
-            if let cgImage = try? generator.copyCGImage(at: time, actualTime: nil) {
-                let nsImage = NSImage(cgImage: cgImage, size: .zero)
-                DispatchQueue.main.async {
-                    self.image = nsImage
-                }
+            let nsImage = (try? generator.copyCGImage(at: time, actualTime: nil))
+                .map { NSImage(cgImage: $0, size: .zero) }
+            DispatchQueue.main.async {
+                self.image = nsImage
+                self.isLoading = false
             }
         }
     }

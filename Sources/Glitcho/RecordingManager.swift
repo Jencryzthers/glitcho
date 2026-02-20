@@ -142,10 +142,38 @@ final class RecordingManager: ObservableObject {
 
         // Try loading encrypted manifest first.
         if let manifest = try? effectiveEncryptionManager.loadManifest(from: directory), !manifest.isEmpty {
-            return manifest.map { hashFilename, entry in
+            var entries = manifest.map { hashFilename, entry -> RecordingEntry in
                 let url = directory.appendingPathComponent(hashFilename)
                 return RecordingEntry(url: url, channelName: entry.channelName, recordedAt: entry.date)
-            }.sorted { left, right in
+            }
+
+            // Also include any in-progress .mp4 recordings not yet encrypted.
+            if let files = try? FileManager.default.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: [.isRegularFileKey],
+                options: [.skipsHiddenFiles]
+            ) {
+                for url in files {
+                    guard url.pathExtension.lowercased() == "mp4",
+                          !url.lastPathComponent.hasSuffix(".stderr.log"),
+                          !url.lastPathComponent.contains(".remux-") else { continue }
+                    let filename = url.deletingPathExtension().lastPathComponent
+                    let parts = filename.split(separator: "_")
+                    let channelName: String
+                    let recordedAt: Date?
+                    if parts.count >= 3 {
+                        channelName = parts.dropLast(2).joined(separator: "_")
+                        let dateString = "\(parts[parts.count - 2])_\(parts[parts.count - 1])"
+                        recordedAt = filenameDateFormatter.date(from: dateString)
+                    } else {
+                        channelName = filename
+                        recordedAt = nil
+                    }
+                    entries.append(RecordingEntry(url: url, channelName: channelName, recordedAt: recordedAt))
+                }
+            }
+
+            return entries.sorted { left, right in
                 let nameCompare = left.channelName.localizedCaseInsensitiveCompare(right.channelName)
                 if nameCompare != .orderedSame {
                     return nameCompare == .orderedAscending
@@ -227,7 +255,7 @@ final class RecordingManager: ObservableObject {
             try FileManager.default.removeItem(at: url)
         }
 
-        // Remove from manifest after successful file removal.
+        // Remove from manifest and delete thumbnail sidecar after successful file removal.
         if url.pathExtension == "glitcho" {
             let directory = recordingsDirectory()
             let mgr = effectiveEncryptionManager
@@ -235,6 +263,8 @@ final class RecordingManager: ObservableObject {
                 manifest.removeValue(forKey: url.lastPathComponent)
                 try? mgr.saveManifest(manifest, to: directory)
             }
+            let thumbURL = RecordingEncryptionManager.thumbnailURL(for: url.lastPathComponent)
+            try? FileManager.default.removeItem(at: thumbURL)
         }
     }
     func toggleRecording(target: String, channelName: String?, quality: String = "best") {
@@ -529,19 +559,22 @@ final class RecordingManager: ObservableObject {
 
         guard FileManager.default.fileExists(atPath: url.path) else { return }
 
-        do {
-            let result = try mgr.encryptFile(
-                at: url,
-                in: directory,
-                channelName: channelName,
-                quality: quality
-            )
-
-            var manifest = (try? mgr.loadManifest(from: directory)) ?? [:]
-            manifest[result.hashFilename] = result.entry
-            try mgr.saveManifest(manifest, to: directory)
-        } catch {
-            // If encryption fails, the original MP4 is preserved.
+        // Run encryption on a background thread — loading + AES-encrypting a full video
+        // on the main actor would freeze the UI for seconds.
+        Task.detached(priority: .background) {
+            do {
+                let result = try mgr.encryptFile(
+                    at: url,
+                    in: directory,
+                    channelName: channelName,
+                    quality: quality
+                )
+                var manifest = (try? mgr.loadManifest(from: directory)) ?? [:]
+                manifest[result.hashFilename] = result.entry
+                try mgr.saveManifest(manifest, to: directory)
+            } catch {
+                // If encryption fails, the original MP4 is preserved.
+            }
         }
     }
 

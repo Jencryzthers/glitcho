@@ -1,5 +1,7 @@
 import Foundation
 import CryptoKit
+import AVFoundation
+import AppKit
 
 #if canImport(SwiftUI)
 
@@ -10,7 +12,6 @@ struct RecordingManifestEntry: Codable, Equatable {
     let originalFilename: String
 }
 
-@MainActor
 final class RecordingEncryptionManager {
     private static let keychainService = "com.glitcho.recording-encryption"
     private static let keychainAccount = "master-key"
@@ -120,6 +121,54 @@ final class RecordingEncryptionManager {
         return try decoder.decode([String: RecordingManifestEntry].self, from: json)
     }
 
+    // MARK: - Thumbnail Cache
+
+    static var thumbnailCacheDirectory: URL {
+        let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
+        return caches.appendingPathComponent("Glitcho/thumbnails", isDirectory: true)
+    }
+
+    static func thumbnailURL(for hashFilename: String) -> URL {
+        thumbnailCacheDirectory.appendingPathComponent(hashFilename + ".thumb")
+    }
+
+    private static func ensureThumbnailCacheDirectoryExists() {
+        try? FileManager.default.createDirectory(
+            at: thumbnailCacheDirectory,
+            withIntermediateDirectories: true
+        )
+    }
+
+    func generateThumbnailSidecar(for videoURL: URL, hashFilename: String) {
+        Self.ensureThumbnailCacheDirectoryExists()
+        let asset = AVAsset(url: videoURL)
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: 320, height: 180)
+        // Be maximally tolerant: snap to any available frame near each candidate time.
+        generator.requestedTimeToleranceBefore = CMTime(seconds: 5, preferredTimescale: 600)
+        generator.requestedTimeToleranceAfter  = CMTime(seconds: 5, preferredTimescale: 600)
+
+        // Try several timestamps in case the stream starts late or the first second is black.
+        let candidates: [Double] = [1.0, 0.0, 3.0, 5.0, 10.0]
+        var cgImage: CGImage?
+        for seconds in candidates {
+            let t = CMTime(seconds: seconds, preferredTimescale: 600)
+            if let img = try? generator.copyCGImage(at: t, actualTime: nil) {
+                cgImage = img
+                break
+            }
+        }
+        guard let cgImage else { return }
+
+        let nsImage = NSImage(cgImage: cgImage, size: .zero)
+        guard let tiffData = nsImage.tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiffData),
+              let jpegData = bitmap.representation(using: .jpeg, properties: [.compressionFactor: 0.7])
+        else { return }
+        try? jpegData.write(to: Self.thumbnailURL(for: hashFilename), options: .atomic)
+    }
+
     // MARK: - File-Level Encrypt/Decrypt (Task 5)
 
     struct EncryptFileResult {
@@ -135,10 +184,14 @@ final class RecordingEncryptionManager {
         date: Date = Date()
     ) throws -> EncryptFileResult {
         let originalFilename = sourceURL.lastPathComponent
+
+        // Generate thumbnail before encryption while the source file is still readable.
+        let hashFilename = generateHashFilename(originalFilename: originalFilename)
+        generateThumbnailSidecar(for: sourceURL, hashFilename: hashFilename)
+
         let plaintext = try Data(contentsOf: sourceURL)
         let encrypted = try encrypt(data: plaintext)
 
-        let hashFilename = generateHashFilename(originalFilename: originalFilename)
         let destinationURL = directory.appendingPathComponent(hashFilename)
         try encrypted.write(to: destinationURL, options: .atomic)
 
