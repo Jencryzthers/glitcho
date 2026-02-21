@@ -22,6 +22,27 @@ struct TwitchChannel: Identifiable, Hashable {
     let name: String
     let url: URL
     let thumbnailURL: URL?
+    let viewerCount: Int
+    let gameName: String
+    let title: String
+    let startedAt: Date?
+
+    init(id: String, name: String, url: URL, thumbnailURL: URL?,
+         viewerCount: Int = 0, gameName: String = "", title: String = "",
+         startedAt: Date? = nil) {
+        self.id = id
+        self.name = name
+        self.url = url
+        self.thumbnailURL = thumbnailURL
+        self.viewerCount = viewerCount
+        self.gameName = gameName
+        self.title = title
+        self.startedAt = startedAt
+    }
+}
+
+extension Notification.Name {
+    static let channelsWentLive = Notification.Name("com.glitcho.channelsWentLive")
 }
 
 struct TwitchProfile {
@@ -53,6 +74,7 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
     @Published var pageURL: String = "twitch.tv"
     @Published var followedLive: [TwitchChannel] = []
     @Published var followedChannelLogins: [String] = []
+    @Published var offlineChannelAvatarURLs: [String: URL] = [:]  // login → avatar URL
     @Published var profileName: String?
     @Published var profileLogin: String?
     @Published var profileAvatarURL: URL?
@@ -78,6 +100,7 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
     private static let sharedProcessPool = WKProcessPool()
     private static let twitchWebClientID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
     private static let followedChannelsCacheKey = "webview.followedChannelLogins.v1"
+    private static let avatarCacheKey = "webview.offlineAvatarURLs.v1"
 
     private struct HelixUsersResponse: Decodable {
         let data: [HelixUser]
@@ -105,6 +128,10 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
         let user_login: String
         let user_name: String
         let thumbnail_url: String?
+        let viewer_count: Int?
+        let game_name: String?
+        let title: String?
+        let started_at: String?
     }
 
     private struct HelixFollowedChannel: Decodable {
@@ -134,11 +161,13 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
 
         super.init()
         followedChannelLogins = loadCachedFollowedChannelLogins()
+        offlineChannelAvatarURLs = loadCachedAvatarURLs()
         followActionDelegate.onDidFinish = { [weak self] webView in
             self?.runFollowScript(in: webView)
         }
 
         contentController.add(self, name: "followedLive")
+        contentController.add(self, name: "sideNavFollowedLogins")
         contentController.add(self, name: "profile")
         contentController.add(self, name: "channelNotification")
         contentController.add(self, name: "channelPin")
@@ -294,11 +323,29 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
                         }
                         self.lastFollowedChannelsSyncAt = now
                     }
+                    // After the followedChannelLogins update block:
+                    let offlineLogins = followedLogins.filter { login in
+                        !channels.map({ $0.id }).contains(login)
+                    }
+                    Task {
+                        await self.refreshOfflineAvatars(logins: offlineLogins)
+                    }
                 }
             }
             await MainActor.run {
                 self.lastFollowedLiveUpdateAt = now
                 if self.followedLive != channels {
+                    let previousLogins = Set(self.followedLive.map(\.id))
+                    if !previousLogins.isEmpty {
+                        let newlyLive = channels.filter { !previousLogins.contains($0.id) }
+                        if !newlyLive.isEmpty {
+                            NotificationCenter.default.post(
+                                name: .channelsWentLive,
+                                object: nil,
+                                userInfo: ["channels": newlyLive]
+                            )
+                        }
+                    }
                     self.followedLive = channels
                 }
             }
@@ -355,6 +402,11 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
             }
 
             let decoded = try JSONDecoder().decode(HelixFollowedStreamsResponse.self, from: data)
+            let iso8601Formatter: ISO8601DateFormatter = {
+                let f = ISO8601DateFormatter()
+                f.formatOptions = [.withInternetDateTime]
+                return f
+            }()
             let pageChannels = decoded.data.compactMap { stream -> TwitchChannel? in
                 let login = stream.user_login.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
                 guard !login.isEmpty else { return nil }
@@ -369,11 +421,17 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
                     }
                     .flatMap(URL.init(string:))
 
+                let startedAt: Date? = stream.started_at.flatMap { iso8601Formatter.date(from: $0) }
+
                 return TwitchChannel(
                     id: login,
                     name: name.isEmpty ? login : name,
                     url: url,
-                    thumbnailURL: thumbnailURL
+                    thumbnailURL: thumbnailURL,
+                    viewerCount: stream.viewer_count ?? 0,
+                    gameName: stream.game_name ?? "",
+                    title: stream.title ?? "",
+                    startedAt: startedAt
                 )
             }
             channels.append(contentsOf: pageChannels)
@@ -425,50 +483,59 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
     }
 
     private func fetchFollowedChannelsGQL(authToken: String) async throws -> [String] {
-        let query = """
-        query {
-          currentUser {
-            follows(first: 100) {
-              edges {
-                node {
-                  login
+        var logins: [String] = []
+        var cursor: String? = nil
+        var pageCount = 0
+        let maxPages = 20 // safety cap: 20 × 100 = 2 000 channels
+
+        repeat {
+            pageCount += 1
+            guard pageCount <= maxPages else { break }
+
+            let cursorClause = cursor.map { ", after: \"\($0)\"" } ?? ""
+            let query = """
+            query {
+              currentUser {
+                follows(first: 100\(cursorClause)) {
+                  edges {
+                    node { login }
+                  }
+                  pageInfo { hasNextPage endCursor }
                 }
               }
             }
-          }
-        }
-        """
-        let body: [String: Any] = ["query": query]
-        guard let jsonData = try? JSONSerialization.data(withJSONObject: body) else { return [] }
+            """
+            let body: [String: Any] = ["query": query]
+            guard let jsonData = try? JSONSerialization.data(withJSONObject: body) else { break }
 
-        var request = URLRequest(url: URL(string: "https://gql.twitch.tv/gql")!)
-        request.httpMethod = "POST"
-        request.httpBody = jsonData
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue(Self.twitchWebClientID, forHTTPHeaderField: "Client-ID")
-        request.setValue("OAuth \(authToken)", forHTTPHeaderField: "Authorization")
+            var request = URLRequest(url: URL(string: "https://gql.twitch.tv/gql")!)
+            request.httpMethod = "POST"
+            request.httpBody = jsonData
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue(Self.twitchWebClientID, forHTTPHeaderField: "Client-ID")
+            request.setValue("OAuth \(authToken)", forHTTPHeaderField: "Authorization")
 
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
-            return []
-        }
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let dataObj = json["data"] as? [String: Any],
-              let currentUser = dataObj["currentUser"] as? [String: Any],
-              let follows = currentUser["follows"] as? [String: Any],
-              let edges = follows["edges"] as? [[String: Any]] else {
-            return []
-        }
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse,
+                  (200...299).contains(http.statusCode) else { break }
+            guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let dataObj = json["data"] as? [String: Any],
+                  let currentUser = dataObj["currentUser"] as? [String: Any],
+                  let follows = currentUser["follows"] as? [String: Any],
+                  let edges = follows["edges"] as? [[String: Any]] else { break }
 
-        var logins: [String] = []
-        for edge in edges {
-            guard let node = edge["node"] as? [String: Any],
-                  let login = node["login"] as? String else { continue }
-            let normalized = login.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            if !normalized.isEmpty {
-                logins.append(normalized)
+            for edge in edges {
+                guard let node = edge["node"] as? [String: Any],
+                      let login = node["login"] as? String else { continue }
+                let normalized = login.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                if !normalized.isEmpty { logins.append(normalized) }
             }
-        }
+
+            let pageInfo = follows["pageInfo"] as? [String: Any]
+            let hasNextPage = pageInfo?["hasNextPage"] as? Bool ?? false
+            cursor = hasNextPage ? (pageInfo?["endCursor"] as? String) : nil
+        } while cursor != nil
+
         var seen = Set<String>()
         return logins.filter { seen.insert($0).inserted }.sorted()
     }
@@ -714,6 +781,22 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
                     nonce: UUID()
                 )
             }
+        case "sideNavFollowedLogins":
+            // Sidebar channel logins (live + recently-offline) scraped from the DOM.
+            // Used as a supplementary source when the Helix/GQL API is unavailable.
+            guard let raw = message.body as? [String] else { return }
+            let normalized = raw
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+                .filter { !$0.isEmpty }
+            guard !normalized.isEmpty, isLoggedIn else { return }
+            DispatchQueue.main.async {
+                var updated = Set(self.followedChannelLogins)
+                let added = normalized.filter { updated.insert($0).inserted }
+                guard !added.isEmpty else { return }
+                let merged = updated.sorted()
+                self.followedChannelLogins = merged
+                self.persistFollowedChannelLogins(merged)
+            }
         case "consoleLog":
             break
         case "vodThumbnailRequest":
@@ -742,6 +825,62 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
 
     private func persistFollowedChannelLogins(_ logins: [String]) {
         UserDefaults.standard.set(logins, forKey: Self.followedChannelsCacheKey)
+    }
+
+    private func loadCachedAvatarURLs() -> [String: URL] {
+        guard let dict = UserDefaults.standard.dictionary(forKey: Self.avatarCacheKey) as? [String: String] else { return [:] }
+        var result: [String: URL] = [:]
+        for (login, urlString) in dict {
+            if let url = URL(string: urlString) { result[login] = url }
+        }
+        return result
+    }
+
+    private func persistAvatarURLs(_ urls: [String: URL]) {
+        let dict = urls.mapValues { $0.absoluteString }
+        UserDefaults.standard.set(dict, forKey: Self.avatarCacheKey)
+    }
+
+    func refreshOfflineAvatars(logins: [String]) async {
+        guard !logins.isEmpty else { return }
+        guard let authToken = await twitchAuthToken() else { return }
+
+        // Only fetch for logins we don't already have
+        let missing = logins.filter { offlineChannelAvatarURLs[$0] == nil }
+        guard !missing.isEmpty else { return }
+
+        // Helix allows up to 100 logins per request
+        let batches = stride(from: 0, to: missing.count, by: 100).map {
+            Array(missing[$0..<min($0 + 100, missing.count)])
+        }
+
+        var fetched: [String: URL] = [:]
+        for batch in batches {
+            var components = URLComponents(string: "https://api.twitch.tv/helix/users")!
+            components.queryItems = batch.map { URLQueryItem(name: "login", value: $0) }
+            var request = URLRequest(url: components.url!)
+            request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
+            request.setValue(Self.twitchWebClientID, forHTTPHeaderField: "Client-Id")
+
+            guard let (data, response) = try? await URLSession.shared.data(for: request),
+                  let http = response as? HTTPURLResponse,
+                  (200...299).contains(http.statusCode),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let dataArr = json["data"] as? [[String: Any]] else { continue }
+
+            for user in dataArr {
+                guard let login = (user["login"] as? String)?.lowercased(),
+                      let avatarString = user["profile_image_url"] as? String,
+                      let avatarURL = URL(string: avatarString) else { continue }
+                fetched[login] = avatarURL
+            }
+        }
+
+        guard !fetched.isEmpty else { return }
+        await MainActor.run {
+            self.offlineChannelAvatarURLs.merge(fetched) { _, new in new }
+            self.persistAvatarURLs(self.offlineChannelAvatarURLs)
+        }
     }
 
     func setChannelNotificationState(login: String, enabled: Bool) {
@@ -895,6 +1034,7 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
         config.mediaTypesRequiringUserActionForPlayback = []
 
         contentController.add(self, name: "followedLive")
+        contentController.add(self, name: "sideNavFollowedLogins")
         contentController.add(self, name: "profile")
         contentController.addUserScript(Self.followedLiveScript)
         contentController.addUserScript(Self.profileScript)
@@ -1753,6 +1893,44 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
             });
           }
 
+          // Returns all channel logins found in the sidebar Followed Channels section,
+          // including recently-offline channels shown with a gray indicator.
+          function extractSideNavAllLogins() {
+            const sideNav = document.querySelector('[data-a-target*="side-nav"], [data-test-selector="side-nav"], nav[aria-label="Primary Navigation"]');
+            if (!sideNav) { return []; }
+            let followedSection = null;
+            const allText = sideNav.querySelectorAll('p, span, div, h1, h2, h3, h4, h5, h6');
+            for (const el of allText) {
+              const text = (el.textContent || '').trim().toLowerCase();
+              if (text === 'followed channels' || text === 'chaînes suivies' || text === 'followed' || text === 'suivi') {
+                followedSection = el.closest('[class*="side-nav-section"], [class*="SideNavSection"], div');
+                break;
+              }
+            }
+            if (!followedSection) {
+              followedSection = sideNav.querySelector('[aria-label*="Followed" i], [aria-label*="Suivi" i]');
+            }
+            if (!followedSection) { return []; }
+
+            const logins = [];
+            const links = Array.from(followedSection.querySelectorAll('a[href^="/"]'));
+            for (const link of links) {
+              const href = link.getAttribute('href');
+              if (!href || !href.startsWith('/') || href.startsWith('/directory') || href.startsWith('/videos') || href.startsWith('/settings')) { continue; }
+              const linkText = (link.textContent || '').toLowerCase().trim();
+              if (linkText.includes('show more') || linkText.includes('afficher plus') || linkText.includes('recommended')) { break; }
+              const pathParts = href.split('/').filter(Boolean);
+              if (pathParts.length > 1 && pathParts[1] !== 'home') { continue; }
+              let cleanHref = href;
+              if (/^\\/[^/]+\\/home\\/?$/.test(cleanHref)) { cleanHref = cleanHref.replace(/\\/home\\/?$/, ''); }
+              const login = cleanHref.split('/').filter(Boolean)[0];
+              if (login && !logins.includes(login.toLowerCase())) {
+                logins.push(login.toLowerCase());
+              }
+            }
+            return logins;
+          }
+
           function extract() {
             const map = new Map();
             // Extract from /following page (background webview)
@@ -1761,6 +1939,13 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
             // This section only shows LIVE followed channels
             extractFromSideNav(map);
             window.webkit.messageHandlers.followedLive.postMessage(Array.from(map.values()));
+
+            // Post all sidebar logins (live + recently-offline) as a supplementary
+            // source for the offline section in case the Helix/GQL API is unavailable.
+            const sideNavLogins = extractSideNavAllLogins();
+            if (sideNavLogins.length > 0) {
+              window.webkit.messageHandlers.sideNavFollowedLogins.postMessage(sideNavLogins);
+            }
           }
 
           extract();

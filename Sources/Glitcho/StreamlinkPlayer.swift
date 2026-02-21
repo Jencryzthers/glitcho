@@ -7,6 +7,10 @@ import Metal
 import SwiftUI
 import WebKit
 
+/// Shared WKProcessPool for all hidden scraper WebViews (About, Videos, Schedule tabs).
+/// Merges them into a single WebKit process instead of one per store, reducing RAM usage.
+let sharedScraperProcessPool = WKProcessPool()
+
 /// Gestionnaire Streamlink pour extraire les URLs de stream
 class StreamlinkManager: ObservableObject {
     @Published var isLoading = false
@@ -496,6 +500,12 @@ struct NativeVideoPlayer: NSViewRepresentable {
 
     var minZoom: CGFloat = 1.0
     var maxZoom: CGFloat = 4.0
+    /// When non-nil, seek to this position (seconds) once the player item is ready. Cleared after use.
+    var seekOnLoadSeconds: Double? = nil
+    /// Playback rate (1.0 = normal). Applied only while the player is playing.
+    var playbackRate: Float = 1.0
+    /// Callback invoked periodically (approximately every 5 s) with the current playback position in seconds.
+    var onPlaybackTimeUpdate: ((Double) -> Void)? = nil
 
     init(
         url: URL,
@@ -514,7 +524,10 @@ struct NativeVideoPlayer: NSViewRepresentable {
         imageOptimizeEnabled: Bool = false,
         imageOptimizationConfiguration: ImageOptimizationConfiguration = .productionDefault,
         minZoom: CGFloat = 1.0,
-        maxZoom: CGFloat = 4.0
+        maxZoom: CGFloat = 4.0,
+        seekOnLoadSeconds: Double? = nil,
+        playbackRate: Float = 1.0,
+        onPlaybackTimeUpdate: ((Double) -> Void)? = nil
     ) {
         self.url = url
         self._isPlaying = isPlaying
@@ -533,6 +546,9 @@ struct NativeVideoPlayer: NSViewRepresentable {
         self.imageOptimizationConfiguration = imageOptimizationConfiguration
         self.minZoom = minZoom
         self.maxZoom = maxZoom
+        self.seekOnLoadSeconds = seekOnLoadSeconds
+        self.playbackRate = playbackRate
+        self.onPlaybackTimeUpdate = onPlaybackTimeUpdate
     }
 
     final class ZoomableAVPlayerView: AVPlayerView {
@@ -546,6 +562,7 @@ struct NativeVideoPlayer: NSViewRepresentable {
 
     final class Coordinator: NSObject, NSGestureRecognizerDelegate {
         var endObserver: Any?
+        var periodicTimeObserver: Any?
         let pipController: PictureInPictureController?
 
         var parent: NativeVideoPlayer
@@ -567,6 +584,7 @@ struct NativeVideoPlayer: NSViewRepresentable {
         private var lastImageOptimizationConfiguration = ImageOptimizationConfiguration.productionDefault
         private var lastAppliedVolume: Double = -1
         private var lastAppliedMuted = false
+        private var lastAppliedPlaybackRate: Float = 1.0
         private var lastFullscreenRequestToken: Int
         let interpolationController = MotionInterpolationController()
 
@@ -872,6 +890,17 @@ struct NativeVideoPlayer: NSViewRepresentable {
             lastAppliedMuted = shouldMute
         }
 
+        func updatePlaybackRateIfNeeded(on view: AVPlayerView) {
+            guard let player = view.player else { return }
+            let rate = parent.playbackRate
+            guard abs(lastAppliedPlaybackRate - rate) > 0.001 else { return }
+            lastAppliedPlaybackRate = rate
+            // Only update rate when the player is actively playing (rate > 0).
+            if player.rate > 0 {
+                player.rate = rate
+            }
+        }
+
         func updatePlayerFullscreenIfNeeded(on view: AVPlayerView) {
             guard parent.fullscreenRequestToken != lastFullscreenRequestToken else { return }
             lastFullscreenRequestToken = parent.fullscreenRequestToken
@@ -989,6 +1018,12 @@ struct NativeVideoPlayer: NSViewRepresentable {
         let player = AVPlayer(url: url)
         playerView.player = player
 
+        // Seek to resume position if provided.
+        if let seekSeconds = seekOnLoadSeconds, seekSeconds > 0 {
+            let seekTime = CMTime(seconds: seekSeconds, preferredTimescale: 600)
+            player.seek(to: seekTime, toleranceBefore: .zero, toleranceAfter: CMTime(seconds: 0.5, preferredTimescale: 600))
+        }
+
         // Gestures: pinch to zoom, drag to pan, double-click to toggle zoom.
         let magnify = NSMagnificationGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleMagnify(_:)))
         magnify.delegate = context.coordinator
@@ -1026,6 +1061,15 @@ struct NativeVideoPlayer: NSViewRepresentable {
             }
         }
 
+        // Periodic time observer — fires every 5 seconds to report current time.
+        if let callback = onPlaybackTimeUpdate {
+            let interval = CMTime(seconds: 5.0, preferredTimescale: 600)
+            context.coordinator.periodicTimeObserver = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak player] time in
+                guard let player, player.timeControlStatus != .paused else { return }
+                callback(time.seconds)
+            }
+        }
+
         context.coordinator.pipController?.attach(playerView)
         context.coordinator.applyZoomAndPan(to: playerView)
         return playerView
@@ -1040,6 +1084,7 @@ struct NativeVideoPlayer: NSViewRepresentable {
         context.coordinator.updatePlayerNativeChromeForFullscreenState(on: playerView)
         context.coordinator.updatePlaybackStateIfNeeded(on: playerView)
         context.coordinator.updateAudioStateIfNeeded(on: playerView)
+        context.coordinator.updatePlaybackRateIfNeeded(on: playerView)
         context.coordinator.updatePlayerFullscreenIfNeeded(on: playerView)
         context.coordinator.applyMotionSettingsIfNeeded(to: playerView)
         context.coordinator.pipController?.attach(playerView)
@@ -1050,6 +1095,10 @@ struct NativeVideoPlayer: NSViewRepresentable {
         if let token = coordinator.endObserver {
             NotificationCenter.default.removeObserver(token)
             coordinator.endObserver = nil
+        }
+        if let observer = coordinator.periodicTimeObserver {
+            playerView.player?.removeTimeObserver(observer)
+            coordinator.periodicTimeObserver = nil
         }
         (playerView as? ZoomableAVPlayerView)?.onLayout = nil
         coordinator.interpolationController.teardown()
@@ -1572,14 +1621,6 @@ struct HybridTwitchView: View {
                                         .frame(width: 220, alignment: .leading)
 
                                     Spacer()
-
-                                    Button(action: { setDetailsSectionCollapsed(true) }) {
-                                        Image(systemName: "chevron.down")
-                                            .font(.system(size: 12, weight: .semibold))
-                                    }
-                                    .buttonStyle(.bordered)
-                                    .controlSize(.small)
-                                    .help("Collapse details panel")
 
                                     if detailsTab == .videos {
                                         Button(action: { videosStore.reload() }) {
@@ -2822,6 +2863,7 @@ final class ChannelAboutStore: NSObject, ObservableObject, WKNavigationDelegate,
 
     private func makeWebView() -> WKWebView {
         let config = WKWebViewConfiguration()
+        config.processPool = sharedScraperProcessPool
         let contentController = WKUserContentController()
         config.userContentController = contentController
         config.websiteDataStore = .default()
@@ -3223,7 +3265,7 @@ final class ChannelVideosStore: NSObject, ObservableObject, WKNavigationDelegate
         scheduleLoadingDeadline(for: normalized, section: section, offline: isChannelOffline)
         scheduleGQLFallback(for: normalized, section: section, offline: isChannelOffline)
 
-        let url = preferredRouteURL(channel: normalized, section: section, offline: isChannelOffline)
+        let url = preferredRouteURL(channel: normalized, section: section)
 
         if let currentURL = webView?.url {
             let sameChannel = currentURL.absoluteString.contains("/\(normalized)/")
@@ -3510,10 +3552,10 @@ final class ChannelVideosStore: NSObject, ObservableObject, WKNavigationDelegate
     }
 
     static func preferredRouteURLForTests(channel: String, section: Section, offline: Bool) -> URL {
-        preferredRouteURL(channel: channel, section: section, offline: offline)
+        preferredRouteURL(channel: channel, section: section)
     }
 
-    private static func preferredRouteURL(channel: String, section: Section, offline _: Bool) -> URL {
+    private static func preferredRouteURL(channel: String, section: Section) -> URL {
         switch section {
         case .videos:
             return URL(string: "https://www.twitch.tv/\(channel)/videos")!
@@ -3522,8 +3564,8 @@ final class ChannelVideosStore: NSObject, ObservableObject, WKNavigationDelegate
         }
     }
 
-    private func preferredRouteURL(channel: String, section: Section, offline: Bool) -> URL {
-        Self.preferredRouteURL(channel: channel, section: section, offline: offline)
+    private func preferredRouteURL(channel: String, section: Section) -> URL {
+        Self.preferredRouteURL(channel: channel, section: section)
     }
 
     private func fallbackRouteURL(channel: String, section: Section, offline: Bool) -> URL? {
@@ -3701,6 +3743,7 @@ final class ChannelVideosStore: NSObject, ObservableObject, WKNavigationDelegate
 
     private func makeWebView() -> WKWebView {
         let config = WKWebViewConfiguration()
+        config.processPool = sharedScraperProcessPool
         let contentController = WKUserContentController()
         config.userContentController = contentController
         config.websiteDataStore = .default()
@@ -4480,6 +4523,7 @@ final class ChannelScheduleStore: NSObject, ObservableObject, WKNavigationDelega
 
     private func makeWebView() -> WKWebView {
         let config = WKWebViewConfiguration()
+        config.processPool = sharedScraperProcessPool
         let contentController = WKUserContentController()
         config.userContentController = contentController
         config.websiteDataStore = .default()
@@ -4834,14 +4878,18 @@ struct ChannelSchedulePanelView: View {
                     }
                 } else if store.items.isEmpty {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("No schedule available.")
-                            .font(.system(size: 12))
-                            .foregroundColor(.white.opacity(0.6))
                         if let error = store.lastError, !error.isEmpty {
+                            Text("Unable to load schedule.")
+                                .font(.system(size: 12))
+                                .foregroundColor(.white.opacity(0.6))
                             Text(error)
                                 .font(.system(size: 11))
                                 .foregroundColor(.white.opacity(0.45))
                                 .lineLimit(3)
+                        } else {
+                            Text("No schedule set for this channel.")
+                                .font(.system(size: 12))
+                                .foregroundColor(.white.opacity(0.6))
                         }
                     }
                 } else {

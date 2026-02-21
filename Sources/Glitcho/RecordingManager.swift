@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import UserNotifications
 
 #if canImport(SwiftUI)
 
@@ -29,6 +30,10 @@ final class RecordingManager: ObservableObject {
     @Published var isInstallingFFmpeg = false
     @Published var ffmpegInstallStatus: String?
     @Published var ffmpegInstallError: String?
+
+    @Published var autoStoppedRecordings: [String] = []
+    @Published var scheduledRecordings: [ScheduledRecording] = []
+    @Published var autoRecordLogins: Set<String> = []
 
     let recorderOrchestrator: RecorderOrchestrator
 
@@ -60,12 +65,24 @@ final class RecordingManager: ObservableObject {
         let quality: String
     }
 
+    struct ScheduledRecording: Codable, Identifiable {
+        let id: UUID
+        var channelLogin: String
+        var startDate: Date
+        var quality: String
+        var hasStarted: Bool = false
+    }
+
     private var recordingSessions: [String: RecordingSession] = [:]
     private var queuedRecordingRequestsByLogin: [String: QueuedRecordingRequest] = [:]
     private var backgroundRecordingLogins: Set<String> = []
     private var backgroundRecordingMonitor: Timer?
     private var pendingRecoveryIntents: [RecoveryIntent] = []
     private let recoveryDefaultsKey = "recordingRecoveryIntents.v1"
+    private static let scheduleKey = "scheduledRecordings.v1"
+    private static let autoRecordLoginsKey = "autoRecordLogins.v1"
+    private var scheduleTimer: Timer?
+
 
     private let filenameDateFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -107,10 +124,20 @@ final class RecordingManager: ObservableObject {
                 ]
             )
         }
+
+        // Evict thumbnail cache entries that have no corresponding recording in the manifest.
+        // This cleans up orphaned .thumb files left by deletions that bypassed deleteRecording(at:).
+        let manifest = (try? effectiveEncryptionManager.loadManifest(from: recordingsDirectory())) ?? [:]
+        let knownHashes = Set(manifest.keys)
+        effectiveEncryptionManager.cleanupOrphanedThumbnails(knownHashFilenames: knownHashes)
+        loadScheduledRecordings()
+        startScheduleMonitor()
+        autoRecordLogins = loadPersistedAutoRecordLogins()
     }
 
     deinit {
         backgroundRecordingMonitor?.invalidate()
+        scheduleTimer?.invalidate()
     }
 
     func consumeRecoveryIntents() -> [RecoveryIntent] {
@@ -433,8 +460,33 @@ final class RecordingManager: ObservableObject {
 
                 // Streamlink outputs MPEG-TS data even when the filename ends with .mp4.
                 // Remux to a real MP4 so AVPlayer can play it.
+                // Stream ended naturally (exit 0, not user-requested): treat as auto-stop.
+                let streamEndedNaturally = proc.terminationStatus == 0 && !didUserStop
                 let shouldAttemptFinalize = proc.terminationStatus == 0 || didUserStop
                 if shouldAttemptFinalize {
+                    let displayForNotif = session.channelName ?? session.login ?? "Unknown"
+                    if streamEndedNaturally {
+                        if let login = session.login {
+                            self.autoStoppedRecordings.append(login)
+                        }
+                        self.sendNotification(
+                            title: "Stream ended",
+                            body: "\(displayForNotif) recording saved"
+                        )
+                        GlitchoTelemetry.track(
+                            "recording_auto_stopped_stream_ended",
+                            metadata: ["login": session.login ?? "unknown"]
+                        )
+                    } else {
+                        let duration = Int(Date().timeIntervalSince(session.startedAt))
+                        let mins = duration / 60
+                        let secs = duration % 60
+                        let durationStr = mins > 0 ? "\(mins)m \(secs)s" : "\(secs)s"
+                        self.sendNotification(
+                            title: "Recording saved",
+                            body: "\(displayForNotif) (\(durationStr))"
+                        )
+                    }
                     Task {
                         _ = try? await self.prepareRecordingForPlayback(at: session.outputURL)
                         self.encryptCompletedRecording(
@@ -475,6 +527,8 @@ final class RecordingManager: ObservableObject {
                     metadata: ["login": resolvedChannelLogin, "quality": quality]
                 )
             }
+            let notifDisplayName = displayName ?? resolvedChannelLogin ?? "Unknown"
+            sendNotification(title: "Recording started", body: notifDisplayName)
             return true
         } catch {
             recordingSessions.removeValue(forKey: sessionKey)
@@ -523,6 +577,11 @@ final class RecordingManager: ObservableObject {
         isRecording(channelLogin: channelLogin) || isRecordingInBackgroundAgent(channelLogin: channelLogin)
     }
 
+    func recordingStartTime(channelLogin: String?) -> Date? {
+        guard let channelLogin, let normalized = normalizedChannelLogin(channelLogin) else { return nil }
+        return recordingSessions[loginKey(for: normalized)]?.startedAt
+    }
+
     func isRecordingInBackgroundAgent(channelLogin: String?) -> Bool {
         guard let channelLogin, let normalized = normalizedChannelLogin(channelLogin) else { return false }
         return backgroundRecordingLogins.contains(normalized)
@@ -569,9 +628,8 @@ final class RecordingManager: ObservableObject {
                     channelName: channelName,
                     quality: quality
                 )
-                var manifest = (try? mgr.loadManifest(from: directory)) ?? [:]
-                manifest[result.hashFilename] = result.entry
-                try mgr.saveManifest(manifest, to: directory)
+                try mgr.upsertManifestEntry(result.entry, hashFilename: result.hashFilename, in: directory)
+                NotificationCenter.default.post(name: .recordingLibraryDidChange, object: nil)
             } catch {
                 // If encryption fails, the original MP4 is preserved.
             }
@@ -590,6 +648,148 @@ final class RecordingManager: ObservableObject {
             metadata: ["login": session.login ?? "unknown"]
         )
         session.process.terminate()
+    }
+
+    // MARK: - Auto-Record Allowlist
+
+    func addAutoRecord(login: String) {
+        guard let normalized = normalizedChannelLogin(login) else { return }
+        autoRecordLogins.insert(normalized)
+        persistAutoRecordLogins()
+    }
+
+    func removeAutoRecord(login: String) {
+        guard let normalized = normalizedChannelLogin(login) else { return }
+        autoRecordLogins.remove(normalized)
+        persistAutoRecordLogins()
+    }
+
+    func isAutoRecord(login: String) -> Bool {
+        guard let normalized = normalizedChannelLogin(login) else { return false }
+        return autoRecordLogins.contains(normalized)
+    }
+
+    /// Called when the set of live channel logins changes. Starts recording for any
+    /// allowlisted channels that are live but not already recording and not in the
+    /// recording blocklist.
+    func triggerAutoRecordsForLiveChannels(_ liveLogins: [String], quality: String = "best") {
+        let blocklist = loadAutoRecordBlockedLogins()
+        for login in liveLogins {
+            guard let normalized = normalizedChannelLogin(login) else { continue }
+            guard isAutoRecord(login: normalized) else { continue }
+            guard !blocklist.contains(normalized) else { continue }
+            guard !isRecordingAny(channelLogin: normalized) else { continue }
+            let target = "twitch.tv/\(normalized)"
+            let started = startRecording(target: target, channelName: nil, quality: quality)
+            if started {
+                sendNotification(title: "Auto-recording started: \(normalized)", body: "")
+            }
+        }
+    }
+
+    private func persistAutoRecordLogins() {
+        let array = Array(autoRecordLogins).sorted()
+        if let data = try? JSONEncoder().encode(array) {
+            UserDefaults.standard.set(data, forKey: Self.autoRecordLoginsKey)
+        }
+    }
+
+    private func loadPersistedAutoRecordLogins() -> Set<String> {
+        guard let data = UserDefaults.standard.data(forKey: Self.autoRecordLoginsKey),
+              let decoded = try? JSONDecoder().decode([String].self, from: data) else {
+            return []
+        }
+        return Set(decoded.compactMap { normalizedChannelLogin($0) })
+    }
+
+    /// Reads the recording blocklist from the same UserDefaults key used by ContentView/SettingsView.
+    private func loadAutoRecordBlockedLogins() -> Set<String> {
+        guard let jsonString = UserDefaults.standard.string(forKey: "autoRecordBlockedChannels"),
+              let data = jsonString.data(using: .utf8),
+              let decoded = try? JSONDecoder().decode([String].self, from: data) else {
+            return []
+        }
+        return Set(decoded.compactMap { normalizedChannelLogin($0) })
+    }
+
+    // MARK: - Notification Support
+
+    func requestNotificationPermission() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
+    func sendNotification(title: String, body: String) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 0.1, repeats: false)
+        let request = UNNotificationRequest(
+            identifier: UUID().uuidString,
+            content: content,
+            trigger: trigger
+        )
+        UNUserNotificationCenter.current().add(request, withCompletionHandler: nil)
+    }
+
+    // MARK: - Scheduled Recordings
+
+    func loadScheduledRecordings() {
+        guard let data = UserDefaults.standard.data(forKey: Self.scheduleKey),
+              let decoded = try? JSONDecoder().decode([ScheduledRecording].self, from: data) else {
+            return
+        }
+        scheduledRecordings = decoded
+    }
+
+    func saveScheduledRecordings() {
+        if let data = try? JSONEncoder().encode(scheduledRecordings) {
+            UserDefaults.standard.set(data, forKey: Self.scheduleKey)
+        }
+    }
+
+    func addScheduledRecording(channelLogin: String, startDate: Date, quality: String = "best") {
+        let entry = ScheduledRecording(
+            id: UUID(),
+            channelLogin: channelLogin,
+            startDate: startDate,
+            quality: quality
+        )
+        scheduledRecordings.append(entry)
+        saveScheduledRecordings()
+    }
+
+    func removeScheduledRecording(id: UUID) {
+        scheduledRecordings.removeAll { $0.id == id }
+        saveScheduledRecordings()
+    }
+
+    func startScheduleMonitor() {
+        scheduleTimer?.invalidate()
+        scheduleTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.checkScheduledRecordings()
+            }
+        }
+    }
+
+    private func checkScheduledRecordings() {
+        let now = Date.now
+        var changed = false
+        for index in scheduledRecordings.indices {
+            let entry = scheduledRecordings[index]
+            guard !entry.hasStarted, entry.startDate <= now else { continue }
+            _ = startRecording(
+                target: "twitch.tv/\(entry.channelLogin)",
+                channelName: entry.channelLogin,
+                quality: entry.quality
+            )
+            scheduledRecordings[index].hasStarted = true
+            changed = true
+        }
+        if changed {
+            saveScheduledRecordings()
+        }
     }
 
     private func configuredConcurrencyLimit() -> Int {
@@ -934,6 +1134,31 @@ final class RecordingManager: ObservableObject {
             // Best-effort cleanup.
             try? FileManager.default.removeItem(at: tempURL)
             throw error
+        }
+    }
+
+    /// Remuxes an MPEG-TS-in-MP4 file to a fresh temp file suitable for thumbnail extraction.
+    /// Returns the temp URL on success (caller is responsible for deletion), or nil if
+    /// remux was not needed or failed — in which case the original URL should be used.
+    func remuxForThumbnail(at url: URL) async -> URL? {
+        guard url.pathExtension.lowercased() == "mp4",
+              isTransportStreamFile(at: url),
+              let ffmpegPath = resolveFFmpegPath() else { return nil }
+        let tempURL = effectiveEncryptionManager.tempPlaybackURL()
+        do {
+            _ = try await runProcess(
+                executable: ffmpegPath,
+                arguments: [
+                    "-y", "-hide_banner", "-loglevel", "error",
+                    "-i", url.path,
+                    "-c", "copy", "-movflags", "+faststart", "-bsf:a", "aac_adtstoasc",
+                    tempURL.path
+                ]
+            )
+            return tempURL
+        } catch {
+            try? FileManager.default.removeItem(at: tempURL)
+            return nil
         }
     }
 
@@ -1464,4 +1689,8 @@ private enum RecordingFFmpegInstallError: LocalizedError {
             return "FFmpeg install failed: expected '\(name)' executable was not found."
         }
     }
+}
+
+extension Notification.Name {
+    static let recordingLibraryDidChange = Notification.Name("com.glitcho.recordingLibraryDidChange")
 }

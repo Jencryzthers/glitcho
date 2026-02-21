@@ -42,6 +42,13 @@ private enum RecordingsSortColumn: String, CaseIterable {
     }
 }
 
+enum RecordingSort: String, CaseIterable {
+    case dateDesc = "Newest"
+    case dateAsc = "Oldest"
+    case channelAsc = "Channel"
+    case sizeDesc = "Largest"
+}
+
 struct RecordingsLibraryView: View {
     @ObservedObject var recordingManager: RecordingManager
     @StateObject private var pipController = PictureInPictureController()
@@ -53,6 +60,7 @@ struct RecordingsLibraryView: View {
     @AppStorage("recordingsLibrarySortAscending") private var sortAscending = false
     @AppStorage("recordingsLibraryGroupByStreamer") private var groupByStreamer = true
     @State private var isMultiSelectMode = false
+    @State private var multiSelection: Set<URL> = []
     @State private var playbackURL: URL?
     @State private var isPreparingPlayback = false
     @State private var playbackError: String?
@@ -84,6 +92,27 @@ struct RecordingsLibraryView: View {
     @State private var exportStatus: String?
     @State private var isExporting = false
     @State private var exportProgress: Double = 0
+
+    // Task 3: Resume playback position
+    @State private var seekOnLoadSeconds: Double? = nil
+
+    // Task 4: Clip export
+    @State private var showClipExporter = false
+    @State private var clipStartSeconds: Double = 0
+    @State private var clipEndSeconds: Double = 30
+    @State private var currentPlayerSeconds: Double = 0
+    @State private var clipTotalDuration: Double = 300.0
+
+    // Feature 1: Speed controls
+    @State private var playbackRate: Float = 1.0
+
+    // Feature 2: Sort and filter
+    @State private var filterText: String = ""
+    @State private var sortOrder: RecordingSort = .dateDesc
+    @State private var fileSizeCache: [URL: Int64] = [:]
+
+    // Feature 3: Disk usage
+    @State private var totalDiskUsageBytes: Int64 = 0
 
     private let dateFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -133,6 +162,14 @@ struct RecordingsLibraryView: View {
         .onAppear {
             refreshRecordings()
             refreshMotionCapability()
+            refreshDiskUsage()
+        }
+        .task {
+            refreshDiskUsage()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .recordingLibraryDidChange)) { _ in
+            refreshRecordings()
+            thumbnailRefreshToken = UUID()
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification)) { _ in
             refreshMotionCapability()
@@ -191,17 +228,280 @@ struct RecordingsLibraryView: View {
         } message: {
             Text(deletionError ?? "Unknown error")
         }
+        .sheet(isPresented: $showClipExporter) {
+            clipExporterSheet
+        }
+    }
+
+    // MARK: - Task 4: Clip exporter sheet
+
+    private func mmss(_ seconds: Double) -> String {
+        let total = max(0, Int(seconds))
+        let m = total / 60
+        let s = total % 60
+        return String(format: "%d:%02d", m, s)
+    }
+
+    private var clipExporterSheet: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text("Export Clip")
+                .font(.system(size: 16, weight: .semibold))
+
+            // Start slider
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("Start")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text(mmss(clipStartSeconds))
+                        .font(.system(size: 12, weight: .semibold).monospacedDigit())
+                        .foregroundStyle(.primary)
+                }
+                Slider(
+                    value: $clipStartSeconds,
+                    in: 0...max(clipEndSeconds, 0.1),
+                    step: 0.5
+                )
+                .tint(.accentColor)
+            }
+
+            // Duration label
+            let clipDuration = max(0, clipEndSeconds - clipStartSeconds)
+            Text("Duration: \(mmss(clipDuration))")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.primary)
+                .frame(maxWidth: .infinity, alignment: .center)
+
+            // End slider
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("End")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text(mmss(clipEndSeconds))
+                        .font(.system(size: 12, weight: .semibold).monospacedDigit())
+                        .foregroundStyle(.primary)
+                }
+                Slider(
+                    value: $clipEndSeconds,
+                    in: max(clipStartSeconds, 0)...max(clipTotalDuration, clipStartSeconds + 1),
+                    step: 0.5
+                )
+                .tint(.accentColor)
+            }
+
+            // Read-only time display (secondary)
+            HStack(spacing: 16) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Start")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    Text(mmss(clipStartSeconds))
+                        .font(.system(size: 11, weight: .medium).monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("End")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    Text(mmss(clipEndSeconds))
+                        .font(.system(size: 11, weight: .medium).monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+
+            HStack(spacing: 10) {
+                Button("Export") {
+                    showClipExporter = false
+                    exportClip()
+                }
+                .buttonStyle(.borderedProminent)
+
+                Button("Cancel") {
+                    showClipExporter = false
+                }
+                .buttonStyle(.bordered)
+            }
+        }
+        .padding(24)
+        .frame(width: 360)
+        .task {
+            // Feature 4: Load the actual asset duration when sheet opens.
+            if let url = playbackURL {
+                let asset = AVURLAsset(url: url)
+                if let dur = try? await asset.load(.duration) {
+                    let secs = dur.seconds
+                    if secs.isFinite && secs > 0 {
+                        clipTotalDuration = secs
+                        // Clamp end to actual duration
+                        if clipEndSeconds > secs {
+                            clipEndSeconds = secs
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func exportClip() {
+        guard let sourceURL = playbackURL else { return }
+
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Export Clip Here"
+
+        guard panel.runModal() == .OK, let destinationDir = panel.url else { return }
+
+        // Determine original filename.
+        let baseFilename: String
+        if let recording = selectedRecording, recording.url.pathExtension == "glitcho" {
+            let dir = recordingManager.recordingsDirectory()
+            let manifest = (try? recordingManager.effectiveEncryptionManager.loadManifest(from: dir)) ?? [:]
+            let original = manifest[recording.url.lastPathComponent]?.originalFilename ?? "\(recording.channelName).mp4"
+            let stem = (original as NSString).deletingPathExtension
+            let ext = (original as NSString).pathExtension
+            baseFilename = "\(stem)_clip.\(ext.isEmpty ? "mp4" : ext)"
+        } else {
+            let stem = (sourceURL.lastPathComponent as NSString).deletingPathExtension
+            let ext = sourceURL.pathExtension
+            baseFilename = "\(stem)_clip.\(ext.isEmpty ? "mp4" : ext)"
+        }
+
+        let outputURL = destinationDir.appendingPathComponent(baseFilename)
+        let startSecs = clipStartSeconds
+        let endSecs = clipEndSeconds
+        let ffmpegPath = resolvedFFmpegPath()
+
+        Task.detached(priority: .userInitiated) {
+            do {
+                guard let ffmpeg = ffmpegPath else {
+                    throw NSError(domain: "ClipExport", code: 1,
+                                  userInfo: [NSLocalizedDescriptionKey: "ffmpeg not found. Install via Homebrew or set its path in Settings."])
+                }
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: ffmpeg)
+                process.arguments = [
+                    "-y",
+                    "-ss", "\(startSecs)",
+                    "-to", "\(endSecs)",
+                    "-i", sourceURL.path,
+                    "-c", "copy",
+                    outputURL.path
+                ]
+                try process.run()
+                process.waitUntilExit()
+                if process.terminationStatus != 0 {
+                    throw NSError(domain: "ClipExport", code: 2,
+                                  userInfo: [NSLocalizedDescriptionKey: "ffmpeg exited with status \(process.terminationStatus)."])
+                }
+                await MainActor.run {
+                    exportStatus = "Clip exported to \(outputURL.path)."
+                }
+            } catch {
+                await MainActor.run {
+                    exportStatus = "Clip export failed: \(error.localizedDescription)"
+                }
+            }
+        }
     }
 
     private var librarySidebarView: some View {
         VStack(alignment: .leading, spacing: 12) {
             toolbarControls
             searchField
+            if isMultiSelectMode {
+                multiSelectActionBar
+            }
             exportStatusView
             recordingsListContainer
         }
         .frame(minWidth: 320, idealWidth: 360, maxWidth: 420)
         .background(Color(red: 0.07, green: 0.07, blue: 0.09))
+    }
+
+    private var multiSelectActionBar: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                // Select All button (also activated by Cmd+A)
+                Button {
+                    selectedRecordingIDs = Set(sortedFilteredRecordings.map(\.id))
+                    multiSelection = selectedRecordingIDs
+                } label: {
+                    Text("Select All")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.85))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 5)
+                        .background(Color.white.opacity(0.08))
+                        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                }
+                .buttonStyle(.plain)
+                .keyboardShortcut("a", modifiers: .command)
+                .help("Select all recordings (⌘A)")
+
+                Spacer()
+
+                // Export Selected button
+                Button {
+                    exportSelectedRecordings()
+                } label: {
+                    Label("Export", systemImage: "square.and.arrow.up")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(selectedRecordingIDs.isEmpty || isExporting ? .white.opacity(0.3) : .white.opacity(0.85))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 5)
+                        .background(Color.white.opacity(selectedRecordingIDs.isEmpty || isExporting ? 0.04 : 0.08))
+                        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                }
+                .buttonStyle(.plain)
+                .disabled(selectedRecordingIDs.isEmpty || isExporting)
+                .help("Export selected recordings to a folder")
+
+                // Batch Delete button (also activated by Delete/Backspace key)
+                Button {
+                    showBulkDeletionConfirmation = true
+                } label: {
+                    Label("Delete", systemImage: "trash")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(selectedRecordingIDs.isEmpty ? .white.opacity(0.3) : Color.red.opacity(0.85))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 5)
+                        .background(Color.white.opacity(selectedRecordingIDs.isEmpty ? 0.04 : 0.08))
+                        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                }
+                .buttonStyle(.plain)
+                .disabled(selectedRecordingIDs.isEmpty)
+                .keyboardShortcut(.delete, modifiers: [])
+                .help("Delete selected recordings (⌫)")
+
+                // Cancel button exits multi-select mode
+                Button {
+                    isMultiSelectMode = false
+                    selectedRecordingIDs.removeAll()
+                    multiSelection.removeAll()
+                } label: {
+                    Text("Cancel")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.65))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 5)
+                        .background(Color.white.opacity(0.06))
+                        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                }
+                .buttonStyle(.plain)
+                .help("Exit multi-select mode")
+            }
+            .padding(.horizontal, 16)
+
+            Divider()
+                .background(Color.white.opacity(0.08))
+        }
     }
 
     private var toolbarControls: some View {
@@ -245,6 +545,7 @@ struct RecordingsLibraryView: View {
                     isMultiSelectMode.toggle()
                     if !isMultiSelectMode {
                         selectedRecordingIDs.removeAll()
+                        multiSelection.removeAll()
                     }
                 } label: {
                     Image(systemName: isMultiSelectMode ? "checklist.checked" : "checklist")
@@ -256,6 +557,7 @@ struct RecordingsLibraryView: View {
 
                 Button {
                     refreshRecordings()
+                    refreshDiskUsage()
                 } label: {
                     Image(systemName: "arrow.clockwise")
                         .font(.system(size: 12, weight: .medium))
@@ -263,6 +565,13 @@ struct RecordingsLibraryView: View {
                 }
                 .buttonStyle(.plain)
                 .help("Refresh recordings")
+
+                if totalDiskUsageBytes > 0 {
+                    Text(formattedDiskUsage)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.45))
+                        .lineLimit(1)
+                }
             }
 
             HStack(spacing: 10) {
@@ -314,6 +623,27 @@ struct RecordingsLibraryView: View {
                 }
                 .buttonStyle(.plain)
                 .help(groupByStreamer ? "Disable streamer grouping" : "Enable streamer grouping")
+
+                // Feature 2: Sort order menu
+                Menu {
+                    ForEach(RecordingSort.allCases, id: \.self) { sort in
+                        Button {
+                            sortOrder = sort
+                        } label: {
+                            if sortOrder == sort {
+                                Label(sort.rawValue, systemImage: "checkmark")
+                            } else {
+                                Text(sort.rawValue)
+                            }
+                        }
+                    }
+                } label: {
+                    Image(systemName: "line.3.horizontal.decrease.circle")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.75))
+                }
+                .menuStyle(.borderlessButton)
+                .help("Sort: \(sortOrder.rawValue)")
 
                 Spacer()
             }
@@ -399,7 +729,23 @@ struct RecordingsLibraryView: View {
                             videoAspectMode: effectiveVideoAspectMode,
                             upscaler4KEnabled: isUpscaler4KActive,
                             imageOptimizeEnabled: isImageOptimizeActive,
-                            imageOptimizationConfiguration: imageOptimizationConfiguration
+                            imageOptimizationConfiguration: imageOptimizationConfiguration,
+                            seekOnLoadSeconds: seekOnLoadSeconds,
+                            playbackRate: playbackRate,
+                            onPlaybackTimeUpdate: { seconds in
+                                currentPlayerSeconds = seconds
+                                if let recordingURL = selectedRecording?.url {
+                                    // Check if near end via the resolved playback URL's asset duration.
+                                    let asset = AVURLAsset(url: playbackURL)
+                                    let duration = asset.duration.seconds
+                                    if duration.isFinite && duration > 0 && (duration - seconds) < 10 {
+                                        // Within 10 seconds of end — clear saved position so next play starts fresh.
+                                        clearPlaybackPosition(for: recordingURL)
+                                    } else {
+                                        savePlaybackPosition(seconds, for: recordingURL)
+                                    }
+                                }
+                            }
                         )
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
 
@@ -470,11 +816,43 @@ struct RecordingsLibraryView: View {
         .background(Color(red: 0.05, green: 0.05, blue: 0.07))
     }
 
+    @ViewBuilder
+    private func speedButton(rate: Float, label: String) -> some View {
+        Button {
+            playbackRate = rate
+        } label: {
+            Text(label)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(playbackRate == rate ? Color.accentColor : Color.white.opacity(0.75))
+                .padding(.horizontal, 5)
+                .frame(height: 22)
+        }
+        .buttonStyle(.plain)
+        .background(
+            RoundedRectangle(cornerRadius: 5, style: .continuous)
+                .fill(playbackRate == rate ? Color.white.opacity(0.15) : Color.clear)
+        )
+        .help("\(label) speed")
+    }
+
     private var recordingPlayerControlsToolbar: some View {
         HStack(spacing: 10) {
             Spacer(minLength: 0)
 
             HStack(spacing: 8) {
+                // Speed controls (Feature 1)
+                HStack(spacing: 2) {
+                    speedButton(rate: 0.5, label: "0.5x")
+                    speedButton(rate: 1.0, label: "1x")
+                    speedButton(rate: 1.5, label: "1.5x")
+                    speedButton(rate: 2.0, label: "2x")
+                }
+                .padding(.horizontal, 4)
+                .padding(.vertical, 2)
+                .background(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(Color.white.opacity(0.07))
+                )
                 if pipController.isAvailable {
                     Button(action: { pipController.toggle() }) {
                         Image(systemName: "pip.enter")
@@ -494,6 +872,23 @@ struct RecordingsLibraryView: View {
                 }
                 .buttonStyle(.plain)
                 .help("Player fullscreen")
+
+                Button {
+                    let t = currentPlayerSeconds
+                    clipStartSeconds = max(0, t - 30)
+                    clipEndSeconds = t + 30
+                    showClipExporter = true
+                } label: {
+                    Label("Clip", systemImage: "scissors")
+                        .font(.system(size: 11, weight: .semibold))
+                        .labelStyle(.titleAndIcon)
+                        .foregroundStyle(.white.opacity(0.82))
+                        .padding(.horizontal, 6)
+                        .frame(height: 22)
+                }
+                .buttonStyle(.plain)
+                .disabled(playbackURL == nil)
+                .help("Export Clip")
 
                 Button(action: { showPlayerMorePopover.toggle() }) {
                     Label("More", systemImage: "ellipsis")
@@ -816,16 +1211,51 @@ struct RecordingsLibraryView: View {
     }
 
     private var filteredRecordings: [RecordingEntry] {
-        let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !query.isEmpty else { return recordings }
+        // Combine searchQuery (existing) and filterText (Feature 2) — both drive the same filter.
+        let combinedQuery: String = {
+            let sq = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let ft = filterText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return sq.isEmpty ? ft : sq
+        }()
+        guard !combinedQuery.isEmpty else { return recordings }
         return recordings.filter { recording in
-            recording.channelName.lowercased().contains(query)
-                || recording.url.lastPathComponent.lowercased().contains(query)
+            recording.channelName.lowercased().contains(combinedQuery)
+                || recording.url.lastPathComponent.lowercased().contains(combinedQuery)
         }
     }
 
+    private func fileSize(for entry: RecordingEntry) -> Int64 {
+        if let cached = fileSizeCache[entry.url] { return cached }
+        let attrs = try? FileManager.default.attributesOfItem(atPath: entry.url.path)
+        let size = (attrs?[.size] as? Int64) ?? 0
+        // Note: cannot mutate cache here since this is called from a computed property.
+        return size
+    }
+
     private var sortedFilteredRecordings: [RecordingEntry] {
-        filteredRecordings.sorted(by: isBeforeInSortOrder)
+        let base = filteredRecordings
+        switch sortOrder {
+        case .dateDesc:
+            return base.sorted { l, r in
+                let ld = l.recordedAt ?? Date.distantPast
+                let rd = r.recordedAt ?? Date.distantPast
+                return ld > rd
+            }
+        case .dateAsc:
+            return base.sorted { l, r in
+                let ld = l.recordedAt ?? Date.distantPast
+                let rd = r.recordedAt ?? Date.distantPast
+                return ld < rd
+            }
+        case .channelAsc:
+            return base.sorted { l, r in
+                l.channelName.localizedCaseInsensitiveCompare(r.channelName) == .orderedAscending
+            }
+        case .sizeDesc:
+            return base.sorted { l, r in
+                fileSize(for: l) > fileSize(for: r)
+            }
+        }
     }
 
     private var groupedRecordings: [(channel: String, items: [RecordingEntry])] {
@@ -881,10 +1311,54 @@ struct RecordingsLibraryView: View {
         return dateFormatter.string(from: date)
     }
 
+    // MARK: - Feature 3: Disk usage
+
+    private var formattedDiskUsage: String {
+        let bytes = totalDiskUsageBytes
+        if bytes >= 1_073_741_824 {
+            return String(format: "%.1f GB", Double(bytes) / 1_073_741_824.0)
+        } else if bytes >= 1_048_576 {
+            return String(format: "%d MB", bytes / 1_048_576)
+        } else {
+            return String(format: "%d KB", bytes / 1_024)
+        }
+    }
+
+    private func refreshDiskUsage() {
+        let dir = recordingManager.recordingsDirectory()
+        Task.detached(priority: .background) {
+            var total: Int64 = 0
+            if let enumerator = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: [.fileSizeKey], options: [.skipsHiddenFiles]) {
+                for case let fileURL as URL in enumerator {
+                    if fileURL.pathExtension == "glitcho" {
+                        if let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
+                           let size = attrs[.size] as? Int64 {
+                            total += size
+                        }
+                    }
+                }
+            }
+            await MainActor.run {
+                totalDiskUsageBytes = total
+                // Also warm the file size cache for Feature 2 sorting.
+                for entry in recordings where entry.url.pathExtension == "glitcho" {
+                    if let attrs = try? FileManager.default.attributesOfItem(atPath: entry.url.path),
+                       let size = attrs[.size] as? Int64 {
+                        fileSizeCache[entry.url] = size
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: - Recordings management
+
     private func refreshRecordings() {
         let previousURL = selectedRecording?.url
         recordings = recordingManager.listRecordings()
-        selectedRecordingIDs = selectedRecordingIDs.intersection(Set(recordings.map(\.id)))
+        let liveURLs = Set(recordings.map(\.id))
+        selectedRecordingIDs = selectedRecordingIDs.intersection(liveURLs)
+        multiSelection = multiSelection.intersection(liveURLs)
 
         if let selected = selectedRecording, !recordings.contains(selected) {
             selectedRecording = recordings.first
@@ -908,8 +1382,10 @@ struct RecordingsLibraryView: View {
     private func toggleSelection(for recording: RecordingEntry) {
         if selectedRecordingIDs.contains(recording.id) {
             selectedRecordingIDs.remove(recording.id)
+            multiSelection.remove(recording.id)
         } else {
             selectedRecordingIDs.insert(recording.id)
+            multiSelection.insert(recording.id)
         }
     }
 
@@ -960,6 +1436,7 @@ struct RecordingsLibraryView: View {
         }
 
         selectedRecordingIDs.removeAll()
+        multiSelection.removeAll()
         thumbnailRefreshToken = UUID()
         refreshRecordings()
 
@@ -1009,11 +1486,13 @@ struct RecordingsLibraryView: View {
                     }
 
                     if entry.url.pathExtension == "glitcho" {
-                        try recordingManager.effectiveEncryptionManager.decryptFile(
-                            named: entry.url.lastPathComponent,
-                            in: recordingManager.recordingsDirectory(),
-                            to: destination
-                        )
+                        let mgr = recordingManager.effectiveEncryptionManager
+                        let sourceName = entry.url.lastPathComponent
+                        let sourceDir = recordingManager.recordingsDirectory()
+                        // Decrypt off the main actor so large files don't freeze the UI.
+                        try await Task.detached(priority: .userInitiated) {
+                            try mgr.decryptFile(named: sourceName, in: sourceDir, to: destination)
+                        }.value
                     } else {
                         try FileManager.default.copyItem(at: entry.url, to: destination)
                     }
@@ -1029,6 +1508,7 @@ struct RecordingsLibraryView: View {
 
             await MainActor.run {
                 isExporting = false
+                refreshDiskUsage()
                 if failures.isEmpty {
                     exportStatus = "Exported \(exported) recording(s) to \(destinationDir.path)."
                 } else {
@@ -1038,6 +1518,44 @@ struct RecordingsLibraryView: View {
                 }
             }
         }
+    }
+
+    // MARK: - Task 3: Playback position persistence
+
+    private func playbackPositionKey(for url: URL) -> String {
+        "playback.pos.\(url.path)"
+    }
+
+    /// Returns the saved position to seek to, or nil if we should start from the beginning.
+    /// Clears the saved position if it is within 10 seconds of the end (duration unknown at call time,
+    /// so we use a simple guard: if position is 0 or negative, return nil).
+    private func savedPlaybackPosition(for url: URL) -> Double? {
+        let key = playbackPositionKey(for: url)
+        let saved = UserDefaults.standard.double(forKey: key)
+        guard saved > 5 else { return nil }
+        return saved
+    }
+
+    private func savePlaybackPosition(_ seconds: Double, for url: URL) {
+        let key = playbackPositionKey(for: url)
+        UserDefaults.standard.set(seconds, forKey: key)
+    }
+
+    private func clearPlaybackPosition(for url: URL) {
+        let key = playbackPositionKey(for: url)
+        UserDefaults.standard.removeObject(forKey: key)
+    }
+
+    // MARK: - Task 4: Clip export helpers
+
+    private func resolvedFFmpegPath() -> String? {
+        if let path = UserDefaults.standard.string(forKey: "ffmpegPath"),
+           !path.isEmpty,
+           FileManager.default.isExecutableFile(atPath: path) {
+            return path
+        }
+        let candidates = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"]
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
     private func prepareSelectedRecording() {
@@ -1060,6 +1578,7 @@ struct RecordingsLibraryView: View {
 
         isPreparingPlayback = true
         isPlaying = false
+        playbackRate = 1.0
         videoZoom = 1.0
         videoPan = .zero
         motionRuntimeStatus = nil
@@ -1077,6 +1596,7 @@ struct RecordingsLibraryView: View {
                     }.value
                     let result = try await recordingManager.prepareRecordingForPlayback(at: tempURL)
                     if self.selectedRecording?.url != selected.url { return }
+                    seekOnLoadSeconds = savedPlaybackPosition(for: url)
                     playbackURL = result.url
                     isPreparingPlayback = false
                     isPlaying = true
@@ -1087,6 +1607,7 @@ struct RecordingsLibraryView: View {
                         thumbnailRefreshToken = UUID()
                         refreshRecordings()
                     }
+                    seekOnLoadSeconds = savedPlaybackPosition(for: url)
                     playbackURL = result.url
                     isPreparingPlayback = false
                     isPlaying = true
@@ -1194,7 +1715,22 @@ struct RecordingGridCard: View {
                     .frame(height: 94)
                     .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
 
-                if isMultiSelectMode {
+                if isDeleteDisabled {
+                    // LIVE badge — always visible when a recording is in progress.
+                    HStack(spacing: 4) {
+                        Circle()
+                            .fill(Color.red)
+                            .frame(width: 6, height: 6)
+                        Text("LIVE")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundStyle(.white)
+                    }
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 3)
+                    .background(Color.black.opacity(0.55))
+                    .clipShape(Capsule())
+                    .padding(6)
+                } else if isMultiSelectMode {
                     Button(action: onToggleSelection) {
                         Image(systemName: isChecked ? "checkmark.circle.fill" : "circle")
                             .font(.system(size: 14, weight: .medium))
@@ -1209,13 +1745,12 @@ struct RecordingGridCard: View {
                     Button(action: onDelete) {
                         Image(systemName: "trash")
                             .font(.system(size: 11, weight: .semibold))
-                            .foregroundStyle(isDeleteDisabled ? Color.white.opacity(0.2) : Color.red.opacity(0.85))
+                            .foregroundStyle(Color.red.opacity(0.85))
                             .padding(6)
                             .background(Color.black.opacity(0.35))
                             .clipShape(Circle())
                     }
                     .buttonStyle(.plain)
-                    .disabled(isDeleteDisabled)
                     .opacity(isHovered || isSelected ? 1 : 0)
                 }
             }
@@ -1275,10 +1810,28 @@ struct RecordingRow: View {
                 .buttonStyle(.plain)
             }
 
-            RecordingThumbnailView(url: recording.url, recordingManager: recordingManager)
-                .id("\(recording.url.path):\(thumbnailRefreshToken.uuidString)")
-                .frame(width: 120, height: 68)
-                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            ZStack(alignment: .topLeading) {
+                RecordingThumbnailView(url: recording.url, recordingManager: recordingManager)
+                    .id("\(recording.url.path):\(thumbnailRefreshToken.uuidString)")
+                    .frame(width: 120, height: 68)
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+                if isDeleteDisabled {
+                    HStack(spacing: 4) {
+                        Circle()
+                            .fill(Color.red)
+                            .frame(width: 6, height: 6)
+                        Text("LIVE")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundStyle(.white)
+                    }
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 3)
+                    .background(Color.black.opacity(0.55))
+                    .clipShape(Capsule())
+                    .padding(5)
+                }
+            }
 
             VStack(alignment: .leading, spacing: 6) {
                 Text(recording.channelName)
@@ -1381,6 +1934,13 @@ final class RecordingThumbnailLoader: ObservableObject {
     private let url: URL
     private let recordingManager: RecordingManager?
 
+    // Serial queue — ensures at most one decrypt+remux+generate runs at a time,
+    // preventing peak memory from multiplying across all simultaneously visible thumbnails.
+    private static let decryptQueue = DispatchQueue(
+        label: "com.glitcho.thumbnail-decrypt",
+        qos: .userInitiated
+    )
+
     init(url: URL, recordingManager: RecordingManager? = nil) {
         self.url = url
         self.recordingManager = recordingManager
@@ -1402,29 +1962,57 @@ final class RecordingThumbnailLoader: ObservableObject {
                     }
                 }
             } else if let rm = recordingManager {
-                // Cache miss — decrypt, remux if needed, extract frame, write to cache.
+                // Cache miss — decrypt (serialized), remux if needed, extract frame with retry.
                 let directory = url.deletingLastPathComponent()
                 Task {
                     let mgr = await MainActor.run { rm.effectiveEncryptionManager }
+
+                    // Serialize decryption so multiple thumbnails don't overwhelm RAM.
                     let tempURL = mgr.tempPlaybackURL()
-                    defer { try? FileManager.default.removeItem(at: tempURL) }
-                    guard (try? mgr.decryptFile(named: hashFilename, in: directory, to: tempURL)) != nil else {
-                        self.isLoading = false
+                    let decryptOK: Bool = await withCheckedContinuation { continuation in
+                        Self.decryptQueue.async {
+                            let ok = (try? mgr.decryptFile(named: hashFilename, in: directory, to: tempURL)) != nil
+                            continuation.resume(returning: ok)
+                        }
+                    }
+                    guard decryptOK else {
+                        try? FileManager.default.removeItem(at: tempURL)
+                        await MainActor.run { self.isLoading = false }
                         return
                     }
-                    // Remux MPEG-TS-in-MP4 containers so AVAssetImageGenerator can read them.
-                    let videoURL = (try? await rm.prepareRecordingForPlayback(at: tempURL))?.url ?? tempURL
-                    await Task.detached(priority: .userInitiated) {
-                        mgr.generateThumbnailSidecar(for: videoURL, hashFilename: hashFilename)
-                    }.value
-                    let nsImage = FileManager.default.fileExists(atPath: thumbURL.path)
-                        ? NSImage(contentsOf: thumbURL)
-                        : nil
-                    self.image = nsImage
-                    self.isLoading = false
+
+                    // Remux MPEG-TS-in-MP4 to a separate temp file so AVAssetImageGenerator can read it.
+                    let remuxTempURL: URL? = await rm.remuxForThumbnail(at: tempURL)
+                    let videoURL = remuxTempURL ?? tempURL
+
+                    // Retry thumbnail generation up to 3× — first attempt may fail on
+                    // partially-written or still-remuxing files.
+                    var nsImage: NSImage?
+                    for attempt in 1...3 {
+                        await Task.detached(priority: .userInitiated) {
+                            mgr.generateThumbnailSidecar(for: videoURL, hashFilename: hashFilename)
+                        }.value
+                        if FileManager.default.fileExists(atPath: thumbURL.path) {
+                            nsImage = NSImage(contentsOf: thumbURL)
+                            break
+                        }
+                        if attempt < 3 {
+                            try? await Task.sleep(nanoseconds: 500_000_000)
+                        }
+                    }
+
+                    // Cleanup temp files before publishing result.
+                    try? FileManager.default.removeItem(at: tempURL)
+                    if let r = remuxTempURL { try? FileManager.default.removeItem(at: r) }
+
+                    let finalImage = nsImage
+                    await MainActor.run {
+                        self.image = finalImage
+                        self.isLoading = false
+                    }
                 }
             } else {
-                // No manager available — show placeholder.
+                // No manager available — show placeholder immediately.
                 isLoading = false
             }
             return

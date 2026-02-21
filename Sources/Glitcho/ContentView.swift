@@ -110,6 +110,8 @@ struct ContentView: View {
         .onChange(of: store.followedLive) { newValue in
             refreshPinnedMetadata(using: newValue)
             scheduleFollowedLiveEvaluation(newValue)
+            let logins = newValue.map(\.id)
+            recordingManager.triggerAutoRecordsForLiveChannels(logins, quality: "best")
         }
         .onChange(of: store.followedChannelLogins) { _ in
             scheduleSyncBackgroundRecordingAgent()
@@ -171,6 +173,15 @@ struct ContentView: View {
         .onReceive(autoRecordEvaluationTimer) { _ in
             guard store.isLoggedIn, autoRecordOnLive || !pendingRecoveryIntents.isEmpty else { return }
             handleFollowedLiveChange(store.followedLive)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .channelsWentLive)) { notification in
+            guard let channels = notification.userInfo?["channels"] as? [TwitchChannel] else { return }
+            for ch in channels {
+                recordingManager.sendNotification(title: "\(ch.name) is live", body: ch.title.isEmpty ? "Now streaming" : ch.title)
+                if recordingManager.isAutoRecord(login: ch.id) {
+                    // auto-record triggering is handled by triggerAutoRecordsForLiveChannels
+                }
+            }
         }
         .confirmationDialog(
             pendingManualRecordingAction?.action.confirmationTitle ?? "Recording Action",
@@ -1232,9 +1243,11 @@ struct Sidebar: View {
     var onSetRecordingBlocked: ((String, Bool) -> Void)?
     var showRecordingsNavigation: Bool = true
     var onPinLimitReached: (() -> Void)?
+    @AppStorage("recentChannels.v1") private var recentChannelsData: Data = Data()
     @State private var isAddingPin = false
     @State private var newPinText = ""
     @State private var pinError: String?
+    @State private var showScheduleSheet = false
 
     private let sections: [TwitchDestination] = [
         .home,
@@ -1344,6 +1357,14 @@ struct Sidebar: View {
                     }
                     .buttonStyle(.plain)
                 }
+                Button {
+                    searchText = ""
+                } label: {
+                    EmptyView()
+                }
+                .buttonStyle(.plain)
+                .frame(width: 0, height: 0)
+                .keyboardShortcut("k", modifiers: .command)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
@@ -1370,6 +1391,13 @@ struct Sidebar: View {
                             systemImage: "record.circle"
                         ) {
                             onShowRecordings?()
+                        }
+
+                        SidebarRow(
+                            title: "Schedule",
+                            systemImage: "calendar.badge.clock"
+                        ) {
+                            showScheduleSheet = true
                         }
                     }
 
@@ -1466,8 +1494,10 @@ struct Sidebar: View {
                                 onOpen: {
                                     if let liveChannel {
                                         onChannelSelected?(liveChannel.login)
+                                        addToRecent(login: liveChannel.login)
                                     } else {
                                         onNavigate?(pin.url) ?? store.navigate(to: pin.url)
+                                        addToRecent(login: pin.login)
                                     }
                                 },
                                 onRemove: { onRemovePin?(pin) },
@@ -1479,7 +1509,19 @@ struct Sidebar: View {
                                 },
                                 onToggleRecordingBlocklist: {
                                     onSetRecordingBlocked?(pin.login, !isBlocked)
-                                }
+                                },
+                                onCopyURL: {
+                                    NSPasteboard.general.clearContents()
+                                    NSPasteboard.general.setString("https://twitch.tv/\(pin.login)", forType: .string)
+                                },
+                                onToggleAutoRecord: {
+                                    if recordingManager.isAutoRecord(login: pin.login) {
+                                        recordingManager.removeAutoRecord(login: pin.login)
+                                    } else {
+                                        recordingManager.addAutoRecord(login: pin.login)
+                                    }
+                                },
+                                isAutoRecord: recordingManager.isAutoRecord(login: pin.login)
                             )
                         }
                     }
@@ -1490,6 +1532,56 @@ struct Sidebar: View {
                         .frame(height: 1)
                         .padding(.vertical, 12)
                         .padding(.horizontal, 12)
+
+                    // Recent section
+                    if !recentChannels.isEmpty {
+                        Text("RECENT")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundStyle(.white.opacity(0.25))
+                            .tracking(1)
+                            .padding(.horizontal, 12)
+                            .padding(.top, 8)
+                            .padding(.bottom, 4)
+
+                        let liveLoginSet = Set(store.followedLive.map(\.login))
+                        ForEach(recentChannels, id: \.self) { login in
+                            OfflineFollowingRow(
+                                login: login,
+                                avatarURL: store.offlineChannelAvatarURLs[login]
+                            ) {
+                                onChannelSelected?(login)
+                                addToRecent(login: login)
+                            }
+                            .contextMenu {
+                                Button("Copy Stream URL") {
+                                    NSPasteboard.general.clearContents()
+                                    NSPasteboard.general.setString("https://twitch.tv/\(login)", forType: .string)
+                                }
+                                Button(recordingManager.isAutoRecord(login: login) ? "Remove Auto-Record" : "Auto-Record This Channel") {
+                                    if recordingManager.isAutoRecord(login: login) {
+                                        recordingManager.removeAutoRecord(login: login)
+                                    } else {
+                                        recordingManager.addAutoRecord(login: login)
+                                    }
+                                }
+                            }
+                            .overlay(alignment: .trailing) {
+                                if liveLoginSet.contains(login) {
+                                    Circle()
+                                        .fill(Color.red)
+                                        .frame(width: 6, height: 6)
+                                        .padding(.trailing, 12)
+                                }
+                            }
+                        }
+
+                        // Divider before Following
+                        Rectangle()
+                            .fill(Color.white.opacity(0.08))
+                            .frame(height: 1)
+                            .padding(.vertical, 12)
+                            .padding(.horizontal, 12)
+                    }
 
                     // Following section
                     Text("FOLLOWING")
@@ -1523,12 +1615,26 @@ struct Sidebar: View {
                             let isBlocked = recordingBlocklist.contains(channel.login)
                             FollowingRow(
                                 channel: channel,
-                                isRecording: recordingManager.isRecordingAny(channelLogin: channel.login)
+                                isRecording: recordingManager.isRecordingAny(channelLogin: channel.login),
+                                recordingStartTime: recordingManager.recordingStartTime(channelLogin: channel.login)
                             ) {
                                 let channelName = channel.url.lastPathComponent
                                 onChannelSelected?(channelName)
+                                addToRecent(login: channel.login)
                             }
                             .contextMenu {
+                                Button("Copy Stream URL") {
+                                    NSPasteboard.general.clearContents()
+                                    NSPasteboard.general.setString(channel.url.absoluteString, forType: .string)
+                                }
+                                Button(recordingManager.isAutoRecord(login: channel.id) ? "Remove Auto-Record" : "Auto-Record This Channel") {
+                                    if recordingManager.isAutoRecord(login: channel.id) {
+                                        recordingManager.removeAutoRecord(login: channel.id)
+                                    } else {
+                                        recordingManager.addAutoRecord(login: channel.id)
+                                    }
+                                }
+                                Divider()
                                 Button(pinnedLogins.contains(channel.login) ? "Unpin from Favorites" : "Pin to Favorites") {
                                     if !pinnedLogins.contains(channel.login) && pinnedChannels.count >= pinnedLimit {
                                         onPinLimitReached?()
@@ -1546,9 +1652,36 @@ struct Sidebar: View {
                             }
                         }
 
+                        if !nonPinnedLive.isEmpty && !offlineLogins.isEmpty {
+                            Text("OFFLINE")
+                                .font(.system(size: 10, weight: .bold))
+                                .foregroundStyle(.white.opacity(0.25))
+                                .tracking(1)
+                                .padding(.horizontal, 12)
+                                .padding(.top, 8)
+                                .padding(.bottom, 4)
+                        }
+
                         ForEach(offlineLogins, id: \.self) { login in
-                            OfflineFollowingRow(login: login) {
+                            OfflineFollowingRow(
+                                login: login,
+                                avatarURL: store.offlineChannelAvatarURLs[login]
+                            ) {
                                 onChannelSelected?(login)
+                                addToRecent(login: login)
+                            }
+                            .contextMenu {
+                                Button("Copy Stream URL") {
+                                    NSPasteboard.general.clearContents()
+                                    NSPasteboard.general.setString("https://twitch.tv/\(login)", forType: .string)
+                                }
+                                Button(recordingManager.isAutoRecord(login: login) ? "Remove Auto-Record" : "Auto-Record This Channel") {
+                                    if recordingManager.isAutoRecord(login: login) {
+                                        recordingManager.removeAutoRecord(login: login)
+                                    } else {
+                                        recordingManager.addAutoRecord(login: login)
+                                    }
+                                }
                             }
                         }
                     }
@@ -1565,6 +1698,21 @@ struct Sidebar: View {
                 sidebarTint.opacity(0.25)
             }
         )
+        .sheet(isPresented: $showScheduleSheet) {
+            ScheduleSheetView(recordingManager: recordingManager)
+        }
+    }
+
+    private var recentChannels: [String] {
+        (try? JSONDecoder().decode([String].self, from: recentChannelsData)) ?? []
+    }
+
+    private func addToRecent(login: String) {
+        var recent = recentChannels
+        recent.removeAll { $0 == login }
+        recent.insert(login, at: 0)
+        if recent.count > 8 { recent = Array(recent.prefix(8)) }
+        recentChannelsData = (try? JSONEncoder().encode(recent)) ?? Data()
     }
 
     private func normalized(_ value: String?) -> String? {
@@ -1735,8 +1883,40 @@ struct SidebarRow: View {
 struct FollowingRow: View {
     let channel: TwitchChannel
     let isRecording: Bool
+    let recordingStartTime: Date?
     let action: () -> Void
     @State private var isHovered = false
+
+    private func formattedViewerCount(_ count: Int) -> String {
+        if count >= 1_000_000 {
+            let m = Double(count) / 1_000_000.0
+            return String(format: "%.1fM", m)
+        } else if count >= 1_000 {
+            let k = Double(count) / 1_000.0
+            return String(format: "%.1fK", k)
+        } else {
+            return "\(count)"
+        }
+    }
+
+    private func formattedUptime(from startedAt: Date, to now: Date) -> String {
+        let elapsed = max(0, Int(now.timeIntervalSince(startedAt)))
+        let hours = elapsed / 3600
+        let minutes = (elapsed % 3600) / 60
+        return hours > 0 ? "\(hours)h \(minutes)m" : "\(minutes)m"
+    }
+
+    private func formattedDuration(from startTime: Date, to now: Date) -> String {
+        let elapsed = max(0, Int(now.timeIntervalSince(startTime)))
+        let hours = elapsed / 3600
+        let minutes = (elapsed % 3600) / 60
+        let seconds = elapsed % 60
+        if hours > 0 {
+            return String(format: "%02d:%02d:%02d", hours, minutes, seconds)
+        } else {
+            return String(format: "%02d:%02d", minutes, seconds)
+        }
+    }
 
     var body: some View {
         Button(action: action) {
@@ -1759,24 +1939,47 @@ struct FollowingRow: View {
                 .frame(width: 28, height: 28)
                 .clipShape(Circle())
 
-                Text(channel.name)
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundColor(isHovered ? .white : .white.opacity(0.7))
-                    .lineLimit(1)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(channel.name)
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundColor(isHovered ? .white : .white.opacity(0.7))
+                        .lineLimit(1)
+
+                    if isRecording, let startTime = recordingStartTime {
+                        TimelineView(.periodic(from: .now, by: 1.0)) { context in
+                            HStack(spacing: 3) {
+                                Circle()
+                                    .fill(Color.red)
+                                    .frame(width: 6, height: 6)
+                                Text("REC \(formattedDuration(from: startTime, to: context.date))")
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .foregroundStyle(Color.red)
+                            }
+                        }
+                    } else {
+                        if channel.viewerCount > 0 {
+                            Text("\(formattedViewerCount(channel.viewerCount)) viewers")
+                                .font(.system(size: 11))
+                                .foregroundStyle(.white.opacity(0.45))
+                                .lineLimit(1)
+                        }
+                        if let startedAt = channel.startedAt {
+                            TimelineView(.periodic(from: .now, by: 60)) { ctx in
+                                Text(formattedUptime(from: startedAt, to: ctx.date))
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(.white.opacity(0.30))
+                            }
+                        }
+                        if !channel.gameName.isEmpty {
+                            Text(channel.gameName)
+                                .font(.system(size: 10))
+                                .foregroundStyle(.white.opacity(0.30))
+                                .lineLimit(1)
+                        }
+                    }
+                }
 
                 Spacer()
-
-                if isRecording {
-                    Text("REC")
-                        .font(.system(size: 9, weight: .bold))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(
-                            Capsule()
-                                .fill(Color.red.opacity(0.85))
-                        )
-                }
 
                 Circle()
                     .fill(Color.red)
@@ -1791,6 +1994,7 @@ struct FollowingRow: View {
         }
         .buttonStyle(.plain)
         .contentShape(Rectangle())
+        .help(channel.title)
         .onHover { hovering in
             withAnimation(.easeOut(duration: 0.12)) {
                 isHovered = hovering
@@ -1801,20 +2005,30 @@ struct FollowingRow: View {
 
 struct OfflineFollowingRow: View {
     let login: String
+    let avatarURL: URL?
     let action: () -> Void
     @State private var isHovered = false
 
     var body: some View {
         Button(action: action) {
             HStack(spacing: 10) {
-                Circle()
-                    .fill(Color.white.opacity(0.08))
-                    .frame(width: 28, height: 28)
-                    .overlay(
-                        Text(String(login.prefix(1)).uppercased())
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(.white.opacity(0.35))
-                    )
+                // Avatar: real image if available, otherwise letter placeholder
+                Group {
+                    if let avatarURL {
+                        AsyncImage(url: avatarURL) { phase in
+                            switch phase {
+                            case .success(let img):
+                                img.resizable().scaledToFill()
+                            default:
+                                letterAvatar
+                            }
+                        }
+                    } else {
+                        letterAvatar
+                    }
+                }
+                .frame(width: 28, height: 28)
+                .clipShape(Circle())
 
                 Text(login)
                     .font(.system(size: 13, weight: .medium))
@@ -1838,6 +2052,16 @@ struct OfflineFollowingRow: View {
             }
         }
     }
+
+    private var letterAvatar: some View {
+        Circle()
+            .fill(Color.white.opacity(0.08))
+            .overlay(
+                Text(String(login.prefix(1)).uppercased())
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.35))
+            )
+    }
 }
 
 struct PinnedRow: View {
@@ -1851,6 +2075,9 @@ struct PinnedRow: View {
     let isRecordingBlocked: Bool
     var onToggleRecordingAllowlist: (() -> Void)?
     var onToggleRecordingBlocklist: (() -> Void)?
+    var onCopyURL: (() -> Void)?
+    var onToggleAutoRecord: (() -> Void)?
+    var isAutoRecord: Bool = false
     @State private var isHovered = false
 
     private var displayName: String {
@@ -1938,6 +2165,15 @@ struct PinnedRow: View {
             }
         }
         .contextMenu {
+            if let onCopyURL {
+                Button("Copy Stream URL", action: onCopyURL)
+            }
+            if let onToggleAutoRecord {
+                Button(isAutoRecord ? "Remove Auto-Record" : "Auto-Record This Channel", action: onToggleAutoRecord)
+            }
+            if onCopyURL != nil || onToggleAutoRecord != nil {
+                Divider()
+            }
             Button(channel.notifyEnabled ? "Disable notifications" : "Enable notifications", action: onToggleNotifications)
             if let onToggleRecordingAllowlist {
                 Button(
@@ -2232,6 +2468,174 @@ struct LoadingOverlay: View {
             }
             dotOffset = 2
         }
+    }
+}
+
+struct ScheduleSheetView: View {
+    @ObservedObject var recordingManager: RecordingManager
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var channelInput = ""
+    @State private var startDate = Date().addingTimeInterval(300)
+    @State private var quality = "best"
+
+    private let qualityOptions = ["best", "720p60", "720p", "480p", "360p", "160p", "worst"]
+
+    var body: some View {
+        VStack(spacing: 0) {
+            sheetHeader
+            Divider().background(Color.white.opacity(0.1))
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    addForm
+                    scheduleList
+                }
+                .padding(20)
+            }
+        }
+        .frame(width: 420, height: 540)
+        .background(Color(red: 0.08, green: 0.08, blue: 0.10))
+    }
+
+    @ViewBuilder
+    private var sheetHeader: some View {
+        HStack {
+            Text("Scheduled Recordings")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(.white)
+            Spacer()
+            Button(action: { dismiss() }) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 16))
+                    .foregroundStyle(.white.opacity(0.4))
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 20)
+        .padding(.top, 20)
+        .padding(.bottom, 16)
+    }
+
+    @ViewBuilder
+    private var addForm: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("New Scheduled Recording")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.5))
+                .tracking(0.5)
+            TextField("Channel login (e.g. monstercat)", text: $channelInput)
+                .textFieldStyle(.plain)
+                .font(.system(size: 13))
+                .foregroundStyle(.white)
+                .padding(10)
+                .background(Color.white.opacity(0.07))
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            DatePicker(
+                "Start time",
+                selection: $startDate,
+                in: Date()...,
+                displayedComponents: [.date, .hourAndMinute]
+            )
+            .datePickerStyle(.compact)
+            .font(.system(size: 13))
+            .foregroundStyle(.white)
+            .colorScheme(.dark)
+            Picker("Quality", selection: $quality) {
+                ForEach(qualityOptions, id: \.self) { opt in
+                    Text(opt).tag(opt)
+                }
+            }
+            .pickerStyle(.menu)
+            .font(.system(size: 13))
+            scheduleButton
+        }
+        .padding(16)
+        .background(Color.white.opacity(0.04))
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    @ViewBuilder
+    private var scheduleButton: some View {
+        Button(action: scheduleRecording) {
+            HStack(spacing: 6) {
+                Image(systemName: "calendar.badge.plus")
+                Text("Schedule Recording")
+                    .font(.system(size: 13, weight: .semibold))
+            }
+            .foregroundStyle(.white)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 9)
+            .frame(maxWidth: .infinity)
+            .background(Color.purple.opacity(0.75))
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .disabled(channelInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+    }
+
+    @ViewBuilder
+    private var scheduleList: some View {
+        if recordingManager.scheduledRecordings.isEmpty {
+            Text("No scheduled recordings")
+                .font(.system(size: 12))
+                .foregroundStyle(.white.opacity(0.35))
+                .frame(maxWidth: .infinity)
+                .padding(.top, 8)
+        } else {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Upcoming")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.5))
+                    .tracking(0.5)
+                ForEach(recordingManager.scheduledRecordings) { schedule in
+                    scheduleRow(schedule)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func scheduleRow(_ schedule: RecordingManager.ScheduledRecording) -> some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(schedule.channelLogin)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.white)
+                Text(schedule.startDate.formatted(date: .abbreviated, time: .shortened))
+                    .font(.system(size: 11))
+                    .foregroundStyle(.white.opacity(0.5))
+                Text("Quality: \(schedule.quality)")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.white.opacity(0.4))
+            }
+            Spacer()
+            if schedule.hasStarted {
+                Text("Started")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.green.opacity(0.8))
+            }
+            Button {
+                recordingManager.removeScheduledRecording(id: schedule.id)
+            } label: {
+                Image(systemName: "trash")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.white.opacity(0.35))
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(Color.white.opacity(0.04))
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private func scheduleRecording() {
+        let login = channelInput.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !login.isEmpty else { return }
+        recordingManager.addScheduledRecording(channelLogin: login, startDate: startDate, quality: quality)
+        channelInput = ""
+        startDate = Date().addingTimeInterval(300)
+        quality = "best"
     }
 }
 

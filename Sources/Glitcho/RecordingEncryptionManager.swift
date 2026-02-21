@@ -16,6 +16,10 @@ final class RecordingEncryptionManager {
     private static let keychainService = "com.glitcho.recording-encryption"
     private static let keychainAccount = "master-key"
 
+    /// Serializes all manifest reads and writes to prevent a read-modify-write race
+    /// when two recordings finish concurrently.
+    private let manifestQueue = DispatchQueue(label: "com.glitcho.manifest", qos: .utility)
+
     /// Override for unit tests to avoid real Keychain access.
     var _keyOverride: SymmetricKey?
 
@@ -121,6 +125,29 @@ final class RecordingEncryptionManager {
         return try decoder.decode([String: RecordingManifestEntry].self, from: json)
     }
 
+    // MARK: - Serialized Manifest Access
+
+    /// Thread-safe wrapper around `loadManifest` that serializes access through `manifestQueue`.
+    func loadManifestSerialized(from directory: URL) throws -> [String: RecordingManifestEntry] {
+        try manifestQueue.sync { try loadManifest(from: directory) }
+    }
+
+    /// Thread-safe wrapper around `saveManifest` that serializes access through `manifestQueue`.
+    func saveManifestSerialized(_ manifest: [String: RecordingManifestEntry], to directory: URL) throws {
+        try manifestQueue.sync { try saveManifest(manifest, to: directory) }
+    }
+
+    /// Atomically adds or updates a single manifest entry without a full read-modify-write race.
+    /// All manifest I/O is serialized through `manifestQueue`, so concurrent callers cannot
+    /// overwrite each other's entries.
+    func upsertManifestEntry(_ entry: RecordingManifestEntry, hashFilename: String, in directory: URL) throws {
+        try manifestQueue.sync {
+            var manifest = (try? loadManifest(from: directory)) ?? [:]
+            manifest[hashFilename] = entry
+            try saveManifest(manifest, to: directory)
+        }
+    }
+
     // MARK: - Thumbnail Cache
 
     static var thumbnailCacheDirectory: URL {
@@ -176,6 +203,11 @@ final class RecordingEncryptionManager {
         let entry: RecordingManifestEntry
     }
 
+    // Magic prefix written at the start of every chunked .glitcho file.
+    // Absence of this prefix means the file uses the legacy single-block format.
+    private static let chunkMagic = Data("GLITCHO1".utf8)
+    private static let chunkSize  = 8 * 1024 * 1024  // 8 MB per chunk
+
     func encryptFile(
         at sourceURL: URL,
         in directory: URL,
@@ -189,11 +221,44 @@ final class RecordingEncryptionManager {
         let hashFilename = generateHashFilename(originalFilename: originalFilename)
         generateThumbnailSidecar(for: sourceURL, hashFilename: hashFilename)
 
-        let plaintext = try Data(contentsOf: sourceURL)
-        let encrypted = try encrypt(data: plaintext)
-
         let destinationURL = directory.appendingPathComponent(hashFilename)
-        try encrypted.write(to: destinationURL, options: .atomic)
+
+        // Chunked streaming encryption: read/encrypt/write one chunk at a time so
+        // peak RAM usage is O(chunkSize) rather than O(fileSize).
+        guard let srcHandle = FileHandle(forReadingAtPath: sourceURL.path) else {
+            throw EncryptionError.fileNotFound(sourceURL.lastPathComponent)
+        }
+        defer { srcHandle.closeFile() }
+
+        FileManager.default.createFile(atPath: destinationURL.path, contents: nil)
+        guard let dstHandle = FileHandle(forWritingAtPath: destinationURL.path) else {
+            throw EncryptionError.sealFailed
+        }
+        defer { dstHandle.closeFile() }
+
+        // Header: magic(8) + chunkSize(4) + chunkCount(4, back-patched later).
+        var cs = UInt32(Self.chunkSize).bigEndian
+        var placeholder = UInt32(0).bigEndian
+        dstHandle.write(Self.chunkMagic)
+        dstHandle.write(Data(bytes: &cs, count: 4))
+        let chunkCountOffset = dstHandle.offsetInFile
+        dstHandle.write(Data(bytes: &placeholder, count: 4))
+
+        var chunkCount = UInt32(0)
+        while true {
+            let chunk = srcHandle.readData(ofLength: Self.chunkSize)
+            guard !chunk.isEmpty else { break }
+            let sealed = try encrypt(data: chunk)
+            var sealedLen = UInt32(sealed.count).bigEndian
+            dstHandle.write(Data(bytes: &sealedLen, count: 4))
+            dstHandle.write(sealed)
+            chunkCount += 1
+        }
+
+        // Back-patch chunk count into header.
+        dstHandle.seek(toFileOffset: chunkCountOffset)
+        var finalCount = chunkCount.bigEndian
+        dstHandle.write(Data(bytes: &finalCount, count: 4))
 
         // Delete the plaintext original.
         try FileManager.default.removeItem(at: sourceURL)
@@ -216,9 +281,43 @@ final class RecordingEncryptionManager {
         guard FileManager.default.fileExists(atPath: sourceURL.path) else {
             throw EncryptionError.fileNotFound(hashFilename)
         }
-        let encrypted = try Data(contentsOf: sourceURL)
-        let plaintext = try decrypt(data: encrypted)
-        try plaintext.write(to: destinationURL, options: .atomic)
+
+        guard let srcHandle = FileHandle(forReadingAtPath: sourceURL.path) else {
+            throw EncryptionError.fileNotFound(hashFilename)
+        }
+        defer { srcHandle.closeFile() }
+
+        let header = srcHandle.readData(ofLength: 8)
+        if header == Self.chunkMagic {
+            // Chunked format: read header, decrypt each chunk, stream to destination.
+            let chunkSizeData  = srcHandle.readData(ofLength: 4)
+            let chunkCountData = srcHandle.readData(ofLength: 4)
+            guard chunkSizeData.count == 4, chunkCountData.count == 4 else {
+                throw EncryptionError.manifestCorrupted
+            }
+            let chunkCount = chunkCountData.withUnsafeBytes { $0.load(as: UInt32.self).byteSwapped }
+
+            FileManager.default.createFile(atPath: destinationURL.path, contents: nil)
+            guard let dstHandle = FileHandle(forWritingAtPath: destinationURL.path) else {
+                throw EncryptionError.sealFailed
+            }
+            defer { dstHandle.closeFile() }
+
+            for _ in 0..<chunkCount {
+                let sealedLenData = srcHandle.readData(ofLength: 4)
+                guard sealedLenData.count == 4 else { throw EncryptionError.manifestCorrupted }
+                let sealedLen = sealedLenData.withUnsafeBytes { $0.load(as: UInt32.self).byteSwapped }
+                let sealedData = srcHandle.readData(ofLength: Int(sealedLen))
+                let plaintext = try decrypt(data: sealedData)
+                dstHandle.write(plaintext)
+            }
+        } else {
+            // Legacy single-block format: whole file is one AES-GCM sealed blob.
+            srcHandle.seek(toFileOffset: 0)
+            let encrypted = srcHandle.readDataToEndOfFile()
+            let plaintext = try decrypt(data: encrypted)
+            try plaintext.write(to: destinationURL, options: .atomic)
+        }
     }
 
     // MARK: - Migration Logic (Task 6)
@@ -247,7 +346,6 @@ final class RecordingEncryptionManager {
             return MigrationResult(migratedCount: 0, skippedCount: 0)
         }
 
-        var manifest = (try? loadManifest(from: directory)) ?? [:]
         var migrated = 0
         var skipped = 0
 
@@ -261,11 +359,10 @@ final class RecordingEncryptionManager {
             if mp4URL.lastPathComponent.contains(".remux-") { continue }
 
             let result = try encryptFile(at: mp4URL, in: directory)
-            manifest[result.hashFilename] = result.entry
-            migrated += 1
-
             // Save manifest after each file to avoid data loss if interrupted.
-            try saveManifest(manifest, to: directory)
+            // Use upsertManifestEntry so concurrent access from other contexts is safe.
+            try upsertManifestEntry(result.entry, hashFilename: result.hashFilename, in: directory)
+            migrated += 1
         }
 
         return MigrationResult(migratedCount: migrated, skippedCount: skipped)
@@ -290,6 +387,24 @@ final class RecordingEncryptionManager {
 
         for file in files where file.lastPathComponent.hasSuffix(Self.tempPlaybackSuffix) {
             try? FileManager.default.removeItem(at: file)
+        }
+    }
+
+    /// Removes `.thumb` sidecar files whose corresponding `.glitcho` recording no longer
+    /// exists in the manifest. This handles deletions that bypassed `deleteRecording(at:)`
+    /// (e.g. via Finder or a pre-fix retention policy) and keeps the thumbnail cache lean.
+    /// Safe to call at launch — the thumbnails directory is typically small.
+    func cleanupOrphanedThumbnails(knownHashFilenames: Set<String>) {
+        let dir = Self.thumbnailCacheDirectory
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: dir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]
+        ) else { return }
+        for file in files where file.pathExtension == "thumb" {
+            // The thumb filename is "<hashFilename>.thumb", so the base name is the hash.
+            let hashFilename = file.deletingPathExtension().lastPathComponent
+            if !knownHashFilenames.contains(hashFilename) {
+                try? FileManager.default.removeItem(at: file)
+            }
         }
     }
 

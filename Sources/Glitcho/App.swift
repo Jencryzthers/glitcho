@@ -1,5 +1,6 @@
 #if canImport(SwiftUI)
 import SwiftUI
+import UserNotifications
 
 @main
 struct TwitchGlassApp: App {
@@ -12,6 +13,9 @@ struct TwitchGlassApp: App {
                 .background(WindowConfigurator())
                 .environmentObject(updateChecker)
                 .environment(\.notificationManager, notificationManager)
+                .onAppear {
+                    UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+                }
         }
         .windowStyle(.hiddenTitleBar)
         .windowToolbarStyle(.unifiedCompact)
