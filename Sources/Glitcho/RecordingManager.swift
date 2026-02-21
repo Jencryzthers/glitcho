@@ -672,7 +672,18 @@ final class RecordingManager: ObservableObject {
     /// Called when the set of live channel logins changes. Starts recording for any
     /// allowlisted channels that are live but not already recording and not in the
     /// recording blocklist.
+    ///
+    /// This is System B's per-channel allowlist trigger. It only activates when System A's
+    /// global auto-record toggle (autoRecordOnLive) is OFF. When System A is enabled it
+    /// handles scheduling with its own debounce/cooldown logic, so System B steps aside to
+    /// avoid competing for the same channels simultaneously.
     func triggerAutoRecordsForLiveChannels(_ liveLogins: [String], quality: String = "best") {
+        // Only trigger if System A's global auto-record is OFF.
+        // If autoRecordOnLive is enabled, System A handles scheduling with debounce/cooldown.
+        // System B's per-channel allowlist only activates when System A is disabled.
+        let systemAEnabled = UserDefaults.standard.bool(forKey: "autoRecordOnLive")
+        guard !systemAEnabled else { return }
+
         let blocklist = loadAutoRecordBlockedLogins()
         for login in liveLogins {
             guard let normalized = normalizedChannelLogin(login) else { continue }
@@ -682,7 +693,7 @@ final class RecordingManager: ObservableObject {
             let target = "twitch.tv/\(normalized)"
             let started = startRecording(target: target, channelName: nil, quality: quality)
             if started {
-                sendNotification(title: "Auto-recording started: \(normalized)", body: "")
+                sendNotification(title: "Auto-recording", body: "\(normalized) is now recording")
             }
         }
     }

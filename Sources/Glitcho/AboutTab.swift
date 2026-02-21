@@ -1099,7 +1099,6 @@ final class AboutTabStore: NSObject, ObservableObject, WKNavigationDelegate, WKS
 
     private func makeWebView() -> WKWebView {
         let config = WKWebViewConfiguration()
-        config.processPool = sharedScraperProcessPool
         let contentController = WKUserContentController()
         config.userContentController = contentController
         config.websiteDataStore = .default()

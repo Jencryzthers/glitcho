@@ -600,6 +600,7 @@ struct ContentView: View {
 
         var request = URLRequest(url: URL(string: "https://gql.twitch.tv/gql")!)
         request.httpMethod = "POST"
+        request.httpBody = jsonData
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("kimne78kx3ncx6brgo4mv6wki5h1ko", forHTTPHeaderField: "Client-ID")
 
@@ -2479,7 +2480,7 @@ struct ScheduleSheetView: View {
     @State private var startDate = Date().addingTimeInterval(300)
     @State private var quality = "best"
 
-    private let qualityOptions = ["best", "720p60", "720p", "480p", "360p", "160p", "worst"]
+    private let qualityOptions = ["best", "1080p60", "720p60", "480p"]
 
     var body: some View {
         VStack(spacing: 0) {
@@ -2583,10 +2584,10 @@ struct ScheduleSheetView: View {
                 .padding(.top, 8)
         } else {
             VStack(alignment: .leading, spacing: 8) {
-                Text("Upcoming")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.5))
-                    .tracking(0.5)
+                Text("SCHEDULED")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(.white.opacity(0.35))
+                    .tracking(1)
                 ForEach(recordingManager.scheduledRecordings) { schedule in
                     scheduleRow(schedule)
                 }
@@ -2597,31 +2598,42 @@ struct ScheduleSheetView: View {
     @ViewBuilder
     private func scheduleRow(_ schedule: RecordingManager.ScheduledRecording) -> some View {
         HStack(spacing: 12) {
-            VStack(alignment: .leading, spacing: 3) {
+            VStack(alignment: .leading, spacing: 4) {
                 Text(schedule.channelLogin)
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(.white)
                 Text(schedule.startDate.formatted(date: .abbreviated, time: .shortened))
                     .font(.system(size: 11))
                     .foregroundStyle(.white.opacity(0.5))
-                Text("Quality: \(schedule.quality)")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.white.opacity(0.4))
             }
             Spacer()
-            if schedule.hasStarted {
-                Text("Started")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.green.opacity(0.8))
+            HStack(spacing: 6) {
+                Text(schedule.quality)
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.7))
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3)
+                    .background(Color.white.opacity(0.1))
+                    .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+                if schedule.hasStarted {
+                    Text("Started")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.green.opacity(0.85))
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(Color.green.opacity(0.12))
+                        .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+                }
+                Button {
+                    recordingManager.removeScheduledRecording(id: schedule.id)
+                } label: {
+                    Image(systemName: "trash")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.white.opacity(0.35))
+                }
+                .buttonStyle(.plain)
+                .help("Remove scheduled recording")
             }
-            Button {
-                recordingManager.removeScheduledRecording(id: schedule.id)
-            } label: {
-                Image(systemName: "trash")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.white.opacity(0.35))
-            }
-            .buttonStyle(.plain)
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)

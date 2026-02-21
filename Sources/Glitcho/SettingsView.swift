@@ -49,6 +49,7 @@ struct SettingsDetailView: View {
     @AppStorage("video.imageOptimize.lighting") private var imageOptimizeLighting = ImageOptimizationConfiguration.productionDefault.lighting
     @AppStorage("video.imageOptimize.denoiser") private var imageOptimizeDenoiser = ImageOptimizationConfiguration.productionDefault.denoiser
     @AppStorage("video.imageOptimize.neuralClarity") private var imageOptimizeNeuralClarity = ImageOptimizationConfiguration.productionDefault.neuralClarity
+    @AppStorage("recentChannels.v1") private var recentChannelsData: Data = Data()
     @Environment(\.notificationManager) private var notificationManager
     @Environment(\.openURL) private var openURL
     @State private var testStatus: NotificationTestStatus?
@@ -67,6 +68,7 @@ struct SettingsDetailView: View {
     @State private var blockedChannelInput = ""
     @State private var selectedChannelInputError: String?
     @State private var blockedChannelInputError: String?
+    @State private var autoRecordAllowlistInput = ""
     @State private var hasLoadedSelectedChannels = false
     @State private var showChannelSelector = false
     @State private var showBlocklistSelector = false
@@ -949,8 +951,28 @@ struct SettingsDetailView: View {
                             }
 
                             Divider()
+                                .padding(.vertical, 4)
+
+                            HStack {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Recently Watched")
+                                        .font(.system(size: 13, weight: .medium))
+                                        .foregroundStyle(.white)
+                                    Text("Channels you've visited recently appear in the sidebar")
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Button("Clear History") {
+                                    recentChannelsData = Data()
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                            }
+
+                            Divider()
                                 .padding(.vertical, 8)
-                            
+
                             VStack(alignment: .leading, spacing: 2) {
                                 Text("Background Recorder")
                                     .font(.system(size: 12, weight: .medium))
@@ -1010,6 +1032,78 @@ struct SettingsDetailView: View {
                                     .font(.system(size: 10, weight: .medium))
                                     .foregroundStyle(.white.opacity(0.5))
                             }
+                            }
+                        }
+
+                        CollapsibleSettingsCard(
+                            id: "per-channel-auto-record",
+                            icon: "checkmark.circle.fill",
+                            iconColor: .white,
+                            iconBackgroundColor: sidebarTintBinding.wrappedValue,
+                            title: "Per-Channel Auto-Record",
+                            subtitle: "Always record specific channels when live",
+                            isExpanded: expandedSections.contains("per-channel-auto-record"),
+                            onToggle: { toggleSection("per-channel-auto-record") }
+                        ) {
+                            VStack(alignment: .leading, spacing: 10) {
+                                Text("These channels are always recorded when live, regardless of the global auto-record mode")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.white.opacity(0.5))
+
+                                HStack(spacing: 8) {
+                                    TextField("Add channel login", text: $autoRecordAllowlistInput)
+                                        .textFieldStyle(.plain)
+                                        .font(.system(size: 11, weight: .medium))
+                                        .foregroundStyle(.white)
+                                        .padding(.horizontal, 8)
+                                        .padding(.vertical, 6)
+                                        .background(Color.white.opacity(0.08))
+                                        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                                        .onSubmit {
+                                            let trimmed = autoRecordAllowlistInput.trimmingCharacters(in: .whitespacesAndNewlines)
+                                            guard !trimmed.isEmpty else { return }
+                                            recordingManager.addAutoRecord(login: trimmed)
+                                            autoRecordAllowlistInput = ""
+                                        }
+                                    Button("Add") {
+                                        let trimmed = autoRecordAllowlistInput.trimmingCharacters(in: .whitespacesAndNewlines)
+                                        guard !trimmed.isEmpty else { return }
+                                        recordingManager.addAutoRecord(login: trimmed)
+                                        autoRecordAllowlistInput = ""
+                                    }
+                                    .font(.system(size: 10, weight: .semibold))
+                                    .buttonStyle(.plain)
+                                    .foregroundStyle(.white.opacity(0.8))
+                                }
+
+                                if recordingManager.autoRecordLogins.isEmpty {
+                                    Text("No channels configured")
+                                        .font(.system(size: 10))
+                                        .foregroundStyle(.white.opacity(0.6))
+                                } else {
+                                    VStack(spacing: 4) {
+                                        ForEach(recordingManager.autoRecordLogins.sorted(), id: \.self) { login in
+                                            HStack {
+                                                Text(login)
+                                                    .font(.system(size: 11, weight: .medium))
+                                                    .foregroundStyle(.white.opacity(0.85))
+                                                Spacer()
+                                                Button {
+                                                    recordingManager.removeAutoRecord(login: login)
+                                                } label: {
+                                                    Image(systemName: "xmark.circle.fill")
+                                                        .font(.system(size: 11))
+                                                        .foregroundStyle(.white.opacity(0.45))
+                                                }
+                                                .buttonStyle(.plain)
+                                            }
+                                            .padding(.horizontal, 8)
+                                            .padding(.vertical, 4)
+                                            .background(Color.white.opacity(0.03))
+                                            .clipShape(RoundedRectangle(cornerRadius: 4))
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
