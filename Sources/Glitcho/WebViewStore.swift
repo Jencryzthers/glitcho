@@ -1986,11 +1986,22 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
             'adnxs.com','rubiconproject.com','indexww.com','casalemedia.com',
             'adsafeprotected.com','moatads.com','krxd.net'
           ]);
-          const _adPatternRe = new RegExp('/ads?/|/advert|/banner|/sponsor|/tracking|/analytics|/pixel|/beacon|utm_source=|utm_medium=|_ads?\\.|ads?_', 'i');
+          const _adPatternRe = new RegExp('/ads?/|/advert|/sponsor|/pixel|/beacon|utm_source=|utm_medium=', 'i');
+
+          const allowedDomains = new Set([
+            'static.twitchcdn.net','assets.twitch.tv','static-cdn.jtvnw.net',
+            'gql.twitch.tv','twitch.tv','www.twitch.tv','m.twitch.tv',
+            'vod-secure.twitch.tv','clips-media-assets2.twitch.tv',
+            'usher.ttvnw.net','video-weaver'
+          ]);
 
           function shouldBlockRequest(url) {
             if (!url || typeof url !== 'string') return false;
             const lowerUrl = url.toLowerCase();
+            // Never block Twitch's own CDN / first-party module URLs
+            for (const domain of allowedDomains) {
+              if (lowerUrl.includes(domain) && !lowerUrl.includes('/ads/') && !lowerUrl.includes('/ads?')) { return false; }
+            }
             for (const domain of blockedDomains) {
               if (lowerUrl.includes(domain)) { return true; }
             }
@@ -2043,8 +2054,13 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
 
           // Override fetch for playlist requests + ad blocking
           window.fetch = async function(resource, init) {
-            const url = typeof resource === 'string' ? resource : resource.url;
-            
+            const url = typeof resource === 'string' ? resource : (resource && resource.url);
+
+            // Never interfere with JavaScript module/chunk loading
+            if (url && (url.endsWith('.js') || url.endsWith('.mjs') || url.includes('/chunk'))) {
+              return originalFetch.apply(this, arguments);
+            }
+
             // Block ad/tracking requests
             if (shouldBlockRequest(url)) {
               return Promise.reject(new Error('Blocked by Enhanced Adblock'));
@@ -2077,7 +2093,6 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
                   const adOperations = [
                     'VideoPlayerStreamInfoOverlayChannel',
                     'ComscoreStreamingQuery',
-                    'ChannelShellQuery',
                     'VideoAdUI'
                   ];
                   
@@ -2175,46 +2190,28 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
             [data-test-selector="display-ad"],
             [data-a-target*="display-ad"],
             [data-test-selector*="display-ad"],
-            [data-a-target*="sponsored"],
-            [data-test-selector*="sponsored"],
-            [data-a-target*="promoted"],
-            [data-test-selector*="promoted"],
-            [data-a-target*="promo"],
-            [data-test-selector*="promo"],
-            [data-a-target*="banner"],
-            [data-test-selector*="banner"],
+            [data-a-target="ad-banner"],
+            [data-test-selector="ad-banner"],
             [id*="ad-banner"],
             [id*="ad-overlay"],
             [class*="AdBanner"],
             [class*="ad-banner"],
             /* Display ads on directory/browse */
-            [data-a-target*="amazon"],
-            [data-test-selector*="amazon"],
-            [data-a-target*="display-ad"],
-            [data-test-selector*="display-ad"],
-            [aria-label*="Advertisement"],
-            [aria-label*="advertisement"],
-            
+            [data-a-target="display-ad"],
+            [data-test-selector="display-ad"],
+            [aria-label="Advertisement"],
+            [aria-label="advertisement"],
+
             /* Twitch-specific ad elements */
-            [data-a-target*="ad-"],
-            [data-test-selector*="ad-"],
             .tw-ad,
             [class*="TwitchAd"],
             [class*="twitch-ad"],
             .channel-info-bar__ad,
-            
+
             /* Sponsored content */
             [data-a-target="sponsorship"],
             [data-test-selector="sponsorship"],
             .sponsored-content,
-            [class*="Sponsored"],
-            [class*="sponsored"],
-            
-            /* Promotional banners */
-            [data-a-target="promo-banner"],
-            [data-test-selector="promo-banner"],
-            .promo-banner,
-            [class*="PromoBanner"],
             
             /* Common ad patterns */
             div[id^="ad-"],
@@ -2264,14 +2261,22 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
             (document.head || document.documentElement).appendChild(style);
           }
           
-          // Block ad scripts from loading
+          // Block ad scripts from loading (only from known ad network domains)
+          function isAdNetworkURL(src) {
+            if (!src || typeof src !== 'string') return false;
+            const lower = src.toLowerCase();
+            for (const domain of blockedDomains) {
+              if (lower.includes(domain)) return true;
+            }
+            return false;
+          }
           const scriptObserver = new MutationObserver((mutations) => {
             mutations.forEach((mutation) => {
               mutation.addedNodes.forEach((node) => {
-                if (node.tagName === 'SCRIPT' && node.src && shouldBlockRequest(node.src)) {
+                if (node.tagName === 'SCRIPT' && node.src && isAdNetworkURL(node.src)) {
                   node.remove();
                 }
-                if (node.tagName === 'IFRAME' && node.src && shouldBlockRequest(node.src)) {
+                if (node.tagName === 'IFRAME' && node.src && isAdNetworkURL(node.src)) {
                   node.remove();
                 }
               });
@@ -2293,12 +2298,12 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
             }
           });
           
-          // Block Image.prototype.src setter for tracking pixels
+          // Block Image.prototype.src setter for tracking pixels (ad networks only)
           const originalImageSrc = Object.getOwnPropertyDescriptor(Image.prototype, 'src');
           if (originalImageSrc && originalImageSrc.set) {
             Object.defineProperty(Image.prototype, 'src', {
               set: function(value) {
-              if (shouldBlockRequest(value)) {
+              if (isAdNetworkURL(value)) {
                   return;
                 }
                 originalImageSrc.set.call(this, value);
@@ -2393,12 +2398,14 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
 
             // Remove any elements matching ad patterns
             const adSelectors = [
-              '[data-a-target*="ad"]',
-              '[data-test-selector*="ad"]',
-              '[class*="ad-"]',
-              '[class*="Ad"]',
-              '[id*="ad-"]',
-              '.sponsored',
+              '[data-a-target="video-ad-countdown"]',
+              '[data-a-target="video-ad-label"]',
+              '[data-a-target="video-ad-overlay"]',
+              '[data-a-target="ad-banner"]',
+              '[data-a-target="ad-overlay"]',
+              '[data-test-selector="video-ad"]',
+              '[data-test-selector="ad-banner"]',
+              '[data-test-selector="ad-overlay"]',
               '.directory-banner',
               '[data-a-target="directory-banner"]',
               '[data-test-selector="directory-banner"]',
@@ -2406,19 +2413,7 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
               '[id*="directory-banner"]',
               '[data-a-target="display-ad"]',
               '[data-test-selector="display-ad"]',
-              '[data-a-target*="display-ad"]',
-              '[data-test-selector*="display-ad"]',
-              '[data-a-target*="sponsored"]',
-              '[data-test-selector*="sponsored"]',
-              '[data-a-target*="promoted"]',
-              '[data-test-selector*="promoted"]',
-              '[data-a-target*="promo"]',
-              '[data-test-selector*="promo"]',
-              '[data-a-target*="banner"]',
-              '[data-test-selector*="banner"]',
-              '[data-a-target="sponsorship"]',
-              '[data-a-target*="amazon"]',
-              '[data-test-selector*="amazon"]'
+              '[data-a-target="sponsorship"]'
             ];
             
             adSelectors.forEach(selector => {
@@ -2446,7 +2441,7 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
 
             // Force-remove directory banner ads even if they don't match text heuristics.
             try {
-              document.querySelectorAll('.directory-banner, [data-a-target="directory-banner"], [data-test-selector="directory-banner"], [class*="directory-banner"], [id*="directory-banner"], [data-a-target="display-ad"], [data-test-selector="display-ad"], [data-a-target*="display-ad"], [data-test-selector*="display-ad"], [data-a-target*="sponsored"], [data-test-selector*="sponsored"], [data-a-target*="promoted"], [data-test-selector*="promoted"], [data-a-target*="promo"], [data-test-selector*="promo"], [data-a-target*="banner"], [data-test-selector*="banner"]').forEach(el => {
+              document.querySelectorAll('.directory-banner, [data-a-target="directory-banner"], [data-test-selector="directory-banner"], [class*="directory-banner"], [id*="directory-banner"], [data-a-target="display-ad"], [data-test-selector="display-ad"]').forEach(el => {
                 el.remove();
               });
             } catch (e) {}

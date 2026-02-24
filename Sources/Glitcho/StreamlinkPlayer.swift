@@ -388,7 +388,7 @@ struct MotionSmootheningCapability: Equatable {
     let reason: String
 
     var targetRefreshRate: Int {
-        max(60, min(maxRefreshRate, 120))
+        60
     }
 
     static func evaluate(screen: NSScreen?) -> MotionSmootheningCapability {
@@ -560,7 +560,6 @@ struct NativeVideoPlayer: NSViewRepresentable {
         var endObserver: Any?
         var periodicTimeObserver: Any?
         let pipController: PictureInPictureController?
-
         var parent: NativeVideoPlayer
         private var magnifyStartZoom: CGFloat = 1.0
         private var panStart: CGSize = .zero
@@ -1002,6 +1001,10 @@ struct NativeVideoPlayer: NSViewRepresentable {
 
     func makeCoordinator() -> Coordinator { Coordinator(parent: self, pipController: pipController) }
 
+    private func makePlayerItem(for url: URL, coordinator: Coordinator) -> AVPlayerItem {
+        AVPlayerItem(url: url)
+    }
+
     func makeNSView(context: Context) -> AVPlayerView {
         let playerView = ZoomableAVPlayerView()
         playerView.controlsStyle = .floating
@@ -1011,7 +1014,7 @@ struct NativeVideoPlayer: NSViewRepresentable {
         playerView.wantsLayer = true
         playerView.layer?.masksToBounds = true
 
-        let player = AVPlayer(url: url)
+        let player = AVPlayer(playerItem: makePlayerItem(for: url, coordinator: context.coordinator))
         playerView.player = player
 
         // Seek to resume position if provided.
@@ -1075,7 +1078,7 @@ struct NativeVideoPlayer: NSViewRepresentable {
         context.coordinator.parent = self
 
         if let current = playerView.player?.currentItem?.asset as? AVURLAsset, current.url != url {
-            playerView.player?.replaceCurrentItem(with: AVPlayerItem(url: url))
+            playerView.player?.replaceCurrentItem(with: makePlayerItem(for: url, coordinator: context.coordinator))
         }
         context.coordinator.updatePlayerNativeChromeForFullscreenState(on: playerView)
         context.coordinator.updatePlaybackStateIfNeeded(on: playerView)
@@ -1359,6 +1362,8 @@ struct HybridTwitchView: View {
     @AppStorage("video.imageOptimize.lighting") private var imageOptimizeLighting = ImageOptimizationConfiguration.productionDefault.lighting
     @AppStorage("video.imageOptimize.denoiser") private var imageOptimizeDenoiser = ImageOptimizationConfiguration.productionDefault.denoiser
     @AppStorage("video.imageOptimize.neuralClarity") private var imageOptimizeNeuralClarity = ImageOptimizationConfiguration.productionDefault.neuralClarity
+    @AppStorage("motionSmoothening.showFPSOverlay") private var showFPSOverlay = true
+    @AppStorage("video.show4KOverlay") private var show4KOverlay = true
     @AppStorage("motionSmoothening.autoPreset") private var motionAutoPresetEnabled = true
     @AppStorage("motionSmoothening.preset") private var motionPresetRaw = MotionInterpolationPreset.balanced.rawValue
     @AppStorage("motionSmoothening.forceFrameGenDebug") private var motionForceFrameGenDebug = false
@@ -1552,13 +1557,13 @@ struct HybridTwitchView: View {
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                             .background(Color(red: 0.04, green: 0.04, blue: 0.05))
 
-                            if isMotionSmootheningActive || isUpscaler4KActive {
+                            if (isMotionSmootheningActive && showFPSOverlay) || (isUpscaler4KActive && show4KOverlay) {
                                 VStack {
                                     HStack(spacing: 8) {
-                                        if isMotionSmootheningActive, let status = motionRuntimeStatus {
+                                        if isMotionSmootheningActive && showFPSOverlay, let status = motionRuntimeStatus {
                                             motionFPSBadge(status)
                                         }
-                                        if isUpscaler4KActive {
+                                        if isUpscaler4KActive && show4KOverlay {
                                             upscaler4KBadge
                                         }
                                         Spacer()
@@ -2067,7 +2072,7 @@ struct HybridTwitchView: View {
             .padding(.vertical, 6)
             .background(
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(Color.white.opacity(0.1))
+                    .fill(Color.black.opacity(0.7))
             )
         }
     }

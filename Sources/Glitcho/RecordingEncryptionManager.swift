@@ -276,7 +276,18 @@ final class RecordingEncryptionManager {
         return EncryptFileResult(hashFilename: hashFilename, entry: entry)
     }
 
-    func decryptFile(named hashFilename: String, in directory: URL, to destinationURL: URL) throws {
+    /// Decrypts a .glitcho file to `destinationURL`.
+    ///
+    /// - Parameter onFirstChunk: Called on the background thread immediately after the first
+    ///   chunk has been written to `destinationURL`. The caller can use this to start
+    ///   AVPlayer on the partial file before the full decryption is complete, enabling
+    ///   streaming playback of large recordings.
+    func decryptFile(
+        named hashFilename: String,
+        in directory: URL,
+        to destinationURL: URL,
+        onFirstChunk: (() -> Void)? = nil
+    ) throws {
         let sourceURL = directory.appendingPathComponent(hashFilename)
         guard FileManager.default.fileExists(atPath: sourceURL.path) else {
             throw EncryptionError.fileNotFound(hashFilename)
@@ -303,13 +314,15 @@ final class RecordingEncryptionManager {
             }
             defer { dstHandle.closeFile() }
 
-            for _ in 0..<chunkCount {
+            for chunkIndex in 0..<chunkCount {
                 let sealedLenData = srcHandle.readData(ofLength: 4)
                 guard sealedLenData.count == 4 else { throw EncryptionError.manifestCorrupted }
                 let sealedLen = sealedLenData.withUnsafeBytes { $0.load(as: UInt32.self).byteSwapped }
                 let sealedData = srcHandle.readData(ofLength: Int(sealedLen))
                 let plaintext = try decrypt(data: sealedData)
                 dstHandle.write(plaintext)
+                // Signal after first chunk so callers can start streaming playback immediately.
+                if chunkIndex == 0 { onFirstChunk?() }
             }
         } else {
             // Legacy single-block format: whole file is one AES-GCM sealed blob.
@@ -317,6 +330,8 @@ final class RecordingEncryptionManager {
             let encrypted = srcHandle.readDataToEndOfFile()
             let plaintext = try decrypt(data: encrypted)
             try plaintext.write(to: destinationURL, options: .atomic)
+            // Single-block: the full file is ready — signal now.
+            onFirstChunk?()
         }
     }
 
@@ -410,6 +425,7 @@ final class RecordingEncryptionManager {
 
     // MARK: - Filename Parsing Helpers
 
+
     private static let filenameDateFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
@@ -430,6 +446,175 @@ final class RecordingEncryptionManager {
         guard parts.count >= 3 else { return nil }
         let dateString = "\(parts[parts.count - 2])_\(parts[parts.count - 1])"
         return filenameDateFormatter.date(from: dateString)
+    }
+}
+
+// MARK: - Streaming Resource Loader
+
+/// AVAssetResourceLoader delegate for zero-wait streaming of encrypted .glitcho files.
+///
+/// Usage:
+/// ```swift
+/// var comps = URLComponents()
+/// comps.scheme = "glitcho-stream"; comps.host = "local"; comps.path = glitchoFile.path
+/// let asset = AVURLAsset(url: comps.url!)
+/// let loader = GlitchoStreamResourceLoader(glitchoURL: glitchoFile, encryptionManager: mgr)
+/// asset.resourceLoader.setDelegate(loader, queue: .global(qos: .userInitiated))
+/// let player = AVPlayer(playerItem: AVPlayerItem(asset: asset))
+/// ```
+final class GlitchoStreamResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
+
+    private let glitchoURL: URL
+    private let encryptionManager: RecordingEncryptionManager
+
+    // Must match the constants in RecordingEncryptionManager.encryptFile
+    private static let chunkMagic      = Data("GLITCHO1".utf8)
+    private static let headerSize      = 16           // magic(8) + chunkSize(4) + chunkCount(4)
+    private static let chunkLenSize    = 4            // UInt32 BE per chunk
+    private static let gcmOverhead     = 28           // nonce(12) + tag(16)
+    private static let plainChunkSize  = 8 * 1024 * 1024         // 8 MB
+    private static let sealedChunkSize = plainChunkSize + gcmOverhead  // 8 388 636
+    private static let chunkBlockSize  = chunkLenSize + sealedChunkSize // 8 388 640
+
+    // Cached total plaintext size (computed once on first content-info request).
+    private var cachedTotalSize: Int?
+    // For legacy single-block files: cache decrypted bytes to avoid repeated full decryption.
+    private var cachedLegacyData: Data?
+
+    init(glitchoURL: URL, encryptionManager: RecordingEncryptionManager) {
+        self.glitchoURL = glitchoURL
+        self.encryptionManager = encryptionManager
+    }
+
+    // MARK: AVAssetResourceLoaderDelegate
+
+    func resourceLoader(
+        _ resourceLoader: AVAssetResourceLoader,
+        shouldWaitForLoadingOfRequestedResource loadingRequest: AVAssetResourceLoadingRequest
+    ) -> Bool {
+        // Handle both content-info and data in a single async block so that
+        // finishLoading() is called exactly once after ALL parts are fulfilled.
+        // The first request from AVPlayer typically carries both; the old
+        // if/else-if pattern dropped the data request and called finishLoading()
+        // with no data, which caused AVPlayer to stall.
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            do {
+                if let info = loadingRequest.contentInformationRequest {
+                    let total = try computeTotalSize()
+                    info.contentType = "public.mpeg-4"
+                    info.contentLength = Int64(total)
+                    info.isByteRangeAccessSupported = true
+                }
+                if let data = loadingRequest.dataRequest {
+                    try serveData(data)
+                }
+                loadingRequest.finishLoading()
+            } catch {
+                loadingRequest.finishLoading(with: error)
+            }
+        }
+        return true
+    }
+
+    // MARK: Helpers
+
+    private func computeTotalSize() throws -> Int {
+        if let cached = cachedTotalSize { return cached }
+
+        guard let fh = FileHandle(forReadingAtPath: glitchoURL.path) else {
+            throw CocoaError(.fileReadNoSuchFile)
+        }
+        defer { fh.closeFile() }
+
+        let magic = fh.readData(ofLength: 8)
+        if magic == Self.chunkMagic {
+            let rest = fh.readData(ofLength: 8) // chunkSize(4) + chunkCount(4)
+            guard rest.count == 8 else { throw CocoaError(.fileReadCorruptFile) }
+            let chunkCount = rest.subdata(in: 4..<8).withUnsafeBytes { $0.load(as: UInt32.self).byteSwapped }
+            guard chunkCount > 0 else { cachedTotalSize = 0; return 0 }
+
+            // Read last chunk's sealedLen to determine its plaintext size.
+            let lastOffset = UInt64(Self.headerSize + Int(chunkCount - 1) * Self.chunkBlockSize)
+            fh.seek(toFileOffset: lastOffset)
+            let lenData = fh.readData(ofLength: 4)
+            guard lenData.count == 4 else { throw CocoaError(.fileReadCorruptFile) }
+            let lastSealedLen = lenData.withUnsafeBytes { $0.load(as: UInt32.self).byteSwapped }
+            let lastPlain = Int(lastSealedLen) - Self.gcmOverhead
+            let total = Int(chunkCount - 1) * Self.plainChunkSize + lastPlain
+            cachedTotalSize = total
+            return total
+        } else {
+            // Legacy single-block: decrypt everything once and cache it.
+            fh.seek(toFileOffset: 0)
+            let encrypted = fh.readDataToEndOfFile()
+            let key = encryptionManager.encryptionKey()
+            let box = try AES.GCM.SealedBox(combined: encrypted)
+            let plain = try AES.GCM.open(box, using: key)
+            cachedLegacyData = plain
+            cachedTotalSize = plain.count
+            return plain.count
+        }
+    }
+
+    private func serveData(_ dataRequest: AVAssetResourceLoadingDataRequest) throws {
+        let reqOffset = Int(dataRequest.requestedOffset)
+        let reqLength = dataRequest.requestedLength
+        let reqEnd    = reqOffset + reqLength
+        guard reqLength > 0 else { return }
+
+        guard let fh = FileHandle(forReadingAtPath: glitchoURL.path) else {
+            throw CocoaError(.fileReadNoSuchFile)
+        }
+        defer { fh.closeFile() }
+
+        let magic = fh.readData(ofLength: 8)
+        if magic == Self.chunkMagic {
+            // Chunked format: decrypt only the chunks that cover the requested range.
+            let rest = fh.readData(ofLength: 8)
+            guard rest.count == 8 else { throw CocoaError(.fileReadCorruptFile) }
+            let chunkCount = Int(rest.subdata(in: 4..<8).withUnsafeBytes { $0.load(as: UInt32.self).byteSwapped })
+            guard chunkCount > 0 else { return }
+
+            let startChunk = reqOffset / Self.plainChunkSize
+            let endChunk   = min(chunkCount - 1, (reqEnd - 1) / Self.plainChunkSize)
+            guard startChunk <= endChunk else { return }
+
+            let key = encryptionManager.encryptionKey()
+            for idx in startChunk...endChunk {
+                let chunkFileOff = UInt64(Self.headerSize + idx * Self.chunkBlockSize)
+                fh.seek(toFileOffset: chunkFileOff)
+                let lenData = fh.readData(ofLength: 4)
+                guard lenData.count == 4 else { throw CocoaError(.fileReadCorruptFile) }
+                let sealedLen = Int(lenData.withUnsafeBytes { $0.load(as: UInt32.self).byteSwapped })
+                let sealed    = fh.readData(ofLength: sealedLen)
+                guard sealed.count == sealedLen else { throw CocoaError(.fileReadCorruptFile) }
+
+                let box      = try AES.GCM.SealedBox(combined: sealed)
+                let plain    = try AES.GCM.open(box, using: key)
+                let chunkBeg = idx * Self.plainChunkSize
+                let chunkEnd = chunkBeg + plain.count
+                let from     = max(reqOffset, chunkBeg) - chunkBeg
+                let to       = min(reqEnd, chunkEnd)    - chunkBeg
+                guard from < to else { continue }
+                dataRequest.respond(with: plain.subdata(in: from..<to))
+            }
+        } else {
+            // Legacy single-block: use cached decrypted data if already available.
+            let plain: Data
+            if let cached = cachedLegacyData {
+                plain = cached
+            } else {
+                fh.seek(toFileOffset: 0)
+                let encrypted = fh.readDataToEndOfFile()
+                let key = encryptionManager.encryptionKey()
+                let box = try AES.GCM.SealedBox(combined: encrypted)
+                plain = try AES.GCM.open(box, using: key)
+                cachedLegacyData = plain
+            }
+            let from = min(reqOffset, plain.count)
+            let to   = min(reqEnd, plain.count)
+            if from < to { dataRequest.respond(with: plain.subdata(in: from..<to)) }
+        }
     }
 }
 

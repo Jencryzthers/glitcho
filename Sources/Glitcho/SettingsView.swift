@@ -35,13 +35,13 @@ struct SettingsDetailView: View {
     @AppStorage("autoRecordDebounceSeconds") private var autoRecordDebounceSeconds = 1
     @AppStorage("autoRecordCooldownSeconds") private var autoRecordCooldownSeconds = 30
     @AppStorage("recordingConcurrencyLimit") private var recordingConcurrencyLimit = 2
-    @AppStorage("companionAPIEnabled") private var companionAPIEnabled = true
-    @AppStorage("companionAPIPort") private var companionAPIPort = 44555
-    @AppStorage("companionAPIToken") private var companionAPIToken = ""
     @AppStorage("recordingsRetentionMaxAgeDays") private var recordingsRetentionMaxAgeDays = 0
     @AppStorage("recordingsRetentionKeepLastGlobal") private var recordingsRetentionKeepLastGlobal = 0
     @AppStorage("recordingsRetentionKeepLastPerChannel") private var recordingsRetentionKeepLastPerChannel = 0
     @AppStorage("motionSmoothening120Enabled") private var motionSmoothening120Enabled = false
+    @AppStorage("motionSmoothening.showFPSOverlay") private var showFPSOverlay = true
+    @AppStorage("video.show4KOverlay") private var show4KOverlay = true
+    @AppStorage("sidebar.showSchedule") private var showScheduleSidebar = false
     @AppStorage("video.upscaler4kEnabled") private var videoUpscaler4KEnabled = false
     @AppStorage("video.imageOptimizeEnabled") private var videoImageOptimizeEnabled = false
     @AppStorage("video.aspectCropMode") private var videoAspectModeRaw = VideoAspectCropMode.source.rawValue
@@ -59,9 +59,9 @@ struct SettingsDetailView: View {
     @ObservedObject var recordingManager: RecordingManager
     @ObservedObject var backgroundAgentManager: BackgroundRecorderAgentManager
     @ObservedObject var store: WebViewStore
-    @ObservedObject var companionAPIServer: CompanionAPIServer
     @AppStorage("autoRecordSelectedChannels") private var autoRecordSelectedChannelsJSON = "[]"
     @AppStorage("autoRecordBlockedChannels") private var autoRecordBlockedChannelsJSON = "[]"
+    @AppStorage("settingsExpandedSections") private var expandedSectionsJSON = "[]"
     @State private var autoRecordSelectedChannels: Set<String> = []
     @State private var autoRecordBlockedChannels: Set<String> = []
     @State private var selectedChannelInput = ""
@@ -70,6 +70,7 @@ struct SettingsDetailView: View {
     @State private var blockedChannelInputError: String?
     @State private var autoRecordAllowlistInput = ""
     @State private var hasLoadedSelectedChannels = false
+    @State private var hasLoadedExpandedSections = false
     @State private var showChannelSelector = false
     @State private var showBlocklistSelector = false
     @State private var pendingBackgroundAction: BackgroundControlAction?
@@ -93,10 +94,6 @@ struct SettingsDetailView: View {
         }
     }
 
-    private var shouldShowRecordingSettings: Bool {
-        true
-    }
-
     private var videoAspectMode: VideoAspectCropMode {
         VideoAspectCropMode(rawValue: videoAspectModeRaw) ?? .source
     }
@@ -107,26 +104,10 @@ struct SettingsDetailView: View {
         ScrollView {
             VStack(spacing: 16) {
                 // Header
-                HStack(spacing: 12) {
-                    ZStack {
-                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            .fill(sidebarTintBinding.wrappedValue.opacity(0.15))
-                        Image(systemName: "slider.horizontal.3")
-                            .font(.system(size: 20, weight: .medium))
-                            .foregroundStyle(.white)
-                    }
-                    .frame(width: 44, height: 44)
-
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Settings")
-                            .font(.system(size: 18, weight: .semibold))
-                            .foregroundStyle(.white)
-
-                        Text("Customize your Glitcho experience")
-                            .font(.system(size: 12))
-                            .foregroundStyle(.white.opacity(0.5))
-                    }
-                    
+                HStack {
+                    Text("Settings")
+                        .font(.system(size: 22, weight: .bold))
+                        .foregroundStyle(.white)
                     Spacer()
                 }
                 .padding(.horizontal, 24)
@@ -134,15 +115,16 @@ struct SettingsDetailView: View {
                 .padding(.bottom, 8)
 
                 VStack(spacing: 14) {
+                    // MARK: - General
                     CollapsibleSettingsCard(
-                        id: "appearance",
-                        icon: "paintpalette.fill",
+                        id: "general",
+                        icon: "gearshape.fill",
                         iconColor: .white,
                         iconBackgroundColor: sidebarTintBinding.wrappedValue,
-                        title: "Appearance",
-                        subtitle: "Customize the sidebar tint",
-                        isExpanded: expandedSections.contains("appearance"),
-                        onToggle: { toggleSection("appearance") }
+                        title: "General",
+                        subtitle: "Appearance, alerts, and permissions",
+                        isExpanded: expandedSections.contains("general"),
+                        onToggle: { toggleSection("general") }
                     ) {
                         HStack(spacing: 12) {
                             ColorPicker("Sidebar tint", selection: sidebarTintBinding, supportsOpacity: false)
@@ -167,18 +149,10 @@ struct SettingsDetailView: View {
                             )
                         }
                         .padding(.vertical, 4)
-                    }
 
-                    CollapsibleSettingsCard(
-                        id: "notifications",
-                        icon: "bell.badge.fill",
-                        iconColor: .white,
-                        iconBackgroundColor: sidebarTintBinding.wrappedValue,
-                        title: "Notifications",
-                        subtitle: "Control how Glitcho alerts you",
-                        isExpanded: expandedSections.contains("notifications"),
-                        onToggle: { toggleSection("notifications") }
-                    ) {
+                        Divider()
+                            .padding(.vertical, 4)
+
                         SettingsToggleRow(
                             title: "Live alerts",
                             detail: "Show a notification when followed channels go live.",
@@ -214,18 +188,10 @@ struct SettingsDetailView: View {
                             Spacer()
                         }
                         .padding(.top, 4)
-                    }
 
-                    CollapsibleSettingsCard(
-                        id: "permissions",
-                        icon: "lock.shield.fill",
-                        iconColor: .white,
-                        iconBackgroundColor: sidebarTintBinding.wrappedValue,
-                        title: "System Permissions",
-                        subtitle: "Allow notifications in macOS",
-                        isExpanded: expandedSections.contains("permissions"),
-                        onToggle: { toggleSection("permissions") }
-                    ) {
+                        Divider()
+                            .padding(.vertical, 4)
+
                         VStack(alignment: .leading, spacing: 8) {
                             permissionRow(
                                 icon: "bell.badge.fill",
@@ -251,17 +217,24 @@ struct SettingsDetailView: View {
                         .padding(.top, 4)
                     }
 
-                    if shouldShowRecordingSettings {
-                        CollapsibleSettingsCard(
-                            id: "recording-tools",
-                            icon: "terminal.fill",
-                            iconColor: .white,
-                            iconBackgroundColor: sidebarTintBinding.wrappedValue,
-                            title: "Recording Tools",
-                            subtitle: "Configure Streamlink and FFmpeg binaries",
-                            isExpanded: expandedSections.contains("recording-tools"),
-                            onToggle: { toggleSection("recording-tools") }
-                        ) {
+                    // MARK: - Recording
+                    CollapsibleSettingsCard(
+                        id: "recording",
+                        icon: "record.circle",
+                        iconColor: .white,
+                        iconBackgroundColor: sidebarTintBinding.wrappedValue,
+                        title: "Recording",
+                        subtitle: "Capture, auto-record, and manage recordings",
+                        isExpanded: expandedSections.contains("recording"),
+                        onToggle: { toggleSection("recording") }
+                    ) {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("TOOLS")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(.white.opacity(0.45))
+                                .textCase(.uppercase)
+                                .tracking(0.5)
+
                             settingsValueRow(
                                 title: "Streamlink binary",
                                 value: streamlinkPath.isEmpty ? "Auto-detect (Homebrew or downloaded)" : streamlinkPath
@@ -374,217 +347,16 @@ struct SettingsDetailView: View {
                                     .foregroundStyle(Color.orange.opacity(0.85))
                                     .lineLimit(2)
                             }
-                        }
-                    }
 
-                    if shouldShowRecordingSettings {
-                        CollapsibleSettingsCard(
-                            id: "video-enhancement",
-                            icon: "sparkles.tv.fill",
-                            iconColor: .green,
-                            title: "Video Enhancement (Pro)",
-                            subtitle: "Tune playback quality features from settings",
-                            isExpanded: expandedSections.contains("video-enhancement"),
-                            onToggle: { toggleSection("video-enhancement") }
-                        ) {
-                            VStack(alignment: .leading, spacing: 10) {
-                                SettingsToggleRow(
-                                    title: "Motion smoothening (\(motionCapability.targetRefreshRate)Hz)",
-                                    detail: "AI interpolation for smoother movement when supported.",
-                                    isOn: $motionSmoothening120Enabled
-                                )
-                                .disabled(!motionCapability.supported)
-                                .opacity(motionCapability.supported ? 1 : 0.5)
+                            Divider()
+                                .padding(.vertical, 4)
 
-                                if !motionCapability.supported {
-                                    Text("Unavailable on this device now: \(motionCapability.reason)")
-                                        .font(.system(size: 10, weight: .medium))
-                                        .foregroundStyle(.orange.opacity(0.85))
-                                }
+                            Text("AUTO-RECORD")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(.white.opacity(0.45))
+                                .textCase(.uppercase)
+                                .tracking(0.5)
 
-                                SettingsToggleRow(
-                                    title: "4K Upscaler",
-                                    detail: "Upscale stream frames toward 4K output using local hardware.",
-                                    isOn: $videoUpscaler4KEnabled
-                                )
-
-                                SettingsToggleRow(
-                                    title: "Image Optimize",
-                                    detail: "Reduce compression artifacts and improve sharpness/colors for low-quality streams.",
-                                    isOn: $videoImageOptimizeEnabled
-                                )
-
-                                VStack(alignment: .leading, spacing: 8) {
-                                    Text("Image optimize tuning")
-                                        .font(.system(size: 11, weight: .medium))
-                                        .foregroundStyle(.white.opacity(0.9))
-
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        HStack {
-                                            Text("Contrast")
-                                                .font(.system(size: 10, weight: .medium))
-                                                .foregroundStyle(.white.opacity(0.75))
-                                            Spacer()
-                                            Text(String(format: "%.2f", imageOptimizeContrast))
-                                                .font(.system(size: 10, weight: .medium))
-                                                .foregroundStyle(.white.opacity(0.65))
-                                        }
-                                        Slider(value: $imageOptimizeContrast, in: 0.8...1.5, step: 0.01)
-                                    }
-
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        HStack {
-                                            Text("Lighting")
-                                                .font(.system(size: 10, weight: .medium))
-                                                .foregroundStyle(.white.opacity(0.75))
-                                            Spacer()
-                                            Text(String(format: "%.3f", imageOptimizeLighting))
-                                                .font(.system(size: 10, weight: .medium))
-                                                .foregroundStyle(.white.opacity(0.65))
-                                        }
-                                        Slider(value: $imageOptimizeLighting, in: -0.15...0.15, step: 0.005)
-                                    }
-
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        HStack {
-                                            Text("Denoiser")
-                                                .font(.system(size: 10, weight: .medium))
-                                                .foregroundStyle(.white.opacity(0.75))
-                                            Spacer()
-                                            Text(String(format: "%.2f", imageOptimizeDenoiser))
-                                                .font(.system(size: 10, weight: .medium))
-                                                .foregroundStyle(.white.opacity(0.65))
-                                        }
-                                        Slider(value: $imageOptimizeDenoiser, in: 0...1, step: 0.01)
-                                    }
-
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        HStack {
-                                            Text("Neural clarity")
-                                                .font(.system(size: 10, weight: .medium))
-                                                .foregroundStyle(.white.opacity(0.75))
-                                            Spacer()
-                                            Text(String(format: "%.2f", imageOptimizeNeuralClarity))
-                                                .font(.system(size: 10, weight: .medium))
-                                                .foregroundStyle(.white.opacity(0.65))
-                                        }
-                                        Slider(value: $imageOptimizeNeuralClarity, in: 0...1, step: 0.01)
-                                    }
-                                }
-
-                                Divider()
-                                    .padding(.vertical, 4)
-
-                                VStack(alignment: .leading, spacing: 6) {
-                                    Text("Aspect crop mode")
-                                        .font(.system(size: 11, weight: .medium))
-                                        .foregroundStyle(.white.opacity(0.9))
-                                    Picker("Aspect crop mode", selection: $videoAspectModeRaw) {
-                                        ForEach(VideoAspectCropMode.allCases, id: \.self) { mode in
-                                            Text(mode.label).tag(mode.rawValue)
-                                        }
-                                    }
-                                    .pickerStyle(.menu)
-                                    .tint(.white)
-
-                                    Text("Current mode: \(videoAspectMode.label)")
-                                        .font(.system(size: 10, weight: .medium))
-                                        .foregroundStyle(.white.opacity(0.6))
-                                }
-                            }
-                        }
-
-                        CollapsibleSettingsCard(
-                            id: "companion",
-                            icon: "network.badge.shield.half.filled",
-                            iconColor: .white,
-                            iconBackgroundColor: sidebarTintBinding.wrappedValue,
-                            title: "Companion API",
-                            subtitle: "Remote control endpoint for companion clients",
-                            isExpanded: expandedSections.contains("companion"),
-                            onToggle: { toggleSection("companion") }
-                        ) {
-                            VStack(alignment: .leading, spacing: 10) {
-                                SettingsToggleRow(
-                                    title: "Enable companion API",
-                                    detail: "Expose local HTTP control API for remote clients.",
-                                    isOn: $companionAPIEnabled,
-                                    accentColor: sidebarTintBinding.wrappedValue
-                                )
-
-                                HStack {
-                                    Text("Port")
-                                        .font(.system(size: 11, weight: .medium))
-                                        .foregroundStyle(.white.opacity(0.85))
-                                    Spacer()
-                                    Stepper(value: $companionAPIPort, in: 1024...65535) {
-                                        Text("\(companionAPIPort)")
-                                            .font(.system(size: 11, weight: .medium))
-                                            .foregroundStyle(.white.opacity(0.75))
-                                    }
-                                    .frame(width: 180)
-                                }
-                                .disabled(!companionAPIEnabled)
-                                .opacity(companionAPIEnabled ? 1 : 0.5)
-
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text("Auth token (optional)")
-                                        .font(.system(size: 11, weight: .medium))
-                                        .foregroundStyle(.white.opacity(0.85))
-                                    SecureField("Bearer token", text: $companionAPIToken)
-                                        .textFieldStyle(.plain)
-                                        .font(.system(size: 12, weight: .medium))
-                                        .foregroundStyle(.white)
-                                        .padding(.horizontal, 10)
-                                        .padding(.vertical, 8)
-                                        .background(Color.white.opacity(0.08))
-                                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                                }
-                                .disabled(!companionAPIEnabled)
-                                .opacity(companionAPIEnabled ? 1 : 0.5)
-
-                                HStack(spacing: 8) {
-                                    Circle()
-                                        .fill(companionAPIServer.isRunning ? Color.green : Color.orange)
-                                        .frame(width: 8, height: 8)
-                                    Text(companionAPIServer.isRunning ? "Companion API running" : "Companion API stopped")
-                                        .font(.system(size: 10, weight: .medium))
-                                        .foregroundStyle(.white.opacity(0.7))
-                                }
-
-                                if !companionAPIServer.endpoint.isEmpty {
-                                    Text("Endpoint: \(companionAPIServer.endpoint)")
-                                        .font(.system(size: 10, weight: .medium))
-                                        .foregroundStyle(.white.opacity(0.65))
-                                        .textSelection(.enabled)
-                                }
-
-                                if !companionAPIServer.lastRequestSummary.isEmpty {
-                                    Text("Last request: \(companionAPIServer.lastRequestSummary)")
-                                        .font(.system(size: 10, weight: .medium))
-                                        .foregroundStyle(.white.opacity(0.55))
-                                }
-
-                                if let error = companionAPIServer.lastError, !error.isEmpty {
-                                    Text(error)
-                                        .font(.system(size: 10, weight: .medium))
-                                        .foregroundStyle(.orange.opacity(0.9))
-                                        .lineLimit(2)
-                                }
-                            }
-                        }
-
-                        CollapsibleSettingsCard(
-                            id: "recording",
-                            icon: "record.circle",
-                            iconColor: .white,
-                            iconBackgroundColor: sidebarTintBinding.wrappedValue,
-                            title: "Recording",
-                            subtitle: "Capture live streams with Streamlink",
-                            isExpanded: expandedSections.contains("recording"),
-                            onToggle: { toggleSection("recording") }
-                        ) {
-                            VStack(alignment: .leading, spacing: 10) {
                             SettingsToggleRow(
                                 title: "Auto-record when live",
                                 detail: "Start recording followed channels as soon as they go live.",
@@ -612,7 +384,7 @@ struct SettingsDetailView: View {
                             }
                             .disabled(!autoRecordOnLive)
                             .opacity(autoRecordOnLive ? 1 : 0.5)
-                            
+
                             if resolvedAutoRecordMode == .customAllowlist && autoRecordOnLive {
                                 Divider()
                                     .padding(.vertical, 4)
@@ -867,73 +639,144 @@ struct SettingsDetailView: View {
                             Divider()
                                 .padding(.vertical, 4)
 
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text("Orchestration")
-                                    .font(.system(size: 12, weight: .medium))
+                            Text("ALWAYS RECORD")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(.white.opacity(0.45))
+                                .textCase(.uppercase)
+                                .tracking(0.5)
+
+                            Text("These channels are always recorded when live, regardless of auto-record mode")
+                                .font(.system(size: 11))
+                                .foregroundStyle(.white.opacity(0.5))
+
+                            HStack(spacing: 8) {
+                                TextField("Add channel login", text: $autoRecordAllowlistInput)
+                                    .textFieldStyle(.plain)
+                                    .font(.system(size: 11, weight: .medium))
                                     .foregroundStyle(.white)
-
-                                Stepper(value: $recordingConcurrencyLimit, in: 1...12) {
-                                    Text("Max concurrent recordings: \(recordingConcurrencyLimit)")
-                                        .font(.system(size: 10))
-                                        .foregroundStyle(.white.opacity(0.75))
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 6)
+                                    .background(Color.white.opacity(0.08))
+                                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                                    .onSubmit {
+                                        let trimmed = autoRecordAllowlistInput.trimmingCharacters(in: .whitespacesAndNewlines)
+                                        guard !trimmed.isEmpty else { return }
+                                        recordingManager.addAutoRecord(login: trimmed)
+                                        autoRecordAllowlistInput = ""
+                                    }
+                                Button("Add") {
+                                    let trimmed = autoRecordAllowlistInput.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    guard !trimmed.isEmpty else { return }
+                                    recordingManager.addAutoRecord(login: trimmed)
+                                    autoRecordAllowlistInput = ""
                                 }
+                                .font(.system(size: 10, weight: .semibold))
+                                .buttonStyle(.plain)
+                                .foregroundStyle(.white.opacity(0.8))
+                            }
 
-                                Stepper(value: $autoRecordDebounceSeconds, in: 0...20) {
-                                    Text("Live event debounce: \(autoRecordDebounceSeconds)s")
-                                        .font(.system(size: 10))
-                                        .foregroundStyle(.white.opacity(0.75))
-                                }
-
-                                Stepper(value: $autoRecordCooldownSeconds, in: 0...300, step: 5) {
-                                    Text(autoRecordCooldownSeconds == 0 ? "Per-channel cooldown: Disabled" : "Per-channel cooldown: \(autoRecordCooldownSeconds)s")
-                                        .font(.system(size: 10))
-                                        .foregroundStyle(.white.opacity(0.75))
+                            if recordingManager.autoRecordLogins.isEmpty {
+                                Text("No channels configured")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(.white.opacity(0.6))
+                            } else {
+                                VStack(spacing: 4) {
+                                    ForEach(recordingManager.autoRecordLogins.sorted(), id: \.self) { login in
+                                        HStack {
+                                            Text(login)
+                                                .font(.system(size: 11, weight: .medium))
+                                                .foregroundStyle(.white.opacity(0.85))
+                                            Spacer()
+                                            Button {
+                                                recordingManager.removeAutoRecord(login: login)
+                                            } label: {
+                                                Image(systemName: "xmark.circle.fill")
+                                                    .font(.system(size: 11))
+                                                    .foregroundStyle(.white.opacity(0.45))
+                                            }
+                                            .buttonStyle(.plain)
+                                        }
+                                        .padding(.horizontal, 8)
+                                        .padding(.vertical, 4)
+                                        .background(Color.white.opacity(0.03))
+                                        .clipShape(RoundedRectangle(cornerRadius: 4))
+                                    }
                                 }
                             }
 
                             Divider()
                                 .padding(.vertical, 4)
 
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text("Retention policy")
-                                    .font(.system(size: 12, weight: .medium))
-                                    .foregroundStyle(.white)
+                            Text("ORCHESTRATION")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(.white.opacity(0.45))
+                                .textCase(.uppercase)
+                                .tracking(0.5)
 
-                                Stepper(value: $recordingsRetentionMaxAgeDays, in: 0...365) {
-                                    Text(recordingsRetentionMaxAgeDays == 0 ? "Delete older than: Disabled" : "Delete older than: \(recordingsRetentionMaxAgeDays) day(s)")
-                                        .font(.system(size: 10))
-                                        .foregroundStyle(.white.opacity(0.75))
-                                }
-
-                                Stepper(value: $recordingsRetentionKeepLastGlobal, in: 0...200) {
-                                    Text(recordingsRetentionKeepLastGlobal == 0 ? "Keep last (global): Disabled" : "Keep last (global): \(recordingsRetentionKeepLastGlobal)")
-                                        .font(.system(size: 10))
-                                        .foregroundStyle(.white.opacity(0.75))
-                                }
-
-                                Stepper(value: $recordingsRetentionKeepLastPerChannel, in: 0...100) {
-                                    Text(recordingsRetentionKeepLastPerChannel == 0 ? "Keep last per channel: Disabled" : "Keep last per channel: \(recordingsRetentionKeepLastPerChannel)")
-                                        .font(.system(size: 10))
-                                        .foregroundStyle(.white.opacity(0.75))
-                                }
-
-                                HStack {
-                                    SettingsButton(
-                                        title: "Run retention now",
-                                        systemImage: "trash.slash",
-                                        style: .secondary,
-                                        action: runRetentionNow
-                                    )
-                                    Spacer()
-                                }
-
-                                if let retentionRunStatus {
-                                    Text(retentionRunStatus)
-                                        .font(.system(size: 10, weight: .medium))
-                                        .foregroundStyle(.white.opacity(0.65))
-                                        .lineLimit(2)
-                                }
+                            Stepper(value: $recordingConcurrencyLimit, in: 1...12) {
+                                Text("Max concurrent recordings: \(recordingConcurrencyLimit)")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(.white.opacity(0.75))
                             }
+
+                            Stepper(value: $autoRecordDebounceSeconds, in: 0...20) {
+                                Text("Live event debounce: \(autoRecordDebounceSeconds)s")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(.white.opacity(0.75))
+                            }
+
+                            Stepper(value: $autoRecordCooldownSeconds, in: 0...300, step: 5) {
+                                Text(autoRecordCooldownSeconds == 0 ? "Per-channel cooldown: Disabled" : "Per-channel cooldown: \(autoRecordCooldownSeconds)s")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(.white.opacity(0.75))
+                            }
+
+                            Divider()
+                                .padding(.vertical, 4)
+
+                            Text("RETENTION")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(.white.opacity(0.45))
+                                .textCase(.uppercase)
+                                .tracking(0.5)
+
+                            Stepper(value: $recordingsRetentionMaxAgeDays, in: 0...365) {
+                                Text(recordingsRetentionMaxAgeDays == 0 ? "Delete older than: Disabled" : "Delete older than: \(recordingsRetentionMaxAgeDays) day(s)")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(.white.opacity(0.75))
+                            }
+
+                            Stepper(value: $recordingsRetentionKeepLastGlobal, in: 0...200) {
+                                Text(recordingsRetentionKeepLastGlobal == 0 ? "Keep last (global): Disabled" : "Keep last (global): \(recordingsRetentionKeepLastGlobal)")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(.white.opacity(0.75))
+                            }
+
+                            Stepper(value: $recordingsRetentionKeepLastPerChannel, in: 0...100) {
+                                Text(recordingsRetentionKeepLastPerChannel == 0 ? "Keep last per channel: Disabled" : "Keep last per channel: \(recordingsRetentionKeepLastPerChannel)")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(.white.opacity(0.75))
+                            }
+
+                            HStack {
+                                SettingsButton(
+                                    title: "Run retention now",
+                                    systemImage: "trash.slash",
+                                    style: .secondary,
+                                    action: runRetentionNow
+                                )
+                                Spacer()
+                            }
+
+                            if let retentionRunStatus {
+                                Text(retentionRunStatus)
+                                    .font(.system(size: 10, weight: .medium))
+                                    .foregroundStyle(.white.opacity(0.65))
+                                    .lineLimit(2)
+                            }
+
+                            Divider()
+                                .padding(.vertical, 4)
 
                             settingsValueRow(
                                 title: "Recordings folder",
@@ -953,35 +796,12 @@ struct SettingsDetailView: View {
                             Divider()
                                 .padding(.vertical, 4)
 
-                            HStack {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text("Recently Watched")
-                                        .font(.system(size: 13, weight: .medium))
-                                        .foregroundStyle(.white)
-                                    Text("Channels you've visited recently appear in the sidebar")
-                                        .font(.system(size: 11))
-                                        .foregroundStyle(.secondary)
-                                }
-                                Spacer()
-                                Button("Clear History") {
-                                    recentChannelsData = Data()
-                                }
-                                .buttonStyle(.bordered)
-                                .controlSize(.small)
-                            }
+                            Text("BACKGROUND RECORDER")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(.white.opacity(0.45))
+                                .textCase(.uppercase)
+                                .tracking(0.5)
 
-                            Divider()
-                                .padding(.vertical, 8)
-
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("Background Recorder")
-                                    .font(.system(size: 12, weight: .medium))
-                                    .foregroundStyle(.white)
-                                Text("Manage the background recording agent")
-                                    .font(.system(size: 10))
-                                    .foregroundStyle(.white.opacity(0.5))
-                            }
-                            
                             HStack(spacing: 10) {
                                 SettingsButton(
                                     title: "Restart Agent",
@@ -992,7 +812,7 @@ struct SettingsDetailView: View {
                                     }
                                 )
                                 .disabled(isRunningBackgroundAction)
-                                
+
                                 SettingsButton(
                                     title: "Stop All Recordings",
                                     systemImage: "stop.circle",
@@ -1002,7 +822,7 @@ struct SettingsDetailView: View {
                                     }
                                 )
                                 .disabled(isRunningBackgroundAction)
-                                
+
                                 Spacer()
                             }
 
@@ -1032,79 +852,180 @@ struct SettingsDetailView: View {
                                     .font(.system(size: 10, weight: .medium))
                                     .foregroundStyle(.white.opacity(0.5))
                             }
+
+                            Divider()
+                                .padding(.vertical, 4)
+
+                            Text("SIDEBAR")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(.white.opacity(0.45))
+                                .textCase(.uppercase)
+                                .tracking(0.5)
+
+                            SettingsToggleRow(
+                                title: "Show Schedule in sidebar",
+                                detail: "Display a Schedule shortcut in the sidebar navigation.",
+                                isOn: $showScheduleSidebar
+                            )
+                        }
+                    }
+
+                    // MARK: - Playback
+                    CollapsibleSettingsCard(
+                        id: "playback",
+                        icon: "play.circle.fill",
+                        iconColor: .white,
+                        iconBackgroundColor: sidebarTintBinding.wrappedValue,
+                        title: "Playback",
+                        subtitle: "Video quality and enhancement",
+                        isExpanded: expandedSections.contains("playback"),
+                        onToggle: { toggleSection("playback") }
+                    ) {
+                        VStack(alignment: .leading, spacing: 10) {
+                            SettingsToggleRow(
+                                title: "Motion smoothening (\(motionCapability.targetRefreshRate)Hz)",
+                                detail: "AI interpolation for smoother movement when supported.",
+                                isOn: $motionSmoothening120Enabled
+                            )
+                            .disabled(!motionCapability.supported)
+                            .opacity(motionCapability.supported ? 1 : 0.5)
+
+                            if !motionCapability.supported {
+                                Text("Unavailable on this device now: \(motionCapability.reason)")
+                                    .font(.system(size: 10, weight: .medium))
+                                    .foregroundStyle(.orange.opacity(0.85))
+                            }
+
+                            SettingsToggleRow(
+                                title: "Show FPS overlay",
+                                detail: "Display a frame rate badge on the player when motion smoothening is active.",
+                                isOn: $showFPSOverlay
+                            )
+
+                            SettingsToggleRow(
+                                title: "Show 4K overlay",
+                                detail: "Display a 4K badge on the player when upscaling is active.",
+                                isOn: $show4KOverlay
+                            )
+
+                            SettingsToggleRow(
+                                title: "4K Upscaler",
+                                detail: "Upscale stream frames toward 4K output using local hardware.",
+                                isOn: $videoUpscaler4KEnabled
+                            )
+
+                            SettingsToggleRow(
+                                title: "Image Optimize",
+                                detail: "Reduce compression artifacts and improve sharpness/colors for low-quality streams.",
+                                isOn: $videoImageOptimizeEnabled
+                            )
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Image optimize tuning")
+                                    .font(.system(size: 11, weight: .medium))
+                                    .foregroundStyle(.white.opacity(0.9))
+
+                                VStack(alignment: .leading, spacing: 4) {
+                                    HStack {
+                                        Text("Contrast")
+                                            .font(.system(size: 10, weight: .medium))
+                                            .foregroundStyle(.white.opacity(0.75))
+                                        Spacer()
+                                        Text(String(format: "%.2f", imageOptimizeContrast))
+                                            .font(.system(size: 10, weight: .medium))
+                                            .foregroundStyle(.white.opacity(0.65))
+                                    }
+                                    Slider(value: $imageOptimizeContrast, in: 0.8...1.5, step: 0.01)
+                                }
+
+                                VStack(alignment: .leading, spacing: 4) {
+                                    HStack {
+                                        Text("Lighting")
+                                            .font(.system(size: 10, weight: .medium))
+                                            .foregroundStyle(.white.opacity(0.75))
+                                        Spacer()
+                                        Text(String(format: "%.3f", imageOptimizeLighting))
+                                            .font(.system(size: 10, weight: .medium))
+                                            .foregroundStyle(.white.opacity(0.65))
+                                    }
+                                    Slider(value: $imageOptimizeLighting, in: -0.15...0.15, step: 0.005)
+                                }
+
+                                VStack(alignment: .leading, spacing: 4) {
+                                    HStack {
+                                        Text("Denoiser")
+                                            .font(.system(size: 10, weight: .medium))
+                                            .foregroundStyle(.white.opacity(0.75))
+                                        Spacer()
+                                        Text(String(format: "%.2f", imageOptimizeDenoiser))
+                                            .font(.system(size: 10, weight: .medium))
+                                            .foregroundStyle(.white.opacity(0.65))
+                                    }
+                                    Slider(value: $imageOptimizeDenoiser, in: 0...1, step: 0.01)
+                                }
+
+                                VStack(alignment: .leading, spacing: 4) {
+                                    HStack {
+                                        Text("Neural clarity")
+                                            .font(.system(size: 10, weight: .medium))
+                                            .foregroundStyle(.white.opacity(0.75))
+                                        Spacer()
+                                        Text(String(format: "%.2f", imageOptimizeNeuralClarity))
+                                            .font(.system(size: 10, weight: .medium))
+                                            .foregroundStyle(.white.opacity(0.65))
+                                    }
+                                    Slider(value: $imageOptimizeNeuralClarity, in: 0...1, step: 0.01)
+                                }
+                            }
+
+                            Divider()
+                                .padding(.vertical, 4)
+
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("Aspect crop mode")
+                                    .font(.system(size: 11, weight: .medium))
+                                    .foregroundStyle(.white.opacity(0.9))
+                                Picker("Aspect crop mode", selection: $videoAspectModeRaw) {
+                                    ForEach(VideoAspectCropMode.allCases, id: \.self) { mode in
+                                        Text(mode.label).tag(mode.rawValue)
+                                    }
+                                }
+                                .pickerStyle(.menu)
+                                .tint(.white)
+
+                                Text("Current mode: \(videoAspectMode.label)")
+                                    .font(.system(size: 10, weight: .medium))
+                                    .foregroundStyle(.white.opacity(0.6))
                             }
                         }
+                    }
 
-                        CollapsibleSettingsCard(
-                            id: "per-channel-auto-record",
-                            icon: "checkmark.circle.fill",
-                            iconColor: .white,
-                            iconBackgroundColor: sidebarTintBinding.wrappedValue,
-                            title: "Per-Channel Auto-Record",
-                            subtitle: "Always record specific channels when live",
-                            isExpanded: expandedSections.contains("per-channel-auto-record"),
-                            onToggle: { toggleSection("per-channel-auto-record") }
-                        ) {
-                            VStack(alignment: .leading, spacing: 10) {
-                                Text("These channels are always recorded when live, regardless of the global auto-record mode")
+                    // MARK: - Data
+                    CollapsibleSettingsCard(
+                        id: "data",
+                        icon: "clock.arrow.circlepath",
+                        iconColor: .white,
+                        iconBackgroundColor: sidebarTintBinding.wrappedValue,
+                        title: "Data",
+                        subtitle: "History and storage",
+                        isExpanded: expandedSections.contains("data"),
+                        onToggle: { toggleSection("data") }
+                    ) {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Recently Watched")
+                                    .font(.system(size: 13, weight: .medium))
+                                    .foregroundStyle(.white)
+                                Text("Channels you've visited recently appear in the sidebar")
                                     .font(.system(size: 11))
-                                    .foregroundStyle(.white.opacity(0.5))
-
-                                HStack(spacing: 8) {
-                                    TextField("Add channel login", text: $autoRecordAllowlistInput)
-                                        .textFieldStyle(.plain)
-                                        .font(.system(size: 11, weight: .medium))
-                                        .foregroundStyle(.white)
-                                        .padding(.horizontal, 8)
-                                        .padding(.vertical, 6)
-                                        .background(Color.white.opacity(0.08))
-                                        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-                                        .onSubmit {
-                                            let trimmed = autoRecordAllowlistInput.trimmingCharacters(in: .whitespacesAndNewlines)
-                                            guard !trimmed.isEmpty else { return }
-                                            recordingManager.addAutoRecord(login: trimmed)
-                                            autoRecordAllowlistInput = ""
-                                        }
-                                    Button("Add") {
-                                        let trimmed = autoRecordAllowlistInput.trimmingCharacters(in: .whitespacesAndNewlines)
-                                        guard !trimmed.isEmpty else { return }
-                                        recordingManager.addAutoRecord(login: trimmed)
-                                        autoRecordAllowlistInput = ""
-                                    }
-                                    .font(.system(size: 10, weight: .semibold))
-                                    .buttonStyle(.plain)
-                                    .foregroundStyle(.white.opacity(0.8))
-                                }
-
-                                if recordingManager.autoRecordLogins.isEmpty {
-                                    Text("No channels configured")
-                                        .font(.system(size: 10))
-                                        .foregroundStyle(.white.opacity(0.6))
-                                } else {
-                                    VStack(spacing: 4) {
-                                        ForEach(recordingManager.autoRecordLogins.sorted(), id: \.self) { login in
-                                            HStack {
-                                                Text(login)
-                                                    .font(.system(size: 11, weight: .medium))
-                                                    .foregroundStyle(.white.opacity(0.85))
-                                                Spacer()
-                                                Button {
-                                                    recordingManager.removeAutoRecord(login: login)
-                                                } label: {
-                                                    Image(systemName: "xmark.circle.fill")
-                                                        .font(.system(size: 11))
-                                                        .foregroundStyle(.white.opacity(0.45))
-                                                }
-                                                .buttonStyle(.plain)
-                                            }
-                                            .padding(.horizontal, 8)
-                                            .padding(.vertical, 4)
-                                            .background(Color.white.opacity(0.03))
-                                            .clipShape(RoundedRectangle(cornerRadius: 4))
-                                        }
-                                    }
-                                }
+                                    .foregroundStyle(.secondary)
                             }
+                            Spacer()
+                            Button("Clear History") {
+                                recentChannelsData = Data()
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
                         }
                     }
                 }
@@ -1116,6 +1037,7 @@ struct SettingsDetailView: View {
         .onAppear {
             loadSelectedChannelsIfNeeded()
             loadBlockedChannelsIfNeeded()
+            loadExpandedSectionsIfNeeded()
             motionCapability = MotionSmootheningCapability.evaluate(screen: NSScreen.main)
             sanitizeProVideoEnhancementState()
         }
@@ -1220,6 +1142,27 @@ struct SettingsDetailView: View {
         } else {
             expandedSections.insert(id)
         }
+        saveExpandedSections()
+    }
+
+    private func loadExpandedSectionsIfNeeded() {
+        guard !hasLoadedExpandedSections else { return }
+        hasLoadedExpandedSections = true
+
+        guard let data = expandedSectionsJSON.data(using: .utf8),
+              let decoded = try? JSONDecoder().decode([String].self, from: data) else {
+            return
+        }
+        expandedSections = Set(decoded)
+    }
+
+    private func saveExpandedSections() {
+        let array = Array(expandedSections).sorted()
+        guard let data = try? JSONEncoder().encode(array),
+              let json = String(data: data, encoding: .utf8) else {
+            return
+        }
+        expandedSectionsJSON = json
     }
 
     private var sidebarTintBinding: Binding<Color> {

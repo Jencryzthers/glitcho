@@ -407,7 +407,6 @@ struct ContentView: View {
                     recordingManager: recordingManager,
                     backgroundAgentManager: backgroundAgentManager,
                     store: store,
-                    companionAPIServer: companionAPIServer,
                     onOpenTwitchSettings: {
                         detailMode = .web
                         store.navigate(to: URL(string: "https://www.twitch.tv/settings")!)
@@ -1245,6 +1244,10 @@ struct Sidebar: View {
     var showRecordingsNavigation: Bool = true
     var onPinLimitReached: (() -> Void)?
     @AppStorage("recentChannels.v1") private var recentChannelsData: Data = Data()
+    @AppStorage("sidebar.pinnedCollapsed") private var pinnedCollapsed = false
+    @AppStorage("sidebar.recentCollapsed") private var recentCollapsed = false
+    @AppStorage("sidebar.followingCollapsed") private var followingCollapsed = false
+    @AppStorage("sidebar.showSchedule") private var showScheduleSidebar = false
     @State private var isAddingPin = false
     @State private var newPinText = ""
     @State private var pinError: String?
@@ -1394,11 +1397,13 @@ struct Sidebar: View {
                             onShowRecordings?()
                         }
 
-                        SidebarRow(
-                            title: "Schedule",
-                            systemImage: "calendar.badge.clock"
-                        ) {
-                            showScheduleSheet = true
+                        if showScheduleSidebar {
+                            SidebarRow(
+                                title: "Schedule",
+                                systemImage: "calendar.badge.clock"
+                            ) {
+                                showScheduleSheet = true
+                            }
                         }
                     }
 
@@ -1412,30 +1417,41 @@ struct Sidebar: View {
                     // Pinned section
                     let pinnedLogins = Set(pinnedChannels.map(\.login))
                     HStack {
-                        Text("PINNED")
-                            .font(.system(size: 10, weight: .bold))
-                            .foregroundStyle(.white.opacity(0.35))
-                            .tracking(1)
+                        Button(action: { withAnimation(.easeOut(duration: 0.15)) { pinnedCollapsed.toggle() } }) {
+                            HStack(spacing: 4) {
+                                Image(systemName: pinnedCollapsed ? "chevron.right" : "chevron.down")
+                                    .font(.system(size: 8, weight: .bold))
+                                    .foregroundStyle(.white.opacity(0.25))
+                                Text("PINNED")
+                                    .font(.system(size: 10, weight: .bold))
+                                    .foregroundStyle(.white.opacity(0.35))
+                                    .tracking(1)
+                            }
+                        }
+                        .buttonStyle(.plain)
 
                         Spacer()
 
-                        Button(action: {
-                            if pinnedChannels.count >= pinnedLimit {
-                                onPinLimitReached?()
-                            } else {
-                                toggleAddPin()
+                        if !pinnedCollapsed {
+                            Button(action: {
+                                if pinnedChannels.count >= pinnedLimit {
+                                    onPinLimitReached?()
+                                } else {
+                                    toggleAddPin()
+                                }
+                            }) {
+                                Image(systemName: "plus.circle.fill")
+                                    .font(.system(size: 12, weight: .semibold))
+                                    .foregroundStyle(.white.opacity(pinnedChannels.count >= pinnedLimit ? 0.2 : 0.6))
                             }
-                        }) {
-                            Image(systemName: "plus.circle.fill")
-                                .font(.system(size: 12, weight: .semibold))
-                                .foregroundStyle(.white.opacity(pinnedChannels.count >= pinnedLimit ? 0.2 : 0.6))
+                            .buttonStyle(.plain)
+                            .help(pinnedChannels.count >= pinnedLimit ? "Favorites limit reached" : "Add favorite")
                         }
-                        .buttonStyle(.plain)
-                        .help(pinnedChannels.count >= pinnedLimit ? "Favorites limit reached" : "Add favorite")
                     }
                     .padding(.horizontal, 12)
                     .padding(.bottom, 6)
 
+                    if !pinnedCollapsed {
                     if isAddingPin {
                         VStack(alignment: .leading, spacing: 8) {
                             HStack(spacing: 8) {
@@ -1526,6 +1542,7 @@ struct Sidebar: View {
                             )
                         }
                     }
+                    } // end if !pinnedCollapsed
 
                     // Divider
                     Rectangle()
@@ -1536,19 +1553,34 @@ struct Sidebar: View {
 
                     // Recent section
                     if !recentChannels.isEmpty {
-                        Text("RECENT")
-                            .font(.system(size: 10, weight: .bold))
-                            .foregroundStyle(.white.opacity(0.25))
-                            .tracking(1)
-                            .padding(.horizontal, 12)
-                            .padding(.top, 8)
-                            .padding(.bottom, 4)
+                        HStack {
+                            Button(action: { withAnimation(.easeOut(duration: 0.15)) { recentCollapsed.toggle() } }) {
+                                HStack(spacing: 4) {
+                                    Image(systemName: recentCollapsed ? "chevron.right" : "chevron.down")
+                                        .font(.system(size: 8, weight: .bold))
+                                        .foregroundStyle(.white.opacity(0.25))
+                                    Text("RECENT")
+                                        .font(.system(size: 10, weight: .bold))
+                                        .foregroundStyle(.white.opacity(0.25))
+                                        .tracking(1)
+                                }
+                            }
+                            .buttonStyle(.plain)
+                            Spacer()
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.top, 8)
+                        .padding(.bottom, 4)
 
+                        if !recentCollapsed {
                         let liveLoginSet = Set(store.followedLive.map(\.login))
+                        let liveAvatarByLogin = Dictionary(store.followedLive.compactMap { ch in ch.thumbnailURL.map { (ch.login, $0) } }, uniquingKeysWith: { first, _ in first })
+                        let pinnedAvatarByLogin = Dictionary(pinnedChannels.compactMap { p in p.thumbnailURL.map { (p.login, $0) } }, uniquingKeysWith: { first, _ in first })
                         ForEach(recentChannels, id: \.self) { login in
                             OfflineFollowingRow(
                                 login: login,
-                                avatarURL: store.offlineChannelAvatarURLs[login]
+                                avatarURL: liveAvatarByLogin[login] ?? pinnedAvatarByLogin[login] ?? store.offlineChannelAvatarURLs[login],
+                                isLive: liveLoginSet.contains(login)
                             ) {
                                 onChannelSelected?(login)
                                 addToRecent(login: login)
@@ -1575,6 +1607,7 @@ struct Sidebar: View {
                                 }
                             }
                         }
+                        } // end if !recentCollapsed
 
                         // Divider before Following
                         Rectangle()
@@ -1585,12 +1618,23 @@ struct Sidebar: View {
                     }
 
                     // Following section
-                    Text("FOLLOWING")
-                        .font(.system(size: 10, weight: .bold))
-                        .foregroundStyle(.white.opacity(0.35))
-                        .tracking(1)
-                        .padding(.horizontal, 12)
-                        .padding(.bottom, 8)
+                    HStack {
+                        Button(action: { withAnimation(.easeOut(duration: 0.15)) { followingCollapsed.toggle() } }) {
+                            HStack(spacing: 4) {
+                                Image(systemName: followingCollapsed ? "chevron.right" : "chevron.down")
+                                    .font(.system(size: 8, weight: .bold))
+                                    .foregroundStyle(.white.opacity(0.25))
+                                Text("FOLLOWING")
+                                    .font(.system(size: 10, weight: .bold))
+                                    .foregroundStyle(.white.opacity(0.35))
+                                    .tracking(1)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        Spacer()
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 8)
 
                     let liveLogins = Set(store.followedLive.map(\.login))
                     let nonPinnedLive = store.followedLive.filter { !pinnedLogins.contains($0.login) }
@@ -1599,6 +1643,7 @@ struct Sidebar: View {
                         .filter { !pinnedLogins.contains($0) && !liveLogins.contains($0) }
                         .sorted()
 
+                    if !followingCollapsed {
                     if nonPinnedLive.isEmpty && offlineLogins.isEmpty {
                         HStack(spacing: 8) {
                             Image(systemName: "heart")
@@ -1653,7 +1698,7 @@ struct Sidebar: View {
                             }
                         }
 
-                        if !nonPinnedLive.isEmpty && !offlineLogins.isEmpty {
+                        if !offlineLogins.isEmpty {
                             Text("OFFLINE")
                                 .font(.system(size: 10, weight: .bold))
                                 .foregroundStyle(.white.opacity(0.25))
@@ -1666,7 +1711,7 @@ struct Sidebar: View {
                         ForEach(offlineLogins, id: \.self) { login in
                             OfflineFollowingRow(
                                 login: login,
-                                avatarURL: store.offlineChannelAvatarURLs[login]
+                                avatarURL: pinnedChannels.first(where: { $0.login == login })?.thumbnailURL ?? store.offlineChannelAvatarURLs[login]
                             ) {
                                 onChannelSelected?(login)
                                 addToRecent(login: login)
@@ -1686,6 +1731,7 @@ struct Sidebar: View {
                             }
                         }
                     }
+                    } // end if !followingCollapsed
                 }
                 .padding(.bottom, 16)
             }
@@ -2007,6 +2053,7 @@ struct FollowingRow: View {
 struct OfflineFollowingRow: View {
     let login: String
     let avatarURL: URL?
+    var isLive: Bool = false
     let action: () -> Void
     @State private var isHovered = false
 
@@ -2033,7 +2080,7 @@ struct OfflineFollowingRow: View {
 
                 Text(login)
                     .font(.system(size: 13, weight: .medium))
-                    .foregroundColor(isHovered ? .white.opacity(0.6) : .white.opacity(0.4))
+                    .foregroundColor(isHovered ? .white.opacity(isLive ? 1.0 : 0.6) : .white.opacity(isLive ? 0.85 : 0.4))
                     .lineLimit(1)
 
                 Spacer()

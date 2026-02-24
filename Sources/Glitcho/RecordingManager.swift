@@ -96,40 +96,12 @@ final class RecordingManager: ObservableObject {
     /// Override streamlink path resolution (primarily for unit tests).
     var _resolveStreamlinkPathOverride: (() -> String?)?
 
-    /// Override encryption manager (primarily for unit tests).
-    var _encryptionManagerOverride: RecordingEncryptionManager?
-    private let _encryptionManager = RecordingEncryptionManager()
-    var effectiveEncryptionManager: RecordingEncryptionManager {
-        _encryptionManagerOverride ?? _encryptionManager
-    }
-
     init(recorderOrchestrator: RecorderOrchestrator? = nil) {
         self.recorderOrchestrator = recorderOrchestrator ?? RecorderOrchestrator()
         syncOrchestratorConcurrencyLimit()
         pendingRecoveryIntents = loadPersistedRecoveryIntents()
         refreshBackgroundRecordingState()
         startBackgroundRecordingMonitor()
-        _ = enforceRetentionPoliciesNow()
-        effectiveEncryptionManager.cleanupTempPlaybackFiles()
-        let activeURLs = recordingSessions.values.map(\.outputURL)
-        if let migrationResult = try? effectiveEncryptionManager.migrateUnencryptedRecordings(
-            in: recordingsDirectory(),
-            activeOutputURLs: activeURLs
-        ), migrationResult.migratedCount > 0 {
-            GlitchoTelemetry.track(
-                "recordings_migration_completed",
-                metadata: [
-                    "migrated": "\(migrationResult.migratedCount)",
-                    "skipped": "\(migrationResult.skippedCount)"
-                ]
-            )
-        }
-
-        // Evict thumbnail cache entries that have no corresponding recording in the manifest.
-        // This cleans up orphaned .thumb files left by deletions that bypassed deleteRecording(at:).
-        let manifest = (try? effectiveEncryptionManager.loadManifest(from: recordingsDirectory())) ?? [:]
-        let knownHashes = Set(manifest.keys)
-        effectiveEncryptionManager.cleanupOrphanedThumbnails(knownHashFilenames: knownHashes)
         loadScheduledRecordings()
         startScheduleMonitor()
         autoRecordLogins = loadPersistedAutoRecordLogins()
@@ -165,60 +137,17 @@ final class RecordingManager: ObservableObject {
     }
 
     func listRecordings() -> [RecordingEntry] {
-        let directory = recordingsDirectory()
+        Self.buildRecordingEntries(
+            directory: recordingsDirectory(),
+            dateFormatter: filenameDateFormatter
+        )
+    }
 
-        // Try loading encrypted manifest first.
-        if let manifest = try? effectiveEncryptionManager.loadManifest(from: directory), !manifest.isEmpty {
-            var entries = manifest.map { hashFilename, entry -> RecordingEntry in
-                let url = directory.appendingPathComponent(hashFilename)
-                return RecordingEntry(url: url, channelName: entry.channelName, recordedAt: entry.date)
-            }
-
-            // Also include any in-progress .mp4 recordings not yet encrypted.
-            if let files = try? FileManager.default.contentsOfDirectory(
-                at: directory,
-                includingPropertiesForKeys: [.isRegularFileKey],
-                options: [.skipsHiddenFiles]
-            ) {
-                for url in files {
-                    guard url.pathExtension.lowercased() == "mp4",
-                          !url.lastPathComponent.hasSuffix(".stderr.log"),
-                          !url.lastPathComponent.contains(".remux-") else { continue }
-                    let filename = url.deletingPathExtension().lastPathComponent
-                    let parts = filename.split(separator: "_")
-                    let channelName: String
-                    let recordedAt: Date?
-                    if parts.count >= 3 {
-                        channelName = parts.dropLast(2).joined(separator: "_")
-                        let dateString = "\(parts[parts.count - 2])_\(parts[parts.count - 1])"
-                        recordedAt = filenameDateFormatter.date(from: dateString)
-                    } else {
-                        channelName = filename
-                        recordedAt = nil
-                    }
-                    entries.append(RecordingEntry(url: url, channelName: channelName, recordedAt: recordedAt))
-                }
-            }
-
-            return entries.sorted { left, right in
-                let nameCompare = left.channelName.localizedCaseInsensitiveCompare(right.channelName)
-                if nameCompare != .orderedSame {
-                    return nameCompare == .orderedAscending
-                }
-                switch (left.recordedAt, right.recordedAt) {
-                case let (lhs?, rhs?):
-                    return lhs > rhs
-                case (.some, .none):
-                    return true
-                case (.none, .some):
-                    return false
-                case (.none, .none):
-                    return left.url.lastPathComponent < right.url.lastPathComponent
-                }
-            }
-        }
-
-        // Fallback: scan for unencrypted .mp4 files (pre-migration state).
+    /// Pure helper that builds the recording entry list from .mp4 files on disk.
+    private static func buildRecordingEntries(
+        directory: URL,
+        dateFormatter: DateFormatter
+    ) -> [RecordingEntry] {
         guard let urls = try? FileManager.default.contentsOfDirectory(
             at: directory,
             includingPropertiesForKeys: [.isRegularFileKey],
@@ -236,11 +165,15 @@ final class RecordingManager: ObservableObject {
             }
             let channelName = parts.dropLast(2).joined(separator: "_")
             let dateString = "\(parts[parts.count - 2])_\(parts[parts.count - 1])"
-            let recordedAt = filenameDateFormatter.date(from: dateString)
+            let recordedAt = dateFormatter.date(from: dateString)
             return RecordingEntry(url: url, channelName: channelName, recordedAt: recordedAt)
         }
 
-        return recordings.sorted { left, right in
+        return sortEntries(recordings)
+    }
+
+    private static func sortEntries(_ entries: [RecordingEntry]) -> [RecordingEntry] {
+        entries.sorted { left, right in
             let nameCompare = left.channelName.localizedCaseInsensitiveCompare(right.channelName)
             if nameCompare != .orderedSame {
                 return nameCompare == .orderedAscending
@@ -280,18 +213,6 @@ final class RecordingManager: ObservableObject {
             _ = try FileManager.default.trashItem(at: url, resultingItemURL: nil)
         } catch {
             try FileManager.default.removeItem(at: url)
-        }
-
-        // Remove from manifest and delete thumbnail sidecar after successful file removal.
-        if url.pathExtension == "glitcho" {
-            let directory = recordingsDirectory()
-            let mgr = effectiveEncryptionManager
-            if var manifest = try? mgr.loadManifest(from: directory) {
-                manifest.removeValue(forKey: url.lastPathComponent)
-                try? mgr.saveManifest(manifest, to: directory)
-            }
-            let thumbURL = RecordingEncryptionManager.thumbnailURL(for: url.lastPathComponent)
-            try? FileManager.default.removeItem(at: thumbURL)
         }
     }
     func toggleRecording(target: String, channelName: String?, quality: String = "best") {
@@ -489,11 +410,6 @@ final class RecordingManager: ObservableObject {
                     }
                     Task {
                         _ = try? await self.prepareRecordingForPlayback(at: session.outputURL)
-                        self.encryptCompletedRecording(
-                            at: session.outputURL,
-                            channelName: session.channelName,
-                            quality: session.quality
-                        )
                     }
                 }
 
@@ -610,30 +526,6 @@ final class RecordingManager: ObservableObject {
 
     func streamlinkPathForBackgroundAgent() -> String? {
         resolveStreamlinkPath()
-    }
-
-    private func encryptCompletedRecording(at url: URL, channelName: String?, quality: String) {
-        let directory = recordingsDirectory()
-        let mgr = effectiveEncryptionManager
-
-        guard FileManager.default.fileExists(atPath: url.path) else { return }
-
-        // Run encryption on a background thread — loading + AES-encrypting a full video
-        // on the main actor would freeze the UI for seconds.
-        Task.detached(priority: .background) {
-            do {
-                let result = try mgr.encryptFile(
-                    at: url,
-                    in: directory,
-                    channelName: channelName,
-                    quality: quality
-                )
-                try mgr.upsertManifestEntry(result.entry, hashFilename: result.hashFilename, in: directory)
-                NotificationCenter.default.post(name: .recordingLibraryDidChange, object: nil)
-            } catch {
-                // If encryption fails, the original MP4 is preserved.
-            }
-        }
     }
 
     private func stopRecording(forKey key: String) {
@@ -917,6 +809,10 @@ final class RecordingManager: ObservableObject {
     }
 
     func enforceRetentionPoliciesNow() -> RetentionResult {
+        enforceRetentionPolicies(on: listRecordings())
+    }
+
+    func enforceRetentionPolicies(on entries: [RecordingEntry]) -> RetentionResult {
         let maxAgeDays = retentionMaxAgeDays()
         let keepGlobal = retentionKeepLastGlobal()
         let keepPerChannel = retentionKeepLastPerChannel()
@@ -925,7 +821,6 @@ final class RecordingManager: ObservableObject {
             return RetentionResult(deletedCount: 0, failedCount: 0)
         }
 
-        let entries = listRecordings()
         guard !entries.isEmpty else {
             return RetentionResult(deletedCount: 0, failedCount: 0)
         }
@@ -1106,9 +1001,7 @@ final class RecordingManager: ObservableObject {
         let pathExt = url.pathExtension.lowercased()
         guard pathExt == "mp4" else { return (url, false) }
 
-        // If the file already looks like a transport stream, remux it.
-        guard isTransportStreamFile(at: url) else { return (url, false) }
-
+        // Resolve main-actor-bound state up front (fast, no disk I/O).
         guard let ffmpegPath = resolveFFmpegPath() else {
             throw NSError(
                 domain: "RecordingError",
@@ -1116,60 +1009,38 @@ final class RecordingManager: ObservableObject {
                 userInfo: [NSLocalizedDescriptionKey: "FFmpeg was not found. Set it in Settings → Recording, or install ffmpeg (e.g. via Homebrew)."]
             )
         }
-
         let tempURL = uniqueTemporaryMP4URL(for: url)
-        do {
-            _ = try await runProcess(
-                executable: ffmpegPath,
-                arguments: [
-                    "-y",
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-i",
-                    url.path,
-                    "-c",
-                    "copy",
-                    "-movflags",
-                    "+faststart",
-                    "-bsf:a",
-                    "aac_adtstoasc",
-                    tempURL.path
-                ]
-            )
 
-            // Atomically replace the original file with the remuxed MP4.
-            _ = try FileManager.default.replaceItemAt(url, withItemAt: tempURL, backupItemName: nil, options: [])
-            return (url, true)
-        } catch {
-            // Best-effort cleanup.
-            try? FileManager.default.removeItem(at: tempURL)
-            throw error
-        }
+        // Awaiting a nonisolated async function from @MainActor suspends the main actor and
+        // runs the callee on the cooperative thread pool — no Task.detached needed and no
+        // self-capture that could trigger an unexpected hop back to main actor.
+        let didRemux = try await _remuxIfNeeded(url: url, ffmpegPath: ffmpegPath, tempURL: tempURL)
+        return (url, didRemux)
     }
 
-    /// Remuxes an MPEG-TS-in-MP4 file to a fresh temp file suitable for thumbnail extraction.
-    /// Returns the temp URL on success (caller is responsible for deletion), or nil if
-    /// remux was not needed or failed — in which case the original URL should be used.
-    func remuxForThumbnail(at url: URL) async -> URL? {
-        guard url.pathExtension.lowercased() == "mp4",
-              isTransportStreamFile(at: url),
-              let ffmpegPath = resolveFFmpegPath() else { return nil }
-        let tempURL = effectiveEncryptionManager.tempPlaybackURL()
+    /// Nonisolated async helper that runs file inspection and ffmpeg entirely on the
+    /// cooperative thread pool. Called via `await` from the @MainActor function above,
+    /// which is the correct way to hop off the main actor without Task.detached.
+    nonisolated private func _remuxIfNeeded(url: URL, ffmpegPath: String, tempURL: URL) async throws -> Bool {
+        let isTS = isTransportStreamFile(at: url)
+        guard isTS else { return false }
         do {
             _ = try await runProcess(
                 executable: ffmpegPath,
                 arguments: [
                     "-y", "-hide_banner", "-loglevel", "error",
                     "-i", url.path,
-                    "-c", "copy", "-movflags", "+faststart", "-bsf:a", "aac_adtstoasc",
+                    "-c", "copy",
+                    "-movflags", "+faststart",
+                    "-bsf:a", "aac_adtstoasc",
                     tempURL.path
                 ]
             )
-            return tempURL
+            _ = try FileManager.default.replaceItemAt(url, withItemAt: tempURL, backupItemName: nil, options: [])
+            return true
         } catch {
             try? FileManager.default.removeItem(at: tempURL)
-            return nil
+            throw error
         }
     }
 
@@ -1189,7 +1060,7 @@ final class RecordingManager: ObservableObject {
         return Glitcho.resolveExecutable(named: "ffmpeg")
     }
 
-    func isTransportStreamFile(at url: URL) -> Bool {
+    nonisolated func isTransportStreamFile(at url: URL) -> Bool {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
         defer { try? handle.close() }
 
@@ -1210,7 +1081,7 @@ final class RecordingManager: ObservableObject {
         return true
     }
 
-    private func uniqueTemporaryMP4URL(for url: URL) -> URL {
+    nonisolated private func uniqueTemporaryMP4URL(for url: URL) -> URL {
         let directory = url.deletingLastPathComponent()
         let base = url.deletingPathExtension().lastPathComponent
         let name = "\(base).remux-\(UUID().uuidString).mp4"
@@ -1628,7 +1499,7 @@ final class RecordingManager: ObservableObject {
         }
     }
 
-    func runProcess(
+    nonisolated func runProcess(
         executable: String,
         arguments: [String],
         environment: [String: String] = [:]

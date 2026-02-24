@@ -663,7 +663,7 @@ private final class MotionInterpolationMetalView: NSView, MTKViewDelegate {
         self.imageOptimizeEnabled = imageOptimizeEnabled
         self.imageOptimizationConfiguration = imageOptimizationConfiguration.clamped
         stateLock.unlock()
-        metalView.preferredFramesPerSecond = max(60, min(maxRefreshRate, 120))
+        metalView.preferredFramesPerSecond = 60
         attachOutputIfNeeded(force: false)
     }
 
@@ -677,6 +677,7 @@ private final class MotionInterpolationMetalView: NSView, MTKViewDelegate {
 
         isEnabled = enabled
         metalView.isPaused = !enabled
+        metalView.preferredFramesPerSecond = 60
         if enabled {
             attachOutputIfNeeded(force: true)
         } else {

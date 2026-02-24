@@ -74,6 +74,8 @@ struct RecordingsLibraryView: View {
     @State private var videoZoom: CGFloat = 1.0
     @State private var videoPan: CGSize = .zero
     @AppStorage("motionSmoothening120Enabled") private var motionSmoothening120Enabled = false
+    @AppStorage("motionSmoothening.showFPSOverlay") private var showFPSOverlay = true
+    @AppStorage("video.show4KOverlay") private var show4KOverlay = true
     @AppStorage("video.upscaler4kEnabled") private var videoUpscaler4KEnabled = false
     @AppStorage("video.imageOptimizeEnabled") private var videoImageOptimizeEnabled = false
     @AppStorage("video.aspectCropMode") private var videoAspectModeRaw = VideoAspectCropMode.source.rawValue
@@ -159,12 +161,9 @@ struct RecordingsLibraryView: View {
 
             playerDetailView
         }
-        .onAppear {
+        .task {
             refreshRecordings()
             refreshMotionCapability()
-            refreshDiskUsage()
-        }
-        .task {
             refreshDiskUsage()
         }
         .onReceive(NotificationCenter.default.publisher(for: .recordingLibraryDidChange)) { _ in
@@ -359,19 +358,9 @@ struct RecordingsLibraryView: View {
         guard panel.runModal() == .OK, let destinationDir = panel.url else { return }
 
         // Determine original filename.
-        let baseFilename: String
-        if let recording = selectedRecording, recording.url.pathExtension == "glitcho" {
-            let dir = recordingManager.recordingsDirectory()
-            let manifest = (try? recordingManager.effectiveEncryptionManager.loadManifest(from: dir)) ?? [:]
-            let original = manifest[recording.url.lastPathComponent]?.originalFilename ?? "\(recording.channelName).mp4"
-            let stem = (original as NSString).deletingPathExtension
-            let ext = (original as NSString).pathExtension
-            baseFilename = "\(stem)_clip.\(ext.isEmpty ? "mp4" : ext)"
-        } else {
-            let stem = (sourceURL.lastPathComponent as NSString).deletingPathExtension
-            let ext = sourceURL.pathExtension
-            baseFilename = "\(stem)_clip.\(ext.isEmpty ? "mp4" : ext)"
-        }
+        let stem = (sourceURL.lastPathComponent as NSString).deletingPathExtension
+        let ext = sourceURL.pathExtension
+        let baseFilename = "\(stem)_clip.\(ext.isEmpty ? "mp4" : ext)"
 
         let outputURL = destinationDir.appendingPathComponent(baseFilename)
         let startSecs = clipStartSeconds
@@ -384,13 +373,16 @@ struct RecordingsLibraryView: View {
                     throw NSError(domain: "ClipExport", code: 1,
                                   userInfo: [NSLocalizedDescriptionKey: "ffmpeg not found. Install via Homebrew or set its path in Settings."])
                 }
+
+                let ffmpegInputURL = sourceURL
+
                 let process = Process()
                 process.executableURL = URL(fileURLWithPath: ffmpeg)
                 process.arguments = [
                     "-y",
                     "-ss", "\(startSecs)",
                     "-to", "\(endSecs)",
-                    "-i", sourceURL.path,
+                    "-i", ffmpegInputURL.path,
                     "-c", "copy",
                     outputURL.path
                 ]
@@ -735,11 +727,9 @@ struct RecordingsLibraryView: View {
                             onPlaybackTimeUpdate: { seconds in
                                 currentPlayerSeconds = seconds
                                 if let recordingURL = selectedRecording?.url {
-                                    // Check if near end via the resolved playback URL's asset duration.
                                     let asset = AVURLAsset(url: playbackURL)
                                     let duration = asset.duration.seconds
                                     if duration.isFinite && duration > 0 && (duration - seconds) < 10 {
-                                        // Within 10 seconds of end — clear saved position so next play starts fresh.
                                         clearPlaybackPosition(for: recordingURL)
                                     } else {
                                         savePlaybackPosition(seconds, for: recordingURL)
@@ -749,13 +739,13 @@ struct RecordingsLibraryView: View {
                         )
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-                        if isMotionSmootheningActive || isUpscaler4KActive {
+                        if (isMotionSmootheningActive && showFPSOverlay) || (isUpscaler4KActive && show4KOverlay) {
                             VStack {
                                 HStack(spacing: 8) {
-                                    if isMotionSmootheningActive, let status = motionRuntimeStatus {
+                                    if isMotionSmootheningActive && showFPSOverlay, let status = motionRuntimeStatus {
                                         recordingMotionFPSBadge(status)
                                     }
-                                    if isUpscaler4KActive {
+                                    if isUpscaler4KActive && show4KOverlay {
                                         recordingUpscaler4KBadge
                                     }
                                     Spacer()
@@ -1330,7 +1320,7 @@ struct RecordingsLibraryView: View {
             var total: Int64 = 0
             if let enumerator = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: [.fileSizeKey], options: [.skipsHiddenFiles]) {
                 for case let fileURL as URL in enumerator {
-                    if fileURL.pathExtension == "glitcho" {
+                    if fileURL.pathExtension.lowercased() == "mp4" {
                         if let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
                            let size = attrs[.size] as? Int64 {
                             total += size
@@ -1340,8 +1330,8 @@ struct RecordingsLibraryView: View {
             }
             await MainActor.run {
                 totalDiskUsageBytes = total
-                // Also warm the file size cache for Feature 2 sorting.
-                for entry in recordings where entry.url.pathExtension == "glitcho" {
+                // Warm the file size cache for sorting.
+                for entry in recordings {
                     if let attrs = try? FileManager.default.attributesOfItem(atPath: entry.url.path),
                        let size = attrs[.size] as? Int64 {
                         fileSizeCache[entry.url] = size
@@ -1372,9 +1362,10 @@ struct RecordingsLibraryView: View {
         if selectionChanged {
             playbackURL = nil
             playbackError = nil
+            isPreparingPlayback = false
         }
 
-        if playbackURL == nil, selectedRecording != nil {
+        if playbackURL == nil, selectedRecording != nil, !isPreparingPlayback {
             prepareSelectedRecording()
         }
     }
@@ -1470,32 +1461,13 @@ struct RecordingsLibraryView: View {
             var failures: [String] = []
 
             for (index, entry) in selectedEntries.enumerated() {
-                let originalFilename: String
-                if entry.url.pathExtension == "glitcho" {
-                    let dir = recordingManager.recordingsDirectory()
-                    let manifest = (try? recordingManager.effectiveEncryptionManager.loadManifest(from: dir)) ?? [:]
-                    originalFilename = manifest[entry.url.lastPathComponent]?.originalFilename ?? "\(entry.channelName).mp4"
-                } else {
-                    originalFilename = entry.url.lastPathComponent
-                }
-
+                let originalFilename = entry.url.lastPathComponent
                 let destination = destinationDir.appendingPathComponent(originalFilename)
                 do {
                     if FileManager.default.fileExists(atPath: destination.path) {
                         try FileManager.default.removeItem(at: destination)
                     }
-
-                    if entry.url.pathExtension == "glitcho" {
-                        let mgr = recordingManager.effectiveEncryptionManager
-                        let sourceName = entry.url.lastPathComponent
-                        let sourceDir = recordingManager.recordingsDirectory()
-                        // Decrypt off the main actor so large files don't freeze the UI.
-                        try await Task.detached(priority: .userInitiated) {
-                            try mgr.decryptFile(named: sourceName, in: sourceDir, to: destination)
-                        }.value
-                    } else {
-                        try FileManager.default.copyItem(at: entry.url, to: destination)
-                    }
+                    try FileManager.default.copyItem(at: entry.url, to: destination)
                     exported += 1
                 } catch {
                     failures.append("\(originalFilename): \(error.localizedDescription)")
@@ -1583,37 +1555,30 @@ struct RecordingsLibraryView: View {
         videoPan = .zero
         motionRuntimeStatus = nil
 
+        // .mp4 path — may require a one-time remux for Transport Stream files.
         Task {
             do {
-                if url.pathExtension == "glitcho" {
-                    let mgr = recordingManager.effectiveEncryptionManager
-                    let directory = recordingManager.recordingsDirectory()
-                    // Decrypting a full video on the main actor blocks the UI — use a detached task.
-                    let tempURL = try await Task.detached(priority: .userInitiated) {
-                        let tmp = mgr.tempPlaybackURL()
-                        try mgr.decryptFile(named: url.lastPathComponent, in: directory, to: tmp)
-                        return tmp
-                    }.value
-                    let result = try await recordingManager.prepareRecordingForPlayback(at: tempURL)
-                    if self.selectedRecording?.url != selected.url { return }
-                    seekOnLoadSeconds = savedPlaybackPosition(for: url)
-                    playbackURL = result.url
+                let result = try await recordingManager.prepareRecordingForPlayback(at: url)
+                if self.selectedRecording?.url != url {
                     isPreparingPlayback = false
-                    isPlaying = true
-                } else {
-                    let result = try await recordingManager.prepareRecordingForPlayback(at: url)
-                    if self.selectedRecording?.url != url { return }
-                    if result.didRemux {
-                        thumbnailRefreshToken = UUID()
-                        refreshRecordings()
-                    }
-                    seekOnLoadSeconds = savedPlaybackPosition(for: url)
-                    playbackURL = result.url
-                    isPreparingPlayback = false
-                    isPlaying = true
+                    return
                 }
+                if result.didRemux {
+                    thumbnailRefreshToken = UUID()
+                    // Trigger an async library refresh instead of calling refreshRecordings()
+                    // synchronously — the synchronous call would block the main actor with
+                    // manifest I/O and could also start a second prepareSelectedRecording().
+                    NotificationCenter.default.post(name: .recordingLibraryDidChange, object: nil)
+                }
+                seekOnLoadSeconds = savedPlaybackPosition(for: url)
+                playbackURL = result.url
+                isPreparingPlayback = false
+                isPlaying = true
             } catch {
-                if self.selectedRecording?.url != selected.url { return }
+                if self.selectedRecording?.url != selected.url {
+                    isPreparingPlayback = false
+                    return
+                }
                 playbackURL = nil
                 playbackError = error.localizedDescription
                 isPreparingPlayback = false
@@ -1932,92 +1897,13 @@ final class RecordingThumbnailLoader: ObservableObject {
     @Published var image: NSImage?
     @Published var isLoading = true
     private let url: URL
-    private let recordingManager: RecordingManager?
-
-    // Serial queue — ensures at most one decrypt+remux+generate runs at a time,
-    // preventing peak memory from multiplying across all simultaneously visible thumbnails.
-    private static let decryptQueue = DispatchQueue(
-        label: "com.glitcho.thumbnail-decrypt",
-        qos: .userInitiated
-    )
 
     init(url: URL, recordingManager: RecordingManager? = nil) {
         self.url = url
-        self.recordingManager = recordingManager
         loadThumbnail()
     }
 
     private func loadThumbnail() {
-        if url.pathExtension == "glitcho" {
-            let hashFilename = url.lastPathComponent
-            let thumbURL = RecordingEncryptionManager.thumbnailURL(for: hashFilename)
-
-            if FileManager.default.fileExists(atPath: thumbURL.path) {
-                // Cache hit — load directly.
-                DispatchQueue.global(qos: .userInitiated).async {
-                    let nsImage = NSImage(contentsOf: thumbURL)
-                    DispatchQueue.main.async {
-                        self.image = nsImage
-                        self.isLoading = false
-                    }
-                }
-            } else if let rm = recordingManager {
-                // Cache miss — decrypt (serialized), remux if needed, extract frame with retry.
-                let directory = url.deletingLastPathComponent()
-                Task {
-                    let mgr = await MainActor.run { rm.effectiveEncryptionManager }
-
-                    // Serialize decryption so multiple thumbnails don't overwhelm RAM.
-                    let tempURL = mgr.tempPlaybackURL()
-                    let decryptOK: Bool = await withCheckedContinuation { continuation in
-                        Self.decryptQueue.async {
-                            let ok = (try? mgr.decryptFile(named: hashFilename, in: directory, to: tempURL)) != nil
-                            continuation.resume(returning: ok)
-                        }
-                    }
-                    guard decryptOK else {
-                        try? FileManager.default.removeItem(at: tempURL)
-                        await MainActor.run { self.isLoading = false }
-                        return
-                    }
-
-                    // Remux MPEG-TS-in-MP4 to a separate temp file so AVAssetImageGenerator can read it.
-                    let remuxTempURL: URL? = await rm.remuxForThumbnail(at: tempURL)
-                    let videoURL = remuxTempURL ?? tempURL
-
-                    // Retry thumbnail generation up to 3× — first attempt may fail on
-                    // partially-written or still-remuxing files.
-                    var nsImage: NSImage?
-                    for attempt in 1...3 {
-                        await Task.detached(priority: .userInitiated) {
-                            mgr.generateThumbnailSidecar(for: videoURL, hashFilename: hashFilename)
-                        }.value
-                        if FileManager.default.fileExists(atPath: thumbURL.path) {
-                            nsImage = NSImage(contentsOf: thumbURL)
-                            break
-                        }
-                        if attempt < 3 {
-                            try? await Task.sleep(nanoseconds: 500_000_000)
-                        }
-                    }
-
-                    // Cleanup temp files before publishing result.
-                    try? FileManager.default.removeItem(at: tempURL)
-                    if let r = remuxTempURL { try? FileManager.default.removeItem(at: r) }
-
-                    let finalImage = nsImage
-                    await MainActor.run {
-                        self.image = finalImage
-                        self.isLoading = false
-                    }
-                }
-            } else {
-                // No manager available — show placeholder immediately.
-                isLoading = false
-            }
-            return
-        }
-
         let asset = AVAsset(url: url)
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
@@ -2039,11 +1925,7 @@ final class RecordingPreviewController: ObservableObject {
     let player: AVPlayer
 
     init(url: URL) {
-        if url.pathExtension == "glitcho" {
-            player = AVPlayer()
-        } else {
-            player = AVPlayer(url: url)
-        }
+        player = AVPlayer(url: url)
         player.isMuted = true
         player.actionAtItemEnd = .pause
     }

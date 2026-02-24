@@ -9,6 +9,7 @@ final class PictureInPictureController: NSObject, ObservableObject, AVPictureInP
     private var pipController: AVPictureInPictureController?
 
     func attach(_ view: AVPlayerView) {
+        guard playerView !== view else { return }
         playerView = view
         configure(view)
     }
@@ -16,8 +17,12 @@ final class PictureInPictureController: NSObject, ObservableObject, AVPictureInP
     func detach(_ view: AVPlayerView) {
         guard playerView === view else { return }
         playerView = nil
-        isAvailable = false
         pipController = nil
+        if isAvailable {
+            DispatchQueue.main.async { [weak self] in
+                self?.isAvailable = false
+            }
+        }
     }
 
     func toggle() {
@@ -61,7 +66,14 @@ final class PictureInPictureController: NSObject, ObservableObject, AVPictureInP
             }
             available = true
         }
-        isAvailable = available
+        // Defer @Published mutation — this method runs from makeNSView/updateNSView
+        // during SwiftUI view evaluation; publishing synchronously causes an infinite
+        // re-render loop.
+        if isAvailable != available {
+            DispatchQueue.main.async { [weak self] in
+                self?.isAvailable = available
+            }
+        }
     }
 }
 
