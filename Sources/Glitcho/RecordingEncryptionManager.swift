@@ -15,6 +15,7 @@ struct RecordingManifestEntry: Codable, Equatable {
 final class RecordingEncryptionManager {
     private static let keychainService = "com.glitcho.recording-encryption"
     private static let keychainAccount = "master-key"
+    private static var cachedKey: SymmetricKey?
 
     /// Serializes all manifest reads and writes to prevent a read-modify-write race
     /// when two recordings finish concurrently.
@@ -27,16 +28,19 @@ final class RecordingEncryptionManager {
 
     func encryptionKey() -> SymmetricKey {
         if let override = _keyOverride { return override }
+        if let cached = Self.cachedKey { return cached }
 
         // Try loading from Keychain.
         if let stored = KeychainHelper.get(
             service: Self.keychainService,
             account: Self.keychainAccount,
-            allowUserInteraction: false
+            allowUserInteraction: true
         ),
            let data = Data(base64Encoded: stored),
            data.count == 32 {
-            return SymmetricKey(data: data)
+            let key = SymmetricKey(data: data)
+            Self.cachedKey = key
+            return key
         }
 
         // Generate and persist a new key.
@@ -50,6 +54,7 @@ final class RecordingEncryptionManager {
         if !persisted {
             GlitchoTelemetry.track("encryption_key_persist_failed")
         }
+        Self.cachedKey = key
         return key
     }
 

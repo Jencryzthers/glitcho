@@ -51,6 +51,8 @@ enum RecordingSort: String, CaseIterable {
 
 struct RecordingsLibraryView: View {
     @ObservedObject var recordingManager: RecordingManager
+    var protectedChannelLogins: Set<String> = []
+    var showProtectedRecordings = true
     @StateObject private var pipController = PictureInPictureController()
     @State private var recordings: [RecordingEntry] = []
     @State private var selectedRecording: RecordingEntry?
@@ -169,6 +171,12 @@ struct RecordingsLibraryView: View {
         .onReceive(NotificationCenter.default.publisher(for: .recordingLibraryDidChange)) { _ in
             refreshRecordings()
             thumbnailRefreshToken = UUID()
+        }
+        .onChange(of: protectedChannelLogins) { _ in
+            refreshRecordings()
+        }
+        .onChange(of: showProtectedRecordings) { _ in
+            refreshRecordings()
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification)) { _ in
             refreshMotionCapability()
@@ -346,7 +354,8 @@ struct RecordingsLibraryView: View {
     }
 
     private func exportClip() {
-        guard let sourceURL = playbackURL else { return }
+        guard let sourceURL = playbackURL,
+              let selected = selectedRecording else { return }
 
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
@@ -357,9 +366,10 @@ struct RecordingsLibraryView: View {
 
         guard panel.runModal() == .OK, let destinationDir = panel.url else { return }
 
-        // Determine original filename.
-        let stem = (sourceURL.lastPathComponent as NSString).deletingPathExtension
-        let ext = sourceURL.pathExtension
+        // Determine original filename from selected recording metadata when available.
+        let displayFilename = recordingManager.displayFilename(for: selected.url)
+        let stem = (displayFilename as NSString).deletingPathExtension
+        let ext = (displayFilename as NSString).pathExtension.isEmpty ? sourceURL.pathExtension : (displayFilename as NSString).pathExtension
         let baseFilename = "\(stem)_clip.\(ext.isEmpty ? "mp4" : ext)"
 
         let outputURL = destinationDir.appendingPathComponent(baseFilename)
@@ -1345,7 +1355,7 @@ struct RecordingsLibraryView: View {
 
     private func refreshRecordings() {
         let previousURL = selectedRecording?.url
-        recordings = recordingManager.listRecordings()
+        recordings = recordingManager.listRecordings().filter(isRecordingVisible)
         let liveURLs = Set(recordings.map(\.id))
         selectedRecordingIDs = selectedRecordingIDs.intersection(liveURLs)
         multiSelection = multiSelection.intersection(liveURLs)
@@ -1368,6 +1378,13 @@ struct RecordingsLibraryView: View {
         if playbackURL == nil, selectedRecording != nil, !isPreparingPlayback {
             prepareSelectedRecording()
         }
+    }
+
+    private func isRecordingVisible(_ recording: RecordingEntry) -> Bool {
+        guard !showProtectedRecordings else { return true }
+        let normalized = recording.channelName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty else { return true }
+        return !protectedChannelLogins.contains(normalized)
     }
 
     private func toggleSelection(for recording: RecordingEntry) {
@@ -1461,16 +1478,12 @@ struct RecordingsLibraryView: View {
             var failures: [String] = []
 
             for (index, entry) in selectedEntries.enumerated() {
-                let originalFilename = entry.url.lastPathComponent
-                let destination = destinationDir.appendingPathComponent(originalFilename)
                 do {
-                    if FileManager.default.fileExists(atPath: destination.path) {
-                        try FileManager.default.removeItem(at: destination)
-                    }
-                    try FileManager.default.copyItem(at: entry.url, to: destination)
+                    _ = try recordingManager.exportRecording(at: entry.url, to: destinationDir)
                     exported += 1
                 } catch {
-                    failures.append("\(originalFilename): \(error.localizedDescription)")
+                    let displayName = recordingManager.displayFilename(for: entry.url)
+                    failures.append("\(displayName): \(error.localizedDescription)")
                 }
 
                 await MainActor.run {
@@ -1857,7 +1870,7 @@ struct RecordingThumbnailView: View {
 
     var body: some View {
         ZStack {
-            if isHovered {
+            if isHovered && previewController.canPreview {
                 RecordingPreviewPlayer(player: previewController.player, isPlaying: true)
                     .transition(.opacity)
             } else if let image = loader.image {
@@ -1904,6 +1917,21 @@ final class RecordingThumbnailLoader: ObservableObject {
     }
 
     private func loadThumbnail() {
+        if url.pathExtension.lowercased() == "glitcho" {
+            let thumbURL = RecordingEncryptionManager.thumbnailURL(for: url.lastPathComponent)
+            DispatchQueue.global(qos: .userInitiated).async {
+                let nsImage: NSImage? = {
+                    guard let data = try? Data(contentsOf: thumbURL) else { return nil }
+                    return NSImage(data: data)
+                }()
+                DispatchQueue.main.async {
+                    self.image = nsImage
+                    self.isLoading = false
+                }
+            }
+            return
+        }
+
         let asset = AVAsset(url: url)
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
@@ -1923,14 +1951,21 @@ final class RecordingThumbnailLoader: ObservableObject {
 
 final class RecordingPreviewController: ObservableObject {
     let player: AVPlayer
+    let canPreview: Bool
 
     init(url: URL) {
-        player = AVPlayer(url: url)
+        canPreview = url.pathExtension.lowercased() != "glitcho"
+        if canPreview {
+            player = AVPlayer(url: url)
+        } else {
+            player = AVPlayer()
+        }
         player.isMuted = true
         player.actionAtItemEnd = .pause
     }
 
     func setPlaying(_ playing: Bool) {
+        guard canPreview else { return }
         if playing {
             player.seek(to: .zero)
             player.play()

@@ -41,7 +41,6 @@ struct SettingsDetailView: View {
     @AppStorage("motionSmoothening120Enabled") private var motionSmoothening120Enabled = false
     @AppStorage("motionSmoothening.showFPSOverlay") private var showFPSOverlay = true
     @AppStorage("video.show4KOverlay") private var show4KOverlay = true
-    @AppStorage("sidebar.showSchedule") private var showScheduleSidebar = false
     @AppStorage("video.upscaler4kEnabled") private var videoUpscaler4KEnabled = false
     @AppStorage("video.imageOptimizeEnabled") private var videoImageOptimizeEnabled = false
     @AppStorage("video.aspectCropMode") private var videoAspectModeRaw = VideoAspectCropMode.source.rawValue
@@ -50,6 +49,19 @@ struct SettingsDetailView: View {
     @AppStorage("video.imageOptimize.denoiser") private var imageOptimizeDenoiser = ImageOptimizationConfiguration.productionDefault.denoiser
     @AppStorage("video.imageOptimize.neuralClarity") private var imageOptimizeNeuralClarity = ImageOptimizationConfiguration.productionDefault.neuralClarity
     @AppStorage("recentChannels.v1") private var recentChannelsData: Data = Data()
+    @AppStorage(BiometricLockSettings.enabledStorageKey) private var biometricLockEnabled = false
+    @AppStorage(BiometricLockSettings.hideRecordingsStorageKey) private var biometricLockHideRecordings = true
+    @AppStorage(BiometricLockSettings.recordingsRequireAuthOnOpenStorageKey) private var biometricLockRecordingsRequireAuthOnOpen = BiometricLockSettings.defaultRecordingsRequireAuthOnOpen
+    @AppStorage(BiometricLockSettings.hidePinnedStorageKey) private var biometricLockHidePinned = true
+    @AppStorage(BiometricLockSettings.hideRecentStorageKey) private var biometricLockHideRecent = true
+    @AppStorage(BiometricLockSettings.hidePrivacySettingsUntilAuthenticatedStorageKey) private var biometricLockHidePrivacySettingsUntilAuthenticated = BiometricLockSettings.defaultHidePrivacySettingsUntilAuthenticated
+    @AppStorage(BiometricLockSettings.protectedStreamersStorageKey) private var protectedStreamersJSON = "[]"
+    @AppStorage(BiometricLockSettings.authenticateOnSettingsOpenStorageKey) private var biometricLockAuthenticateOnSettingsOpen = false
+    @AppStorage(BiometricLockSettings.hotkeyKeyStorageKey) private var biometricLockHotkeyKey = BiometricLockSettings.defaultHotkeyKey
+    @AppStorage(BiometricLockSettings.hotkeyCommandStorageKey) private var biometricLockHotkeyCommand = BiometricLockSettings.defaultHotkeyCommand
+    @AppStorage(BiometricLockSettings.hotkeyShiftStorageKey) private var biometricLockHotkeyShift = BiometricLockSettings.defaultHotkeyShift
+    @AppStorage(BiometricLockSettings.hotkeyOptionStorageKey) private var biometricLockHotkeyOption = BiometricLockSettings.defaultHotkeyOption
+    @AppStorage(BiometricLockSettings.hotkeyControlStorageKey) private var biometricLockHotkeyControl = BiometricLockSettings.defaultHotkeyControl
     @Environment(\.notificationManager) private var notificationManager
     @Environment(\.openURL) private var openURL
     @State private var testStatus: NotificationTestStatus?
@@ -68,7 +80,6 @@ struct SettingsDetailView: View {
     @State private var blockedChannelInput = ""
     @State private var selectedChannelInputError: String?
     @State private var blockedChannelInputError: String?
-    @State private var autoRecordAllowlistInput = ""
     @State private var hasLoadedSelectedChannels = false
     @State private var hasLoadedExpandedSections = false
     @State private var showChannelSelector = false
@@ -78,6 +89,7 @@ struct SettingsDetailView: View {
     @State private var retentionRunStatus: String?
     @State private var isRunningBackgroundAction = false
     @State private var backgroundActionStatus: String?
+    var isBiometricUnlocked = true
     var onOpenTwitchSettings: (() -> Void)?
     var onActionFeedback: ((String, String) -> Void)?
 
@@ -96,6 +108,32 @@ struct SettingsDetailView: View {
 
     private var videoAspectMode: VideoAspectCropMode {
         VideoAspectCropMode(rawValue: videoAspectModeRaw) ?? .source
+    }
+
+    private var shouldShowPrivacySettingsSection: Bool {
+        if !biometricLockEnabled || !biometricLockHidePrivacySettingsUntilAuthenticated {
+            return true
+        }
+        return isBiometricUnlocked
+    }
+
+    private var protectedStreamerLogins: Set<String> {
+        guard let data = protectedStreamersJSON.data(using: .utf8),
+              let decoded = try? JSONDecoder().decode([String].self, from: data) else {
+            return []
+        }
+        return Set(decoded.map { $0.lowercased() })
+    }
+
+    private var shouldHideProtectedLoginsInSettings: Bool {
+        biometricLockEnabled && !isBiometricUnlocked
+    }
+
+    private func shouldDisplayChannelLogin(_ login: String) -> Bool {
+        if !shouldHideProtectedLoginsInSettings {
+            return true
+        }
+        return !protectedStreamerLogins.contains(login.lowercased())
     }
 
     @State private var expandedSections: Set<String> = []
@@ -215,6 +253,135 @@ struct SettingsDetailView: View {
                             )
                         }
                         .padding(.top, 4)
+                    }
+
+                    // MARK: - Privacy Lock
+                    if shouldShowPrivacySettingsSection {
+                        CollapsibleSettingsCard(
+                            id: "privacy_lock",
+                            icon: "lock.fill",
+                            iconColor: .white,
+                            iconBackgroundColor: sidebarTintBinding.wrappedValue,
+                            title: "Privacy Lock",
+                            subtitle: "Hide selected sections until authenticated",
+                            isExpanded: expandedSections.contains("privacy_lock"),
+                            onToggle: { toggleSection("privacy_lock") }
+                        ) {
+                        SettingsToggleRow(
+                            title: "Enable privacy lock",
+                            detail: "Keep selected sections hidden until biometric authentication succeeds.",
+                            isOn: $biometricLockEnabled,
+                            accentColor: sidebarTintBinding.wrappedValue
+                        )
+
+                        Divider()
+                            .padding(.vertical, 4)
+
+                        Text("HIDE IN SIDEBAR")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.45))
+                            .textCase(.uppercase)
+                            .tracking(0.5)
+
+                        SettingsToggleRow(
+                            title: "Recordings",
+                            detail: "Hide the Recordings navigation item and detail view.",
+                            isOn: $biometricLockHideRecordings,
+                            accentColor: sidebarTintBinding.wrappedValue
+                        )
+                        .disabled(!biometricLockEnabled)
+                        .opacity(biometricLockEnabled ? 1 : 0.5)
+
+                        SettingsToggleRow(
+                            title: "Require authentication to open Recordings",
+                            detail: "Keep the Recordings tab visible, but require authentication before opening it.",
+                            isOn: $biometricLockRecordingsRequireAuthOnOpen,
+                            accentColor: sidebarTintBinding.wrappedValue
+                        )
+                        .disabled(!biometricLockEnabled || biometricLockHideRecordings)
+                        .opacity((biometricLockEnabled && !biometricLockHideRecordings) ? 1 : 0.5)
+
+                        SettingsToggleRow(
+                            title: "Pinned",
+                            detail: "Hide the pinned channels section in the sidebar.",
+                            isOn: $biometricLockHidePinned,
+                            accentColor: sidebarTintBinding.wrappedValue
+                        )
+                        .disabled(!biometricLockEnabled)
+                        .opacity(biometricLockEnabled ? 1 : 0.5)
+
+                        SettingsToggleRow(
+                            title: "Recent",
+                            detail: "Hide the recent channels section in the sidebar.",
+                            isOn: $biometricLockHideRecent,
+                            accentColor: sidebarTintBinding.wrappedValue
+                        )
+                        .disabled(!biometricLockEnabled)
+                        .opacity(biometricLockEnabled ? 1 : 0.5)
+
+                        Divider()
+                            .padding(.vertical, 4)
+
+                        ProtectedStreamersEditor(
+                            accentColor: sidebarTintBinding.wrappedValue,
+                            isEnabled: biometricLockEnabled,
+                            recordingManager: recordingManager
+                        )
+
+                        SettingsToggleRow(
+                            title: "Authenticate on Settings open",
+                            detail: "Run authentication whenever Settings is opened from the sidebar.",
+                            isOn: $biometricLockAuthenticateOnSettingsOpen,
+                            accentColor: sidebarTintBinding.wrappedValue
+                        )
+                        .disabled(!biometricLockEnabled)
+                        .opacity(biometricLockEnabled ? 1 : 0.5)
+
+                        SettingsToggleRow(
+                            title: "Hide Privacy Lock in Settings when locked",
+                            detail: "Hide this Privacy Lock section until authentication succeeds.",
+                            isOn: $biometricLockHidePrivacySettingsUntilAuthenticated,
+                            accentColor: sidebarTintBinding.wrappedValue
+                        )
+                        .disabled(!biometricLockEnabled)
+                        .opacity(biometricLockEnabled ? 1 : 0.5)
+
+                        HStack(spacing: 8) {
+                            TextField("Hotkey key", text: $biometricLockHotkeyKey)
+                                .textFieldStyle(.plain)
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 6)
+                                .background(Color.white.opacity(0.08))
+                                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+
+                            Text(biometricLockHotkeyDisplay)
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(.white.opacity(0.8))
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .background(Color.white.opacity(0.08))
+                                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                        }
+                        .disabled(!biometricLockEnabled)
+                        .opacity(biometricLockEnabled ? 1 : 0.5)
+
+                        HStack(spacing: 8) {
+                            Toggle("Cmd", isOn: $biometricLockHotkeyCommand)
+                                .toggleStyle(.checkbox)
+                            Toggle("Shift", isOn: $biometricLockHotkeyShift)
+                                .toggleStyle(.checkbox)
+                            Toggle("Option", isOn: $biometricLockHotkeyOption)
+                                .toggleStyle(.checkbox)
+                            Toggle("Control", isOn: $biometricLockHotkeyControl)
+                                .toggleStyle(.checkbox)
+                        }
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.8))
+                        .disabled(!biometricLockEnabled)
+                        .opacity(biometricLockEnabled ? 1 : 0.5)
+                        }
                     }
 
                     // MARK: - Recording
@@ -434,11 +601,14 @@ struct SettingsDetailView: View {
                                             .foregroundStyle(.orange.opacity(0.85))
                                     }
 
-                                    if showChannelSelector, !store.followedChannelLogins.isEmpty {
+                                    let visibleFollowedLogins = store.followedChannelLogins
+                                        .sorted()
+                                        .filter(shouldDisplayChannelLogin)
+                                    if showChannelSelector, !visibleFollowedLogins.isEmpty {
                                         VStack(spacing: 6) {
                                             HStack {
                                                 Button("Select All Followed") {
-                                                    autoRecordSelectedChannels.formUnion(store.followedChannelLogins.map { $0.lowercased() })
+                                                    autoRecordSelectedChannels.formUnion(visibleFollowedLogins.map { $0.lowercased() })
                                                     saveSelectedChannels()
                                                 }
                                                 .font(.system(size: 10, weight: .medium))
@@ -459,7 +629,7 @@ struct SettingsDetailView: View {
 
                                             ScrollView {
                                                 VStack(spacing: 4) {
-                                                    ForEach(store.followedChannelLogins.sorted(), id: \.self) { login in
+                                                    ForEach(visibleFollowedLogins, id: \.self) { login in
                                                         HStack {
                                                             Toggle(isOn: Binding(
                                                                 get: { autoRecordSelectedChannels.contains(login) },
@@ -489,13 +659,16 @@ struct SettingsDetailView: View {
                                         }
                                     }
 
-                                    if autoRecordSelectedChannels.isEmpty {
+                                    let visibleSelectedChannels = autoRecordSelectedChannels
+                                        .sorted()
+                                        .filter(shouldDisplayChannelLogin)
+                                    if visibleSelectedChannels.isEmpty {
                                         Text("No channels selected. Add channels manually or from followed list.")
                                             .font(.system(size: 10))
                                             .foregroundStyle(.white.opacity(0.6))
                                     } else {
                                         VStack(spacing: 4) {
-                                            ForEach(autoRecordSelectedChannels.sorted(), id: \.self) { login in
+                                            ForEach(visibleSelectedChannels, id: \.self) { login in
                                                 HStack {
                                                     Text(login)
                                                         .font(.system(size: 11, weight: .medium))
@@ -571,10 +744,13 @@ struct SettingsDetailView: View {
                                             .foregroundStyle(.orange.opacity(0.85))
                                     }
 
-                                    if showBlocklistSelector, !store.followedChannelLogins.isEmpty {
+                                    let visibleFollowedLoginsForBlocklist = store.followedChannelLogins
+                                        .sorted()
+                                        .filter(shouldDisplayChannelLogin)
+                                    if showBlocklistSelector, !visibleFollowedLoginsForBlocklist.isEmpty {
                                         ScrollView {
                                             VStack(spacing: 4) {
-                                                ForEach(store.followedChannelLogins.sorted(), id: \.self) { login in
+                                                ForEach(visibleFollowedLoginsForBlocklist, id: \.self) { login in
                                                     HStack {
                                                         Toggle(isOn: Binding(
                                                             get: { autoRecordBlockedChannels.contains(login) },
@@ -603,13 +779,16 @@ struct SettingsDetailView: View {
                                         .frame(maxHeight: 140)
                                     }
 
-                                    if autoRecordBlockedChannels.isEmpty {
+                                    let visibleBlockedChannels = autoRecordBlockedChannels
+                                        .sorted()
+                                        .filter(shouldDisplayChannelLogin)
+                                    if visibleBlockedChannels.isEmpty {
                                         Text("No blocked channels.")
                                             .font(.system(size: 10))
                                             .foregroundStyle(.white.opacity(0.6))
                                     } else {
                                         VStack(spacing: 4) {
-                                            ForEach(autoRecordBlockedChannels.sorted(), id: \.self) { login in
+                                            ForEach(visibleBlockedChannels, id: \.self) { login in
                                                 HStack {
                                                     Text(login)
                                                         .font(.system(size: 11, weight: .medium))
@@ -634,74 +813,6 @@ struct SettingsDetailView: View {
                                     }
                                 }
                                 .padding(.vertical, 4)
-                            }
-
-                            Divider()
-                                .padding(.vertical, 4)
-
-                            Text("ALWAYS RECORD")
-                                .font(.system(size: 11, weight: .semibold))
-                                .foregroundStyle(.white.opacity(0.45))
-                                .textCase(.uppercase)
-                                .tracking(0.5)
-
-                            Text("These channels are always recorded when live, regardless of auto-record mode")
-                                .font(.system(size: 11))
-                                .foregroundStyle(.white.opacity(0.5))
-
-                            HStack(spacing: 8) {
-                                TextField("Add channel login", text: $autoRecordAllowlistInput)
-                                    .textFieldStyle(.plain)
-                                    .font(.system(size: 11, weight: .medium))
-                                    .foregroundStyle(.white)
-                                    .padding(.horizontal, 8)
-                                    .padding(.vertical, 6)
-                                    .background(Color.white.opacity(0.08))
-                                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-                                    .onSubmit {
-                                        let trimmed = autoRecordAllowlistInput.trimmingCharacters(in: .whitespacesAndNewlines)
-                                        guard !trimmed.isEmpty else { return }
-                                        recordingManager.addAutoRecord(login: trimmed)
-                                        autoRecordAllowlistInput = ""
-                                    }
-                                Button("Add") {
-                                    let trimmed = autoRecordAllowlistInput.trimmingCharacters(in: .whitespacesAndNewlines)
-                                    guard !trimmed.isEmpty else { return }
-                                    recordingManager.addAutoRecord(login: trimmed)
-                                    autoRecordAllowlistInput = ""
-                                }
-                                .font(.system(size: 10, weight: .semibold))
-                                .buttonStyle(.plain)
-                                .foregroundStyle(.white.opacity(0.8))
-                            }
-
-                            if recordingManager.autoRecordLogins.isEmpty {
-                                Text("No channels configured")
-                                    .font(.system(size: 10))
-                                    .foregroundStyle(.white.opacity(0.6))
-                            } else {
-                                VStack(spacing: 4) {
-                                    ForEach(recordingManager.autoRecordLogins.sorted(), id: \.self) { login in
-                                        HStack {
-                                            Text(login)
-                                                .font(.system(size: 11, weight: .medium))
-                                                .foregroundStyle(.white.opacity(0.85))
-                                            Spacer()
-                                            Button {
-                                                recordingManager.removeAutoRecord(login: login)
-                                            } label: {
-                                                Image(systemName: "xmark.circle.fill")
-                                                    .font(.system(size: 11))
-                                                    .foregroundStyle(.white.opacity(0.45))
-                                            }
-                                            .buttonStyle(.plain)
-                                        }
-                                        .padding(.horizontal, 8)
-                                        .padding(.vertical, 4)
-                                        .background(Color.white.opacity(0.03))
-                                        .clipShape(RoundedRectangle(cornerRadius: 4))
-                                    }
-                                }
                             }
 
                             Divider()
@@ -853,20 +964,6 @@ struct SettingsDetailView: View {
                                     .foregroundStyle(.white.opacity(0.5))
                             }
 
-                            Divider()
-                                .padding(.vertical, 4)
-
-                            Text("SIDEBAR")
-                                .font(.system(size: 11, weight: .semibold))
-                                .foregroundStyle(.white.opacity(0.45))
-                                .textCase(.uppercase)
-                                .tracking(0.5)
-
-                            SettingsToggleRow(
-                                title: "Show Schedule in sidebar",
-                                detail: "Display a Schedule shortcut in the sidebar navigation.",
-                                isOn: $showScheduleSidebar
-                            )
                         }
                     }
 
@@ -1040,6 +1137,7 @@ struct SettingsDetailView: View {
             loadExpandedSectionsIfNeeded()
             motionCapability = MotionSmootheningCapability.evaluate(screen: NSScreen.main)
             sanitizeProVideoEnhancementState()
+            sanitizeBiometricLockHotkey()
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification)) { _ in
             motionCapability = MotionSmootheningCapability.evaluate(screen: NSScreen.main)
@@ -1084,6 +1182,9 @@ struct SettingsDetailView: View {
         }
         .onChange(of: imageOptimizeNeuralClarity) { _ in
             trackImageOptimizeTuningChange(trigger: "neural_clarity")
+        }
+        .onChange(of: biometricLockHotkeyKey) { _ in
+            sanitizeBiometricLockHotkey()
         }
         .onChange(of: videoAspectModeRaw) { raw in
             if VideoAspectCropMode(rawValue: raw) == nil {
@@ -1172,6 +1273,23 @@ struct SettingsDetailView: View {
                 sidebarTintHex = newValue.toHex() ?? SidebarTint.defaultHex
             }
         )
+    }
+
+    private var biometricLockHotkeyDisplay: String {
+        BiometricLockSettings.hotkeyDisplay(
+            keyRaw: biometricLockHotkeyKey,
+            useCommand: biometricLockHotkeyCommand,
+            useShift: biometricLockHotkeyShift,
+            useOption: biometricLockHotkeyOption,
+            useControl: biometricLockHotkeyControl
+        )
+    }
+
+    private func sanitizeBiometricLockHotkey() {
+        let sanitized = BiometricLockSettings.normalizedHotkeyInput(biometricLockHotkeyKey)
+        if biometricLockHotkeyKey != sanitized {
+            biometricLockHotkeyKey = sanitized
+        }
     }
 
     private static let restartTimestampFormatter: DateFormatter = {
@@ -1507,6 +1625,18 @@ struct SettingsView: View {
     @AppStorage("ffmpegPath") private var ffmpegPath = ""
     @AppStorage("autoRecordOnLive") private var autoRecordOnLive = false
     @AppStorage("autoRecordPinnedOnly") private var autoRecordPinnedOnly = false
+    @AppStorage(BiometricLockSettings.enabledStorageKey) private var biometricLockEnabled = false
+    @AppStorage(BiometricLockSettings.hideRecordingsStorageKey) private var biometricLockHideRecordings = true
+    @AppStorage(BiometricLockSettings.recordingsRequireAuthOnOpenStorageKey) private var biometricLockRecordingsRequireAuthOnOpen = BiometricLockSettings.defaultRecordingsRequireAuthOnOpen
+    @AppStorage(BiometricLockSettings.hidePinnedStorageKey) private var biometricLockHidePinned = true
+    @AppStorage(BiometricLockSettings.hideRecentStorageKey) private var biometricLockHideRecent = true
+    @AppStorage(BiometricLockSettings.hidePrivacySettingsUntilAuthenticatedStorageKey) private var biometricLockHidePrivacySettingsUntilAuthenticated = BiometricLockSettings.defaultHidePrivacySettingsUntilAuthenticated
+    @AppStorage(BiometricLockSettings.authenticateOnSettingsOpenStorageKey) private var biometricLockAuthenticateOnSettingsOpen = false
+    @AppStorage(BiometricLockSettings.hotkeyKeyStorageKey) private var biometricLockHotkeyKey = BiometricLockSettings.defaultHotkeyKey
+    @AppStorage(BiometricLockSettings.hotkeyCommandStorageKey) private var biometricLockHotkeyCommand = BiometricLockSettings.defaultHotkeyCommand
+    @AppStorage(BiometricLockSettings.hotkeyShiftStorageKey) private var biometricLockHotkeyShift = BiometricLockSettings.defaultHotkeyShift
+    @AppStorage(BiometricLockSettings.hotkeyOptionStorageKey) private var biometricLockHotkeyOption = BiometricLockSettings.defaultHotkeyOption
+    @AppStorage(BiometricLockSettings.hotkeyControlStorageKey) private var biometricLockHotkeyControl = BiometricLockSettings.defaultHotkeyControl
     @Environment(\.notificationManager) private var notificationManager
     @Environment(\.dismiss) private var dismiss
     @Environment(\.openURL) private var openURL
@@ -1537,6 +1667,19 @@ struct SettingsView: View {
             ffmpegPath: $ffmpegPath,
             autoRecordOnLive: $autoRecordOnLive,
             autoRecordPinnedOnly: $autoRecordPinnedOnly,
+            biometricLockEnabled: $biometricLockEnabled,
+            biometricLockHideRecordings: $biometricLockHideRecordings,
+            biometricLockRecordingsRequireAuthOnOpen: $biometricLockRecordingsRequireAuthOnOpen,
+            biometricLockHidePinned: $biometricLockHidePinned,
+            biometricLockHideRecent: $biometricLockHideRecent,
+            biometricLockHidePrivacySettingsUntilAuthenticated: $biometricLockHidePrivacySettingsUntilAuthenticated,
+            biometricLockAuthenticateOnSettingsOpen: $biometricLockAuthenticateOnSettingsOpen,
+            biometricLockHotkeyKey: $biometricLockHotkeyKey,
+            biometricLockHotkeyCommand: $biometricLockHotkeyCommand,
+            biometricLockHotkeyShift: $biometricLockHotkeyShift,
+            biometricLockHotkeyOption: $biometricLockHotkeyOption,
+            biometricLockHotkeyControl: $biometricLockHotkeyControl,
+            isBiometricUnlocked: true,
             selectRecordingsFolder: selectRecordingsFolder,
             selectStreamlinkBinary: selectStreamlinkBinary,
             selectFFmpegBinary: selectFFmpegBinary,
@@ -1545,6 +1688,12 @@ struct SettingsView: View {
             isNotificationManagerAvailable: notificationManager != nil,
             onClose: { (onClose ?? { dismiss() })() }
         )
+        .onAppear {
+            sanitizeBiometricLockHotkey()
+        }
+        .onChange(of: biometricLockHotkeyKey) { _ in
+            sanitizeBiometricLockHotkey()
+        }
     }
 
     private func testNotification() {
@@ -1633,6 +1782,13 @@ struct SettingsView: View {
             ffmpegPath = url.path
         }
     }
+
+    private func sanitizeBiometricLockHotkey() {
+        let sanitized = BiometricLockSettings.normalizedHotkeyInput(biometricLockHotkeyKey)
+        if biometricLockHotkeyKey != sanitized {
+            biometricLockHotkeyKey = sanitized
+        }
+    }
 }
 
 enum NotificationTestStatus {
@@ -1676,6 +1832,19 @@ struct SettingsViewContent: View {
     @Binding var ffmpegPath: String
     @Binding var autoRecordOnLive: Bool
     @Binding var autoRecordPinnedOnly: Bool
+    @Binding var biometricLockEnabled: Bool
+    @Binding var biometricLockHideRecordings: Bool
+    @Binding var biometricLockRecordingsRequireAuthOnOpen: Bool
+    @Binding var biometricLockHidePinned: Bool
+    @Binding var biometricLockHideRecent: Bool
+    @Binding var biometricLockHidePrivacySettingsUntilAuthenticated: Bool
+    @Binding var biometricLockAuthenticateOnSettingsOpen: Bool
+    @Binding var biometricLockHotkeyKey: String
+    @Binding var biometricLockHotkeyCommand: Bool
+    @Binding var biometricLockHotkeyShift: Bool
+    @Binding var biometricLockHotkeyOption: Bool
+    @Binding var biometricLockHotkeyControl: Bool
+    let isBiometricUnlocked: Bool
     let selectRecordingsFolder: () -> Void
     let selectStreamlinkBinary: () -> Void
     let selectFFmpegBinary: () -> Void
@@ -1683,6 +1852,13 @@ struct SettingsViewContent: View {
     let showRecordingSettings: Bool
     let isNotificationManagerAvailable: Bool
     let onClose: () -> Void
+
+    private var shouldShowPrivacySettingsSection: Bool {
+        if !biometricLockEnabled || !biometricLockHidePrivacySettingsUntilAuthenticated {
+            return true
+        }
+        return isBiometricUnlocked
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1820,6 +1996,110 @@ struct SettingsViewContent: View {
                                 style: .secondary,
                                 action: openTwitchSettingsAction
                             )
+                        }
+                    }
+
+                    if shouldShowPrivacySettingsSection {
+                        SettingsCard(
+                            icon: "lock.fill",
+                            iconColor: .blue,
+                            title: "Privacy Lock",
+                            subtitle: "Hide selected sections until authenticated"
+                        ) {
+                        SettingsToggleRow(
+                            title: "Enable privacy lock",
+                            detail: "Keep selected sections hidden until biometric authentication succeeds.",
+                            isOn: $biometricLockEnabled
+                        )
+
+                        SettingsToggleRow(
+                            title: "Recordings",
+                            detail: "Hide the Recordings navigation item and detail view.",
+                            isOn: $biometricLockHideRecordings
+                        )
+                        .disabled(!biometricLockEnabled)
+                        .opacity(biometricLockEnabled ? 1 : 0.5)
+
+                        SettingsToggleRow(
+                            title: "Require authentication to open Recordings",
+                            detail: "Keep the Recordings tab visible, but require authentication before opening it.",
+                            isOn: $biometricLockRecordingsRequireAuthOnOpen
+                        )
+                        .disabled(!biometricLockEnabled || biometricLockHideRecordings)
+                        .opacity((biometricLockEnabled && !biometricLockHideRecordings) ? 1 : 0.5)
+
+                        SettingsToggleRow(
+                            title: "Pinned",
+                            detail: "Hide the pinned channels section in the sidebar.",
+                            isOn: $biometricLockHidePinned
+                        )
+                        .disabled(!biometricLockEnabled)
+                        .opacity(biometricLockEnabled ? 1 : 0.5)
+
+                        SettingsToggleRow(
+                            title: "Recent",
+                            detail: "Hide the recent channels section in the sidebar.",
+                            isOn: $biometricLockHideRecent
+                        )
+                        .disabled(!biometricLockEnabled)
+                        .opacity(biometricLockEnabled ? 1 : 0.5)
+
+                        ProtectedStreamersEditor(
+                            isEnabled: biometricLockEnabled,
+                            recordingManager: recordingManager
+                        )
+
+                        SettingsToggleRow(
+                            title: "Authenticate on Settings open",
+                            detail: "Run authentication whenever Settings is opened from the sidebar.",
+                            isOn: $biometricLockAuthenticateOnSettingsOpen
+                        )
+                        .disabled(!biometricLockEnabled)
+                        .opacity(biometricLockEnabled ? 1 : 0.5)
+
+                        SettingsToggleRow(
+                            title: "Hide Privacy Lock in Settings when locked",
+                            detail: "Hide this Privacy Lock section until authentication succeeds.",
+                            isOn: $biometricLockHidePrivacySettingsUntilAuthenticated
+                        )
+                        .disabled(!biometricLockEnabled)
+                        .opacity(biometricLockEnabled ? 1 : 0.5)
+
+                        HStack(spacing: 8) {
+                            TextField("Hotkey key", text: $biometricLockHotkeyKey)
+                                .textFieldStyle(.plain)
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 6)
+                                .background(Color.white.opacity(0.08))
+                                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+
+                            Text(biometricLockHotkeyDisplay)
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(.white.opacity(0.8))
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .background(Color.white.opacity(0.08))
+                                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                        }
+                        .disabled(!biometricLockEnabled)
+                        .opacity(biometricLockEnabled ? 1 : 0.5)
+
+                        HStack(spacing: 8) {
+                            Toggle("Cmd", isOn: $biometricLockHotkeyCommand)
+                                .toggleStyle(.checkbox)
+                            Toggle("Shift", isOn: $biometricLockHotkeyShift)
+                                .toggleStyle(.checkbox)
+                            Toggle("Option", isOn: $biometricLockHotkeyOption)
+                                .toggleStyle(.checkbox)
+                            Toggle("Control", isOn: $biometricLockHotkeyControl)
+                                .toggleStyle(.checkbox)
+                        }
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.8))
+                        .disabled(!biometricLockEnabled)
+                        .opacity(biometricLockEnabled ? 1 : 0.5)
                         }
                     }
 
@@ -2028,6 +2308,16 @@ struct SettingsViewContent: View {
             set: { newValue in
                 sidebarTintHex = newValue.toHex() ?? SidebarTint.defaultHex
             }
+        )
+    }
+
+    private var biometricLockHotkeyDisplay: String {
+        BiometricLockSettings.hotkeyDisplay(
+            keyRaw: biometricLockHotkeyKey,
+            useCommand: biometricLockHotkeyCommand,
+            useShift: biometricLockHotkeyShift,
+            useOption: biometricLockHotkeyOption,
+            useControl: biometricLockHotkeyControl
         )
     }
 
@@ -2286,6 +2576,195 @@ private struct SettingsTextFieldRow: View {
                 )
         }
         .padding(.vertical, 4)
+    }
+}
+
+private struct ProtectedStreamersEditor: View {
+    @AppStorage(BiometricLockSettings.protectedStreamersStorageKey) private var protectedStreamersJSON = "[]"
+    @AppStorage(BiometricLockSettings.autoProtectAllowlistedStorageKey) private var autoProtectAllowlisted = BiometricLockSettings.defaultAutoProtectAllowlisted
+    @State private var protectedStreamers: Set<String> = []
+    @State private var input = ""
+    @State private var statusMessage: String?
+    @State private var statusIsError = false
+    @State private var hasLoaded = false
+
+    var accentColor: Color = Color(hex: SidebarTint.defaultHex) ?? .purple
+    var isEnabled = true
+    var recordingManager: RecordingManager? = nil
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("PROTECTED STREAMERS")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.45))
+                .textCase(.uppercase)
+                .tracking(0.5)
+
+            Text("These channels are hidden in Recent history and Recordings until authentication succeeds.")
+                .font(.system(size: 10))
+                .foregroundStyle(.white.opacity(0.6))
+
+            HStack(spacing: 8) {
+                TextField("Streamer login or Twitch URL", text: $input)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+                    .background(Color.white.opacity(0.08))
+                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    .onSubmit { addStreamer() }
+
+                SettingsButton(
+                    title: "Add",
+                    systemImage: "plus",
+                    style: .secondary,
+                    action: addStreamer
+                )
+
+                SettingsButton(
+                    title: "Import",
+                    systemImage: "square.and.arrow.down",
+                    style: .secondary,
+                    action: importFromRecordings
+                )
+            }
+
+            if let statusMessage {
+                Text(statusMessage)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(statusIsError ? .orange.opacity(0.85) : .green.opacity(0.85))
+            }
+
+            SettingsToggleRow(
+                title: "Auto-add recording allowlist",
+                detail: "When channels are added to recording allowlist, add them to protected streamers too.",
+                isOn: $autoProtectAllowlisted,
+                accentColor: accentColor
+            )
+
+            if protectedStreamers.isEmpty {
+                Text("No protected streamers.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.white.opacity(0.6))
+            } else {
+                VStack(spacing: 4) {
+                    ForEach(protectedStreamers.sorted(), id: \.self) { login in
+                        HStack {
+                            Text(login)
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundStyle(.white.opacity(0.9))
+                            Spacer()
+                            Button {
+                                protectedStreamers.remove(login)
+                                save()
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.white.opacity(0.45))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Color.white.opacity(0.04))
+                        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    }
+                }
+            }
+        }
+        .disabled(!isEnabled)
+        .opacity(isEnabled ? 1 : 0.5)
+        .onAppear {
+            loadIfNeeded()
+        }
+    }
+
+    private func loadIfNeeded() {
+        guard !hasLoaded else { return }
+        hasLoaded = true
+        guard let data = protectedStreamersJSON.data(using: .utf8),
+              let decoded = try? JSONDecoder().decode([String].self, from: data) else {
+            protectedStreamers = []
+            return
+        }
+        protectedStreamers = Set(decoded.map { $0.lowercased() })
+    }
+
+    private func save() {
+        let array = Array(protectedStreamers).sorted()
+        guard let data = try? JSONEncoder().encode(array),
+              let json = String(data: data, encoding: .utf8) else {
+            return
+        }
+        protectedStreamersJSON = json
+    }
+
+    private func addStreamer() {
+        guard let login = normalizeLogin(input) else {
+            setStatus("Enter a valid streamer login or Twitch URL.", isError: true)
+            return
+        }
+        input = ""
+        if protectedStreamers.contains(login) {
+            setStatus("@\(login) is already protected.", isError: false)
+            return
+        }
+        protectedStreamers.insert(login)
+        save()
+        setStatus("Added @\(login) to protected streamers.", isError: false)
+    }
+
+    private func importFromRecordings() {
+        guard let recordingManager else {
+            setStatus("Recordings list is unavailable.", isError: true)
+            return
+        }
+        let imported = Set<String>(recordingManager.listRecordings().compactMap { normalizeLogin($0.channelName) })
+        guard !imported.isEmpty else {
+            setStatus("No streamer names found in current recordings.", isError: true)
+            return
+        }
+        let before = protectedStreamers.count
+        protectedStreamers.formUnion(imported)
+        let added = protectedStreamers.count - before
+        save()
+        if added > 0 {
+            setStatus("Imported \(added) streamer(s) from recordings.", isError: false)
+        } else {
+            setStatus("All streamers from recordings are already protected.", isError: false)
+        }
+    }
+
+    private func setStatus(_ message: String, isError: Bool) {
+        statusMessage = message
+        statusIsError = isError
+    }
+
+    private func normalizeLogin(_ raw: String) -> String? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        if let url = URL(string: trimmed),
+           let host = url.host?.lowercased(),
+           host.contains("twitch.tv") {
+            let parts = url.path.split(separator: "/").map(String.init)
+            if let first = parts.first, !first.isEmpty {
+                return first.lowercased()
+            }
+        }
+
+        var value = trimmed.lowercased()
+        if value.hasPrefix("@") {
+            value.removeFirst()
+        }
+        if let range = value.range(of: "twitch.tv/") {
+            value = String(value[range.upperBound...])
+        }
+        if let first = value.split(whereSeparator: { $0 == "/" || $0 == "?" || $0 == "#" }).first {
+            value = String(first)
+        }
+        return value.isEmpty ? nil : value
     }
 }
 #endif

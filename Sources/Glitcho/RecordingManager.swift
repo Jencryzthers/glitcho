@@ -32,10 +32,9 @@ final class RecordingManager: ObservableObject {
     @Published var ffmpegInstallError: String?
 
     @Published var autoStoppedRecordings: [String] = []
-    @Published var scheduledRecordings: [ScheduledRecording] = []
-    @Published var autoRecordLogins: Set<String> = []
 
     let recorderOrchestrator: RecorderOrchestrator
+    private let recordingEncryptionManager = RecordingEncryptionManager()
 
     private struct RecordingSession {
         let key: String
@@ -65,23 +64,12 @@ final class RecordingManager: ObservableObject {
         let quality: String
     }
 
-    struct ScheduledRecording: Codable, Identifiable {
-        let id: UUID
-        var channelLogin: String
-        var startDate: Date
-        var quality: String
-        var hasStarted: Bool = false
-    }
-
     private var recordingSessions: [String: RecordingSession] = [:]
     private var queuedRecordingRequestsByLogin: [String: QueuedRecordingRequest] = [:]
     private var backgroundRecordingLogins: Set<String> = []
     private var backgroundRecordingMonitor: Timer?
     private var pendingRecoveryIntents: [RecoveryIntent] = []
     private let recoveryDefaultsKey = "recordingRecoveryIntents.v1"
-    private static let scheduleKey = "scheduledRecordings.v1"
-    private static let autoRecordLoginsKey = "autoRecordLogins.v1"
-    private var scheduleTimer: Timer?
 
 
     private let filenameDateFormatter: DateFormatter = {
@@ -102,18 +90,31 @@ final class RecordingManager: ObservableObject {
         pendingRecoveryIntents = loadPersistedRecoveryIntents()
         refreshBackgroundRecordingState()
         startBackgroundRecordingMonitor()
-        loadScheduledRecordings()
-        startScheduleMonitor()
-        autoRecordLogins = loadPersistedAutoRecordLogins()
+        recordingEncryptionManager.cleanupTempPlaybackFiles()
+        schedulePlaintextMigrationIfNeeded()
     }
 
     deinit {
         backgroundRecordingMonitor?.invalidate()
-        scheduleTimer?.invalidate()
     }
 
     func consumeRecoveryIntents() -> [RecoveryIntent] {
         return pendingRecoveryIntents
+    }
+
+    private func schedulePlaintextMigrationIfNeeded() {
+        let directory = recordingsDirectory()
+        Task.detached(priority: .utility) {
+            let manager = RecordingEncryptionManager()
+            let result = try? manager.migrateUnencryptedRecordings(
+                in: directory,
+                activeOutputURLs: []
+            )
+            guard let result, result.migratedCount > 0 else { return }
+            await MainActor.run {
+                NotificationCenter.default.post(name: .recordingLibraryDidChange, object: nil)
+            }
+        }
     }
 
     func clearPendingRecoveryIntent(channelLogin: String) {
@@ -137,14 +138,25 @@ final class RecordingManager: ObservableObject {
     }
 
     func listRecordings() -> [RecordingEntry] {
-        Self.buildRecordingEntries(
-            directory: recordingsDirectory(),
+        let directory = recordingsDirectory()
+        let encrypted = encryptedRecordingEntries(in: directory)
+        let plaintext = Self.buildPlaintextRecordingEntries(
+            directory: directory,
             dateFormatter: filenameDateFormatter
         )
+        var merged: [RecordingEntry] = []
+        var seen = Set<URL>()
+        for entry in encrypted + plaintext {
+            let standardized = entry.url.standardizedFileURL
+            if seen.insert(standardized).inserted {
+                merged.append(entry)
+            }
+        }
+        return Self.sortEntries(merged)
     }
 
-    /// Pure helper that builds the recording entry list from .mp4 files on disk.
-    private static func buildRecordingEntries(
+    /// Pure helper that builds plaintext recording entry list from .mp4 files on disk.
+    private static func buildPlaintextRecordingEntries(
         directory: URL,
         dateFormatter: DateFormatter
     ) -> [RecordingEntry] {
@@ -156,7 +168,7 @@ final class RecordingManager: ObservableObject {
             return []
         }
 
-        let recordings = urls.compactMap { url -> RecordingEntry? in
+        return urls.compactMap { url -> RecordingEntry? in
             guard url.pathExtension.lowercased() == "mp4" else { return nil }
             let filename = url.deletingPathExtension().lastPathComponent
             let parts = filename.split(separator: "_")
@@ -168,8 +180,22 @@ final class RecordingManager: ObservableObject {
             let recordedAt = dateFormatter.date(from: dateString)
             return RecordingEntry(url: url, channelName: channelName, recordedAt: recordedAt)
         }
+    }
 
-        return sortEntries(recordings)
+    private func encryptedRecordingEntries(in directory: URL) -> [RecordingEntry] {
+        guard let manifest = try? recordingEncryptionManager.loadManifestSerialized(from: directory),
+              !manifest.isEmpty else {
+            return []
+        }
+        return manifest.compactMap { hashFilename, entry in
+            let url = directory.appendingPathComponent(hashFilename)
+            guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+            return RecordingEntry(
+                url: url,
+                channelName: entry.channelName,
+                recordedAt: entry.date
+            )
+        }
     }
 
     private static func sortEntries(_ entries: [RecordingEntry]) -> [RecordingEntry] {
@@ -208,12 +234,78 @@ final class RecordingManager: ObservableObject {
             )
         }
 
+        let isEncryptedRecording = url.pathExtension.lowercased() == "glitcho"
+        let encryptedHashFilename = isEncryptedRecording ? url.lastPathComponent : nil
+
         // Prefer moving to Trash to avoid accidental data loss.
         do {
             _ = try FileManager.default.trashItem(at: url, resultingItemURL: nil)
         } catch {
             try FileManager.default.removeItem(at: url)
         }
+
+        if let encryptedHashFilename {
+            try removeEncryptedRecordingFromManifest(hashFilename: encryptedHashFilename)
+            recordingEncryptionManager.cleanupOrphanedThumbnails(
+                knownHashFilenames: currentEncryptedHashFilenames(in: recordingsDirectory())
+            )
+        }
+    }
+
+    private func removeEncryptedRecordingFromManifest(hashFilename: String) throws {
+        let directory = recordingsDirectory()
+        var manifest = try recordingEncryptionManager.loadManifestSerialized(from: directory)
+        if manifest.removeValue(forKey: hashFilename) != nil {
+            try recordingEncryptionManager.saveManifestSerialized(manifest, to: directory)
+        }
+    }
+
+    private func currentEncryptedHashFilenames(in directory: URL) -> Set<String> {
+        guard let manifest = try? recordingEncryptionManager.loadManifestSerialized(from: directory) else {
+            return []
+        }
+        return Set(manifest.keys)
+    }
+
+    func displayFilename(for recordingURL: URL) -> String {
+        if recordingURL.pathExtension.lowercased() == "glitcho",
+           let manifest = try? recordingEncryptionManager.loadManifestSerialized(from: recordingsDirectory()),
+           let entry = manifest[recordingURL.lastPathComponent] {
+            return entry.originalFilename
+        }
+        return recordingURL.lastPathComponent
+    }
+
+    @discardableResult
+    func exportRecording(at sourceURL: URL, to destinationDir: URL) throws -> URL {
+        if sourceURL.pathExtension.lowercased() == "glitcho" {
+            let directory = recordingsDirectory()
+            let manifest = try recordingEncryptionManager.loadManifestSerialized(from: directory)
+            guard let entry = manifest[sourceURL.lastPathComponent] else {
+                throw NSError(
+                    domain: "RecordingError",
+                    code: 12,
+                    userInfo: [NSLocalizedDescriptionKey: "Encrypted recording metadata is missing."]
+                )
+            }
+            let destination = destinationDir.appendingPathComponent(entry.originalFilename)
+            if FileManager.default.fileExists(atPath: destination.path) {
+                try FileManager.default.removeItem(at: destination)
+            }
+            try recordingEncryptionManager.decryptFile(
+                named: sourceURL.lastPathComponent,
+                in: directory,
+                to: destination
+            )
+            return destination
+        }
+
+        let destination = destinationDir.appendingPathComponent(sourceURL.lastPathComponent)
+        if FileManager.default.fileExists(atPath: destination.path) {
+            try FileManager.default.removeItem(at: destination)
+        }
+        try FileManager.default.copyItem(at: sourceURL, to: destination)
+        return destination
     }
     func toggleRecording(target: String, channelName: String?, quality: String = "best") {
         let resolvedChannelLogin = channelLogin(from: target)
@@ -408,9 +500,7 @@ final class RecordingManager: ObservableObject {
                             body: "\(displayForNotif) (\(durationStr))"
                         )
                     }
-                    Task {
-                        _ = try? await self.prepareRecordingForPlayback(at: session.outputURL)
-                    }
+                    await self.secureRecordedOutputIfNeeded(session: session)
                 }
 
                 _ = self.enforceRetentionPoliciesNow()
@@ -461,6 +551,38 @@ final class RecordingManager: ObservableObject {
                 ]
             )
             return false
+        }
+    }
+
+    private func secureRecordedOutputIfNeeded(session: RecordingSession) async {
+        do {
+            let prepared = try await prepareRecordingForPlayback(at: session.outputURL)
+            let outputURL = prepared.url
+            guard outputURL.pathExtension.lowercased() == "mp4" else { return }
+
+            let directory = recordingsDirectory()
+            let encrypted = try recordingEncryptionManager.encryptFile(
+                at: outputURL,
+                in: directory,
+                channelName: session.channelName,
+                quality: session.quality,
+                date: session.startedAt
+            )
+            try recordingEncryptionManager.upsertManifestEntry(
+                encrypted.entry,
+                hashFilename: encrypted.hashFilename,
+                in: directory
+            )
+            NotificationCenter.default.post(name: .recordingLibraryDidChange, object: nil)
+        } catch {
+            errorMessage = "Could not secure recording: \(error.localizedDescription)"
+            GlitchoTelemetry.track(
+                "recording_secure_finalize_failed",
+                metadata: [
+                    "login": session.login ?? "unknown",
+                    "error": error.localizedDescription
+                ]
+            )
         }
     }
 
@@ -542,79 +664,6 @@ final class RecordingManager: ObservableObject {
         session.process.terminate()
     }
 
-    // MARK: - Auto-Record Allowlist
-
-    func addAutoRecord(login: String) {
-        guard let normalized = normalizedChannelLogin(login) else { return }
-        autoRecordLogins.insert(normalized)
-        persistAutoRecordLogins()
-    }
-
-    func removeAutoRecord(login: String) {
-        guard let normalized = normalizedChannelLogin(login) else { return }
-        autoRecordLogins.remove(normalized)
-        persistAutoRecordLogins()
-    }
-
-    func isAutoRecord(login: String) -> Bool {
-        guard let normalized = normalizedChannelLogin(login) else { return false }
-        return autoRecordLogins.contains(normalized)
-    }
-
-    /// Called when the set of live channel logins changes. Starts recording for any
-    /// allowlisted channels that are live but not already recording and not in the
-    /// recording blocklist.
-    ///
-    /// This is System B's per-channel allowlist trigger. It only activates when System A's
-    /// global auto-record toggle (autoRecordOnLive) is OFF. When System A is enabled it
-    /// handles scheduling with its own debounce/cooldown logic, so System B steps aside to
-    /// avoid competing for the same channels simultaneously.
-    func triggerAutoRecordsForLiveChannels(_ liveLogins: [String], quality: String = "best") {
-        // Only trigger if System A's global auto-record is OFF.
-        // If autoRecordOnLive is enabled, System A handles scheduling with debounce/cooldown.
-        // System B's per-channel allowlist only activates when System A is disabled.
-        let systemAEnabled = UserDefaults.standard.bool(forKey: "autoRecordOnLive")
-        guard !systemAEnabled else { return }
-
-        let blocklist = loadAutoRecordBlockedLogins()
-        for login in liveLogins {
-            guard let normalized = normalizedChannelLogin(login) else { continue }
-            guard isAutoRecord(login: normalized) else { continue }
-            guard !blocklist.contains(normalized) else { continue }
-            guard !isRecordingAny(channelLogin: normalized) else { continue }
-            let target = "twitch.tv/\(normalized)"
-            let started = startRecording(target: target, channelName: nil, quality: quality)
-            if started {
-                sendNotification(title: "Auto-recording", body: "\(normalized) is now recording")
-            }
-        }
-    }
-
-    private func persistAutoRecordLogins() {
-        let array = Array(autoRecordLogins).sorted()
-        if let data = try? JSONEncoder().encode(array) {
-            UserDefaults.standard.set(data, forKey: Self.autoRecordLoginsKey)
-        }
-    }
-
-    private func loadPersistedAutoRecordLogins() -> Set<String> {
-        guard let data = UserDefaults.standard.data(forKey: Self.autoRecordLoginsKey),
-              let decoded = try? JSONDecoder().decode([String].self, from: data) else {
-            return []
-        }
-        return Set(decoded.compactMap { normalizedChannelLogin($0) })
-    }
-
-    /// Reads the recording blocklist from the same UserDefaults key used by ContentView/SettingsView.
-    private func loadAutoRecordBlockedLogins() -> Set<String> {
-        guard let jsonString = UserDefaults.standard.string(forKey: "autoRecordBlockedChannels"),
-              let data = jsonString.data(using: .utf8),
-              let decoded = try? JSONDecoder().decode([String].self, from: data) else {
-            return []
-        }
-        return Set(decoded.compactMap { normalizedChannelLogin($0) })
-    }
-
     // MARK: - Notification Support
 
     func requestNotificationPermission() {
@@ -633,66 +682,6 @@ final class RecordingManager: ObservableObject {
             trigger: trigger
         )
         UNUserNotificationCenter.current().add(request, withCompletionHandler: nil)
-    }
-
-    // MARK: - Scheduled Recordings
-
-    func loadScheduledRecordings() {
-        guard let data = UserDefaults.standard.data(forKey: Self.scheduleKey),
-              let decoded = try? JSONDecoder().decode([ScheduledRecording].self, from: data) else {
-            return
-        }
-        scheduledRecordings = decoded
-    }
-
-    func saveScheduledRecordings() {
-        if let data = try? JSONEncoder().encode(scheduledRecordings) {
-            UserDefaults.standard.set(data, forKey: Self.scheduleKey)
-        }
-    }
-
-    func addScheduledRecording(channelLogin: String, startDate: Date, quality: String = "best") {
-        let entry = ScheduledRecording(
-            id: UUID(),
-            channelLogin: channelLogin,
-            startDate: startDate,
-            quality: quality
-        )
-        scheduledRecordings.append(entry)
-        saveScheduledRecordings()
-    }
-
-    func removeScheduledRecording(id: UUID) {
-        scheduledRecordings.removeAll { $0.id == id }
-        saveScheduledRecordings()
-    }
-
-    func startScheduleMonitor() {
-        scheduleTimer?.invalidate()
-        scheduleTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.checkScheduledRecordings()
-            }
-        }
-    }
-
-    private func checkScheduledRecordings() {
-        let now = Date.now
-        var changed = false
-        for index in scheduledRecordings.indices {
-            let entry = scheduledRecordings[index]
-            guard !entry.hasStarted, entry.startDate <= now else { continue }
-            _ = startRecording(
-                target: "twitch.tv/\(entry.channelLogin)",
-                channelName: entry.channelLogin,
-                quality: entry.quality
-            )
-            scheduledRecordings[index].hasStarted = true
-            changed = true
-        }
-        if changed {
-            saveScheduledRecordings()
-        }
     }
 
     private func configuredConcurrencyLimit() -> Int {
@@ -999,6 +988,17 @@ final class RecordingManager: ObservableObject {
     func prepareRecordingForPlayback(at url: URL) async throws -> (url: URL, didRemux: Bool) {
         guard url.isFileURL else { return (url, false) }
         let pathExt = url.pathExtension.lowercased()
+        if pathExt == "glitcho" {
+            let directory = url.deletingLastPathComponent()
+            let hashFilename = url.lastPathComponent
+            let tempURL = recordingEncryptionManager.tempPlaybackURL()
+            try recordingEncryptionManager.decryptFile(
+                named: hashFilename,
+                in: directory,
+                to: tempURL
+            )
+            return (tempURL, false)
+        }
         guard pathExt == "mp4" else { return (url, false) }
 
         // Resolve main-actor-bound state up front (fast, no disk I/O).

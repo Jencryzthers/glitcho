@@ -23,6 +23,8 @@ Glitcho is a macOS-native Twitch client built with SwiftUI and AVKit. It combine
 
 ### Recording
 - Start/stop confirmation flows.
+- Encrypted recordings at rest with opaque file naming.
+- Secure export path that decrypts protected recordings only when explicitly exported.
 - Auto-record modes:
   - Only pinned
   - Only followed
@@ -31,6 +33,15 @@ Glitcho is a macOS-native Twitch client built with SwiftUI and AVKit. It combine
 - Blocklist override support.
 - Debounce/cooldown and concurrency limit support.
 - Background recorder LaunchAgent support with restart/kill controls and status feedback.
+
+### Privacy Lock
+- Optional biometric lock for sensitive sections.
+- Per-section hide controls for:
+  - Recordings tab/content
+  - Pinned channels
+  - Recent channels
+- Protected streamer list support to hide matching recording/history visibility until unlocked.
+- Configurable hotkey to lock/unlock protected sections.
 
 ### Recordings Library
 - Search, sort, list/grid, and optional grouping by streamer.
@@ -108,6 +119,7 @@ xattr -dr com.apple.quarantine /Applications/Glitcho.app
 ## Docs
 
 - `docs/commerce-site.md` - commerce website setup, endpoints, and operations guide.
+- `docs/privacy-lock.md` - privacy lock behavior, protected streamers, and encrypted recording notes.
 - `docs/perf/recording-profiling.md` - performance profiling workflow.
 - `docs/plans/2026-02-12-dvr-phase0-kickoff.md` - DVR phase plan and status snapshot.
 

@@ -1,5 +1,6 @@
 import Foundation
 import Security
+import LocalAuthentication
 
 enum KeychainHelper {
     static func get(service: String, account: String, allowUserInteraction: Bool = false) -> String? {
@@ -10,9 +11,11 @@ enum KeychainHelper {
             kSecReturnData: true,
             kSecMatchLimit: kSecMatchLimitOne
         ]
-        if !allowUserInteraction {
-            query[kSecUseAuthenticationUI] = kSecUseAuthenticationUIFail
-        }
+        let context = LAContext()
+        context.touchIDAuthenticationAllowableReuseDuration = LATouchIDAuthenticationMaximumAllowableReuseDuration
+        context.interactionNotAllowed = !allowUserInteraction
+        query[kSecUseAuthenticationContext] = context
+
         var result: AnyObject?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
         guard status == errSecSuccess, let data = result as? Data else { return nil }

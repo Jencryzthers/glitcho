@@ -1,4 +1,5 @@
 #if canImport(SwiftUI)
+import AppKit
 import SwiftUI
 import WebKit
 
@@ -25,9 +26,11 @@ struct ContentView: View {
     @StateObject private var recordingManager = RecordingManager()
     @StateObject private var backgroundAgentManager = BackgroundRecorderAgentManager()
     @StateObject private var companionAPIServer = CompanionAPIServer()
+    @StateObject private var recordingsUnlockManager = RecordingsUnlockManager()
     @EnvironmentObject private var updateChecker: UpdateChecker
     @Environment(\.notificationManager) private var notificationManager
     @Environment(\.openURL) private var openURL
+    @Environment(\.scenePhase) private var scenePhase
     @AppStorage("pinnedChannels") private var pinnedChannelsJSON: String = "[]"
     @AppStorage("liveAlertsEnabled") private var liveAlertsEnabled = true
     @AppStorage("liveAlertsPinnedOnly") private var liveAlertsPinnedOnly = false
@@ -43,6 +46,19 @@ struct ContentView: View {
     @AppStorage("companionAPIToken") private var companionAPIToken = ""
     @AppStorage("recordingsDirectory") private var recordingsDirectorySetting = ""
     @AppStorage("streamlinkPath") private var streamlinkPathSetting = ""
+    @AppStorage(BiometricLockSettings.enabledStorageKey) private var biometricLockEnabled = false
+    @AppStorage(BiometricLockSettings.hideRecordingsStorageKey) private var biometricLockHideRecordings = true
+    @AppStorage(BiometricLockSettings.recordingsRequireAuthOnOpenStorageKey) private var biometricLockRecordingsRequireAuthOnOpen = BiometricLockSettings.defaultRecordingsRequireAuthOnOpen
+    @AppStorage(BiometricLockSettings.hidePinnedStorageKey) private var biometricLockHidePinned = true
+    @AppStorage(BiometricLockSettings.hideRecentStorageKey) private var biometricLockHideRecent = true
+    @AppStorage(BiometricLockSettings.autoProtectAllowlistedStorageKey) private var biometricLockAutoProtectAllowlisted = BiometricLockSettings.defaultAutoProtectAllowlisted
+    @AppStorage(BiometricLockSettings.authenticateOnSettingsOpenStorageKey) private var biometricLockAuthenticateOnSettingsOpen = false
+    @AppStorage(BiometricLockSettings.hotkeyKeyStorageKey) private var biometricLockHotkeyKey = BiometricLockSettings.defaultHotkeyKey
+    @AppStorage(BiometricLockSettings.hotkeyCommandStorageKey) private var biometricLockHotkeyCommand = BiometricLockSettings.defaultHotkeyCommand
+    @AppStorage(BiometricLockSettings.hotkeyShiftStorageKey) private var biometricLockHotkeyShift = BiometricLockSettings.defaultHotkeyShift
+    @AppStorage(BiometricLockSettings.hotkeyOptionStorageKey) private var biometricLockHotkeyOption = BiometricLockSettings.defaultHotkeyOption
+    @AppStorage(BiometricLockSettings.hotkeyControlStorageKey) private var biometricLockHotkeyControl = BiometricLockSettings.defaultHotkeyControl
+    @AppStorage(BiometricLockSettings.protectedStreamersStorageKey) private var protectedStreamersJSON = "[]"
     @State private var pinnedChannels: [PinnedChannel] = []
     @State private var hasLoadedPins = false
     @State private var lastLiveLogins: Set<String> = []
@@ -70,6 +86,8 @@ struct ContentView: View {
     private let autoRecordEvaluationTimer = Timer.publish(every: 20, on: .main, in: .common).autoconnect()
     @State private var pendingSyncWork: DispatchWorkItem?
     @State private var pendingFollowedLiveWork: DispatchWorkItem?
+    @State private var biometricHotkeyMonitor = BiometricHotkeyMonitor()
+    @State private var recordingsViewRefreshToken = UUID()
 
     var body: some View {
         ZStack {
@@ -103,6 +121,20 @@ struct ContentView: View {
             syncCompanionAPIServer()
             fetchMissingPinnedAvatars()
         }
+        .task {
+            if biometricLockEnabled {
+                recordingsUnlockManager.authenticateIfNeeded()
+            }
+        }
+        .onAppear {
+            biometricHotkeyMonitor.onTrigger = {
+                recordingsUnlockManager.toggleLock()
+            }
+            configureBiometricHotkeyMonitor()
+        }
+        .onDisappear {
+            biometricHotkeyMonitor.stop()
+        }
         .onChange(of: pinnedChannels) { newValue in
             savePinnedChannels(newValue)
             scheduleSyncBackgroundRecordingAgent()
@@ -110,8 +142,6 @@ struct ContentView: View {
         .onChange(of: store.followedLive) { newValue in
             refreshPinnedMetadata(using: newValue)
             scheduleFollowedLiveEvaluation(newValue)
-            let logins = newValue.map(\.id)
-            recordingManager.triggerAutoRecordsForLiveChannels(logins, quality: "best")
         }
         .onChange(of: store.followedChannelLogins) { _ in
             scheduleSyncBackgroundRecordingAgent()
@@ -139,6 +169,9 @@ struct ContentView: View {
         }
         .onChange(of: autoRecordSelectedChannelsJSON) { _ in
             scheduleSyncBackgroundRecordingAgent()
+            if biometricLockAutoProtectAllowlisted {
+                addProtectedStreamers(loadAutoRecordSelectedChannels())
+            }
         }
         .onChange(of: autoRecordBlockedChannelsJSON) { _ in
             scheduleSyncBackgroundRecordingAgent()
@@ -167,6 +200,40 @@ struct ContentView: View {
         .onChange(of: companionAPIToken) { _ in
             syncCompanionAPIServer()
         }
+        .onChange(of: biometricLockEnabled) { _ in
+            configureBiometricHotkeyMonitor()
+            if biometricLockEnabled {
+                recordingsUnlockManager.authenticateIfNeeded()
+            }
+        }
+        .onChange(of: biometricLockHotkeyKey) { _ in
+            configureBiometricHotkeyMonitor()
+        }
+        .onChange(of: biometricLockHotkeyCommand) { _ in
+            configureBiometricHotkeyMonitor()
+        }
+        .onChange(of: biometricLockHotkeyShift) { _ in
+            configureBiometricHotkeyMonitor()
+        }
+        .onChange(of: biometricLockHotkeyOption) { _ in
+            configureBiometricHotkeyMonitor()
+        }
+        .onChange(of: biometricLockHotkeyControl) { _ in
+            configureBiometricHotkeyMonitor()
+        }
+        .onChange(of: biometricLockAutoProtectAllowlisted) { enabled in
+            guard enabled else { return }
+            addProtectedStreamers(loadAutoRecordSelectedChannels())
+        }
+        .onChange(of: scenePhase) { phase in
+            guard phase == .active else { return }
+            if biometricLockEnabled {
+                recordingsUnlockManager.authenticateIfNeeded()
+            }
+        }
+        .onChange(of: recordingsUnlockManager.isUnlocked) { _ in
+            recordingsViewRefreshToken = UUID()
+        }
         .onChange(of: playbackRequest) { _ in
             updateChannelBellStateIfNeeded()
         }
@@ -178,9 +245,6 @@ struct ContentView: View {
             guard let channels = notification.userInfo?["channels"] as? [TwitchChannel] else { return }
             for ch in channels {
                 recordingManager.sendNotification(title: "\(ch.name) is live", body: ch.title.isEmpty ? "Now streaming" : ch.title)
-                if recordingManager.isAutoRecord(login: ch.id) {
-                    // auto-record triggering is handled by triggerAutoRecordsForLiveChannels
-                }
             }
         }
         .confirmationDialog(
@@ -290,6 +354,11 @@ struct ContentView: View {
     private var splitView: some View {
         let recordingAllowlist = loadAutoRecordSelectedChannels()
         let recordingBlocklist = loadAutoRecordBlockedChannels()
+        let protectedStreamerLogins = loadProtectedStreamers()
+        let canViewProtectedStreamerContent = !biometricLockEnabled || recordingsUnlockManager.isUnlocked
+        let shouldShowRecordings = shouldShowProtectedSection(isEnabled: biometricLockHideRecordings)
+        let shouldShowPinned = shouldShowProtectedSection(isEnabled: biometricLockHidePinned)
+        let shouldShowRecent = shouldShowProtectedSection(isEnabled: biometricLockHideRecent)
         return NavigationSplitView(columnVisibility: $columnVisibility) {
             Sidebar(
                 searchText: $searchText,
@@ -319,10 +388,23 @@ struct ContentView: View {
                     detailMode = .native
                 },
                 onShowRecordings: {
-                    detailMode = .recordings
+                    guard shouldShowRecordings else { return }
+                    if biometricLockEnabled,
+                       biometricLockRecordingsRequireAuthOnOpen,
+                       !recordingsUnlockManager.isUnlocked {
+                        recordingsUnlockManager.requestAuthentication { success in
+                            guard success else { return }
+                            detailMode = .recordings
+                        }
+                    } else {
+                        detailMode = .recordings
+                    }
                 },
                 onShowSettings: {
                     detailMode = .settings
+                    if biometricLockEnabled, biometricLockAuthenticateOnSettingsOpen {
+                        recordingsUnlockManager.requestAuthentication()
+                    }
                 },
                 recordingAllowlist: recordingAllowlist,
                 recordingBlocklist: recordingBlocklist,
@@ -332,7 +414,12 @@ struct ContentView: View {
                 onSetRecordingBlocked: { login, isBlocked in
                     setChannelRecordingBlocked(login, isBlocked: isBlocked)
                 },
-                showRecordingsNavigation: true,
+                activeAutoRecordMode: autoRecordMode(),
+                showRecordingsNavigation: shouldShowRecordings,
+                showPinnedSection: shouldShowPinned,
+                showRecentSection: shouldShowRecent,
+                protectedStreamerLogins: protectedStreamerLogins,
+                isBiometricUnlocked: canViewProtectedStreamerContent,
                 onPinLimitReached: {
                     showToast(message: "You've reached the limit of \(pinnedLimit) favorites! 💜", icon: "heart.fill")
                 }
@@ -359,6 +446,34 @@ struct ContentView: View {
             }
         }
         .navigationSplitViewColumnWidth(min: 300, ideal: 320, max: 340)
+    }
+
+    private func shouldShowProtectedSection(isEnabled: Bool) -> Bool {
+        if !biometricLockEnabled || !isEnabled {
+            return true
+        }
+        return recordingsUnlockManager.isUnlocked
+    }
+
+    private func configureBiometricHotkeyMonitor() {
+        guard biometricLockEnabled else {
+            biometricHotkeyMonitor.stop()
+            return
+        }
+        guard let key = BiometricLockSettings.normalizedHotkeyKey(from: biometricLockHotkeyKey) else {
+            biometricHotkeyMonitor.stop()
+            return
+        }
+        biometricHotkeyMonitor.start(key: key, modifiers: biometricHotkeyModifiers)
+    }
+
+    private var biometricHotkeyModifiers: NSEvent.ModifierFlags {
+        var flags: NSEvent.ModifierFlags = []
+        if biometricLockHotkeyCommand { flags.insert(.command) }
+        if biometricLockHotkeyShift { flags.insert(.shift) }
+        if biometricLockHotkeyOption { flags.insert(.option) }
+        if biometricLockHotkeyControl { flags.insert(.control) }
+        return flags
     }
 
     @ViewBuilder
@@ -399,14 +514,29 @@ struct ContentView: View {
                     }
                 )
             case .recordings:
-                RecordingsLibraryView(
-                    recordingManager: recordingManager
-                )
+                let canShowRecordings =
+                    shouldShowProtectedSection(isEnabled: biometricLockHideRecordings)
+                    && (!biometricLockEnabled
+                        || !biometricLockRecordingsRequireAuthOnOpen
+                        || recordingsUnlockManager.isUnlocked)
+                let protectedStreamerLogins = loadProtectedStreamers()
+                let canViewProtectedStreamerContent = !biometricLockEnabled || recordingsUnlockManager.isUnlocked
+                if canShowRecordings {
+                    RecordingsLibraryView(
+                        recordingManager: recordingManager,
+                        protectedChannelLogins: protectedStreamerLogins,
+                        showProtectedRecordings: canViewProtectedStreamerContent
+                    )
+                    .id(recordingsViewRefreshToken)
+                } else {
+                    WebViewContainer(webView: store.webView)
+                }
             case .settings:
                 SettingsDetailView(
                     recordingManager: recordingManager,
                     backgroundAgentManager: backgroundAgentManager,
                     store: store,
+                    isBiometricUnlocked: !biometricLockEnabled || recordingsUnlockManager.isUnlocked,
                     onOpenTwitchSettings: {
                         detailMode = .web
                         store.navigate(to: URL(string: "https://www.twitch.tv/settings")!)
@@ -1019,6 +1149,36 @@ struct ContentView: View {
         return Set(decoded.map { $0.lowercased() })
     }
 
+    private func loadProtectedStreamers() -> Set<String> {
+        guard let data = protectedStreamersJSON.data(using: .utf8),
+              let decoded = try? JSONDecoder().decode([String].self, from: data) else {
+            return []
+        }
+        return Set(decoded.map { $0.lowercased() })
+    }
+
+    private func saveProtectedStreamers(_ logins: Set<String>) {
+        let sorted = Array(logins.map { $0.lowercased() }).sorted()
+        guard let data = try? JSONEncoder().encode(sorted),
+              let json = String(data: data, encoding: .utf8) else {
+            return
+        }
+        protectedStreamersJSON = json
+    }
+
+    private func addProtectedStreamers(_ logins: Set<String>) {
+        guard !logins.isEmpty else { return }
+        var protected = loadProtectedStreamers()
+        let before = protected.count
+        for login in logins {
+            let normalized = login.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !normalized.isEmpty else { continue }
+            protected.insert(normalized)
+        }
+        guard protected.count != before else { return }
+        saveProtectedStreamers(protected)
+    }
+
     private func saveAutoRecordSelectedChannels(_ channels: Set<String>) {
         let sorted = Array(channels.map { $0.lowercased() }).sorted()
         if let data = try? JSONEncoder().encode(sorted),
@@ -1045,10 +1205,10 @@ struct ContentView: View {
         if isAllowlisted {
             selected.insert(normalized)
             blocked.remove(normalized)
-            showToast(message: "@\(normalized) added to recording allowlist.", icon: "checkmark.circle.fill")
+            showToast(message: "@\(normalized) added to custom auto-record list.", icon: "checkmark.circle.fill")
         } else {
             selected.remove(normalized)
-            showToast(message: "@\(normalized) removed from recording allowlist.", icon: "minus.circle.fill")
+            showToast(message: "@\(normalized) removed from custom auto-record list.", icon: "minus.circle.fill")
         }
 
         saveAutoRecordSelectedChannels(selected)
@@ -1241,17 +1401,20 @@ struct Sidebar: View {
     var recordingBlocklist: Set<String> = []
     var onSetRecordingAllowlisted: ((String, Bool) -> Void)?
     var onSetRecordingBlocked: ((String, Bool) -> Void)?
+    var activeAutoRecordMode: AutoRecordMode = .pinnedAndFollowed
     var showRecordingsNavigation: Bool = true
+    var showPinnedSection: Bool = true
+    var showRecentSection: Bool = true
+    var protectedStreamerLogins: Set<String> = []
+    var isBiometricUnlocked: Bool = false
     var onPinLimitReached: (() -> Void)?
     @AppStorage("recentChannels.v1") private var recentChannelsData: Data = Data()
     @AppStorage("sidebar.pinnedCollapsed") private var pinnedCollapsed = false
     @AppStorage("sidebar.recentCollapsed") private var recentCollapsed = false
     @AppStorage("sidebar.followingCollapsed") private var followingCollapsed = false
-    @AppStorage("sidebar.showSchedule") private var showScheduleSidebar = false
     @State private var isAddingPin = false
     @State private var newPinText = ""
     @State private var pinError: String?
-    @State private var showScheduleSheet = false
 
     private let sections: [TwitchDestination] = [
         .home,
@@ -1396,163 +1559,154 @@ struct Sidebar: View {
                         ) {
                             onShowRecordings?()
                         }
-
-                        if showScheduleSidebar {
-                            SidebarRow(
-                                title: "Schedule",
-                                systemImage: "calendar.badge.clock"
-                            ) {
-                                showScheduleSheet = true
-                            }
-                        }
                     }
 
-                    // Divider
+                    // Pinned / Recent section
+                    let pinnedLogins = Set(pinnedChannels.map(\.login))
+                    let visiblePinnedChannels = pinnedChannels.filter { pin in
+                        !protectedStreamerLogins.contains(pin.login) || isBiometricUnlocked
+                    }
+
                     Rectangle()
                         .fill(Color.white.opacity(0.08))
                         .frame(height: 1)
                         .padding(.vertical, 12)
                         .padding(.horizontal, 12)
 
-                    // Pinned section
-                    let pinnedLogins = Set(pinnedChannels.map(\.login))
-                    HStack {
-                        Button(action: { withAnimation(.easeOut(duration: 0.15)) { pinnedCollapsed.toggle() } }) {
-                            HStack(spacing: 4) {
-                                Image(systemName: pinnedCollapsed ? "chevron.right" : "chevron.down")
-                                    .font(.system(size: 8, weight: .bold))
-                                    .foregroundStyle(.white.opacity(0.25))
-                                Text("PINNED")
-                                    .font(.system(size: 10, weight: .bold))
-                                    .foregroundStyle(.white.opacity(0.35))
-                                    .tracking(1)
-                            }
-                        }
-                        .buttonStyle(.plain)
-
-                        Spacer()
-
-                        if !pinnedCollapsed {
-                            Button(action: {
-                                if pinnedChannels.count >= pinnedLimit {
-                                    onPinLimitReached?()
-                                } else {
-                                    toggleAddPin()
+                    if showPinnedSection {
+                        HStack {
+                            Button(action: { withAnimation(.easeOut(duration: 0.15)) { pinnedCollapsed.toggle() } }) {
+                                HStack(spacing: 4) {
+                                    Image(systemName: pinnedCollapsed ? "chevron.right" : "chevron.down")
+                                        .font(.system(size: 8, weight: .bold))
+                                        .foregroundStyle(.white.opacity(0.25))
+                                    Text("PINNED")
+                                        .font(.system(size: 10, weight: .bold))
+                                        .foregroundStyle(.white.opacity(0.35))
+                                        .tracking(1)
                                 }
-                            }) {
-                                Image(systemName: "plus.circle.fill")
-                                    .font(.system(size: 12, weight: .semibold))
-                                    .foregroundStyle(.white.opacity(pinnedChannels.count >= pinnedLimit ? 0.2 : 0.6))
                             }
                             .buttonStyle(.plain)
-                            .help(pinnedChannels.count >= pinnedLimit ? "Favorites limit reached" : "Add favorite")
-                        }
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.bottom, 6)
 
-                    if !pinnedCollapsed {
-                    if isAddingPin {
-                        VStack(alignment: .leading, spacing: 8) {
-                            HStack(spacing: 8) {
-                                TextField("Channel name or URL", text: $newPinText)
-                                    .textFieldStyle(.plain)
-                                    .font(.system(size: 12))
-                                    .foregroundStyle(.white)
-                                    .onSubmit { submitPin() }
+                            Spacer()
 
-                                Button("Add") { submitPin() }
-                                    .font(.system(size: 11, weight: .semibold))
-                                    .foregroundStyle(.white)
-                                    .padding(.horizontal, 10)
-                                    .padding(.vertical, 6)
-                                    .background(Color.white.opacity(0.12))
-                                    .clipShape(Capsule())
-                                    .buttonStyle(.plain)
-                            }
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 8)
-                            .background(Color.white.opacity(0.08))
-                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                            .padding(.horizontal, 12)
-
-                            if let pinError {
-                                Text(pinError)
-                                    .font(.system(size: 10, weight: .medium))
-                                    .foregroundStyle(.white.opacity(0.45))
-                                    .padding(.horizontal, 12)
+                            if !pinnedCollapsed {
+                                Button(action: {
+                                    if pinnedChannels.count >= pinnedLimit {
+                                        onPinLimitReached?()
+                                    } else {
+                                        toggleAddPin()
+                                    }
+                                }) {
+                                    Image(systemName: "plus.circle.fill")
+                                        .font(.system(size: 12, weight: .semibold))
+                                        .foregroundStyle(.white.opacity(pinnedChannels.count >= pinnedLimit ? 0.2 : 0.6))
+                                }
+                                .buttonStyle(.plain)
+                                .help(pinnedChannels.count >= pinnedLimit ? "Favorites limit reached" : "Add favorite")
                             }
                         }
+                        .padding(.horizontal, 12)
                         .padding(.bottom, 6)
+
+                        if !pinnedCollapsed {
+                        if isAddingPin {
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack(spacing: 8) {
+                                    TextField("Channel name or URL", text: $newPinText)
+                                        .textFieldStyle(.plain)
+                                        .font(.system(size: 12))
+                                        .foregroundStyle(.white)
+                                        .onSubmit { submitPin() }
+
+                                    Button("Add") { submitPin() }
+                                        .font(.system(size: 11, weight: .semibold))
+                                        .foregroundStyle(.white)
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 6)
+                                        .background(Color.white.opacity(0.12))
+                                        .clipShape(Capsule())
+                                        .buttonStyle(.plain)
+                                }
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 8)
+                                .background(Color.white.opacity(0.08))
+                                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                                .padding(.horizontal, 12)
+
+                                if let pinError {
+                                    Text(pinError)
+                                        .font(.system(size: 10, weight: .medium))
+                                        .foregroundStyle(.white.opacity(0.45))
+                                        .padding(.horizontal, 12)
+                                }
+                            }
+                            .padding(.bottom, 6)
+                        }
+
+                        if visiblePinnedChannels.isEmpty {
+                            HStack(spacing: 8) {
+                                Image(systemName: "pin")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.white.opacity(0.3))
+                                Text("Pin channels from LIVE")
+                                    .font(.system(size: 12))
+                                    .foregroundStyle(.white.opacity(0.4))
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                        } else {
+                            let liveByLogin = Dictionary(store.followedLive.map { ($0.login, $0) }, uniquingKeysWith: { first, _ in first })
+                            ForEach(visiblePinnedChannels) { pin in
+                                let liveChannel = liveByLogin[pin.login]
+                                let isRecording = liveChannel != nil && recordingManager.isRecordingAny(channelLogin: pin.login)
+                                let isAllowlisted = recordingAllowlist.contains(pin.login)
+                                let isBlocked = recordingBlocklist.contains(pin.login)
+                                let shouldShowAllowlistAction = activeAutoRecordMode == .customAllowlist || isAllowlisted
+                                PinnedRow(
+                                    channel: pin,
+                                    liveChannel: liveChannel,
+                                    isRecording: isRecording,
+                                    onOpen: {
+                                        if let liveChannel {
+                                            onChannelSelected?(liveChannel.login)
+                                            addToRecent(login: liveChannel.login)
+                                        } else {
+                                            onNavigate?(pin.url) ?? store.navigate(to: pin.url)
+                                            addToRecent(login: pin.login)
+                                        }
+                                    },
+                                    onRemove: { onRemovePin?(pin) },
+                                    onToggleNotifications: { onTogglePinNotifications?(pin) },
+                                    isRecordingAllowlisted: isAllowlisted,
+                                    isRecordingBlocked: isBlocked,
+                                    onToggleRecordingAllowlist: shouldShowAllowlistAction ? {
+                                        onSetRecordingAllowlisted?(pin.login, !isAllowlisted)
+                                    } : nil,
+                                    onToggleRecordingBlocklist: {
+                                        onSetRecordingBlocked?(pin.login, !isBlocked)
+                                    },
+                                    onCopyURL: {
+                                        NSPasteboard.general.clearContents()
+                                        NSPasteboard.general.setString("https://twitch.tv/\(pin.login)", forType: .string)
+                                    }
+                                )
+                            }
+                        }
+                        } // end if !pinnedCollapsed
+
+                        Rectangle()
+                            .fill(Color.white.opacity(0.08))
+                            .frame(height: 1)
+                            .padding(.vertical, 12)
+                            .padding(.horizontal, 12)
                     }
 
-                    if pinnedChannels.isEmpty {
-                        HStack(spacing: 8) {
-                            Image(systemName: "pin")
-                                .font(.system(size: 11))
-                                .foregroundStyle(.white.opacity(0.3))
-                            Text("Pin channels from LIVE")
-                                .font(.system(size: 12))
-                                .foregroundStyle(.white.opacity(0.4))
-                        }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 8)
-                    } else {
-                        let liveByLogin = Dictionary(store.followedLive.map { ($0.login, $0) }, uniquingKeysWith: { first, _ in first })
-                        ForEach(pinnedChannels) { pin in
-                            let liveChannel = liveByLogin[pin.login]
-                            let isRecording = liveChannel != nil && recordingManager.isRecordingAny(channelLogin: pin.login)
-                            let isAllowlisted = recordingAllowlist.contains(pin.login)
-                            let isBlocked = recordingBlocklist.contains(pin.login)
-                            PinnedRow(
-                                channel: pin,
-                                liveChannel: liveChannel,
-                                isRecording: isRecording,
-                                onOpen: {
-                                    if let liveChannel {
-                                        onChannelSelected?(liveChannel.login)
-                                        addToRecent(login: liveChannel.login)
-                                    } else {
-                                        onNavigate?(pin.url) ?? store.navigate(to: pin.url)
-                                        addToRecent(login: pin.login)
-                                    }
-                                },
-                                onRemove: { onRemovePin?(pin) },
-                                onToggleNotifications: { onTogglePinNotifications?(pin) },
-                                isRecordingAllowlisted: isAllowlisted,
-                                isRecordingBlocked: isBlocked,
-                                onToggleRecordingAllowlist: {
-                                    onSetRecordingAllowlisted?(pin.login, !isAllowlisted)
-                                },
-                                onToggleRecordingBlocklist: {
-                                    onSetRecordingBlocked?(pin.login, !isBlocked)
-                                },
-                                onCopyURL: {
-                                    NSPasteboard.general.clearContents()
-                                    NSPasteboard.general.setString("https://twitch.tv/\(pin.login)", forType: .string)
-                                },
-                                onToggleAutoRecord: {
-                                    if recordingManager.isAutoRecord(login: pin.login) {
-                                        recordingManager.removeAutoRecord(login: pin.login)
-                                    } else {
-                                        recordingManager.addAutoRecord(login: pin.login)
-                                    }
-                                },
-                                isAutoRecord: recordingManager.isAutoRecord(login: pin.login)
-                            )
-                        }
+                    let visibleRecentChannels = recentChannels.filter { login in
+                        !protectedStreamerLogins.contains(login) || isBiometricUnlocked
                     }
-                    } // end if !pinnedCollapsed
 
-                    // Divider
-                    Rectangle()
-                        .fill(Color.white.opacity(0.08))
-                        .frame(height: 1)
-                        .padding(.vertical, 12)
-                        .padding(.horizontal, 12)
-
-                    // Recent section
-                    if !recentChannels.isEmpty {
+                    if showRecentSection, !visibleRecentChannels.isEmpty {
                         HStack {
                             Button(action: { withAnimation(.easeOut(duration: 0.15)) { recentCollapsed.toggle() } }) {
                                 HStack(spacing: 4) {
@@ -1576,7 +1730,7 @@ struct Sidebar: View {
                         let liveLoginSet = Set(store.followedLive.map(\.login))
                         let liveAvatarByLogin = Dictionary(store.followedLive.compactMap { ch in ch.thumbnailURL.map { (ch.login, $0) } }, uniquingKeysWith: { first, _ in first })
                         let pinnedAvatarByLogin = Dictionary(pinnedChannels.compactMap { p in p.thumbnailURL.map { (p.login, $0) } }, uniquingKeysWith: { first, _ in first })
-                        ForEach(recentChannels, id: \.self) { login in
+                        ForEach(visibleRecentChannels, id: \.self) { login in
                             OfflineFollowingRow(
                                 login: login,
                                 avatarURL: liveAvatarByLogin[login] ?? pinnedAvatarByLogin[login] ?? store.offlineChannelAvatarURLs[login],
@@ -1590,13 +1744,6 @@ struct Sidebar: View {
                                     NSPasteboard.general.clearContents()
                                     NSPasteboard.general.setString("https://twitch.tv/\(login)", forType: .string)
                                 }
-                                Button(recordingManager.isAutoRecord(login: login) ? "Remove Auto-Record" : "Auto-Record This Channel") {
-                                    if recordingManager.isAutoRecord(login: login) {
-                                        recordingManager.removeAutoRecord(login: login)
-                                    } else {
-                                        recordingManager.addAutoRecord(login: login)
-                                    }
-                                }
                             }
                             .overlay(alignment: .trailing) {
                                 if liveLoginSet.contains(login) {
@@ -1609,7 +1756,6 @@ struct Sidebar: View {
                         }
                         } // end if !recentCollapsed
 
-                        // Divider before Following
                         Rectangle()
                             .fill(Color.white.opacity(0.08))
                             .frame(height: 1)
@@ -1659,6 +1805,7 @@ struct Sidebar: View {
                         ForEach(nonPinnedLive) { channel in
                             let isAllowlisted = recordingAllowlist.contains(channel.login)
                             let isBlocked = recordingBlocklist.contains(channel.login)
+                            let shouldShowAllowlistAction = activeAutoRecordMode == .customAllowlist || isAllowlisted
                             FollowingRow(
                                 channel: channel,
                                 isRecording: recordingManager.isRecordingAny(channelLogin: channel.login),
@@ -1673,14 +1820,6 @@ struct Sidebar: View {
                                     NSPasteboard.general.clearContents()
                                     NSPasteboard.general.setString(channel.url.absoluteString, forType: .string)
                                 }
-                                Button(recordingManager.isAutoRecord(login: channel.id) ? "Remove Auto-Record" : "Auto-Record This Channel") {
-                                    if recordingManager.isAutoRecord(login: channel.id) {
-                                        recordingManager.removeAutoRecord(login: channel.id)
-                                    } else {
-                                        recordingManager.addAutoRecord(login: channel.id)
-                                    }
-                                }
-                                Divider()
                                 Button(pinnedLogins.contains(channel.login) ? "Unpin from Favorites" : "Pin to Favorites") {
                                     if !pinnedLogins.contains(channel.login) && pinnedChannels.count >= pinnedLimit {
                                         onPinLimitReached?()
@@ -1689,10 +1828,12 @@ struct Sidebar: View {
                                     }
                                 }
                                 Divider()
-                                Button(isAllowlisted ? "Remove from recording allowlist" : "Add to recording allowlist") {
-                                    onSetRecordingAllowlisted?(channel.login, !isAllowlisted)
+                                if shouldShowAllowlistAction {
+                                    Button(isAllowlisted ? "Remove from Custom Auto-Record List" : "Add to Custom Auto-Record List") {
+                                        onSetRecordingAllowlisted?(channel.login, !isAllowlisted)
+                                    }
                                 }
-                                Button(isBlocked ? "Unblock from recording" : "Block from recording") {
+                                Button(isBlocked ? "Allow Auto-Record Again" : "Never Auto-Record This Streamer") {
                                     onSetRecordingBlocked?(channel.login, !isBlocked)
                                 }
                             }
@@ -1721,13 +1862,6 @@ struct Sidebar: View {
                                     NSPasteboard.general.clearContents()
                                     NSPasteboard.general.setString("https://twitch.tv/\(login)", forType: .string)
                                 }
-                                Button(recordingManager.isAutoRecord(login: login) ? "Remove Auto-Record" : "Auto-Record This Channel") {
-                                    if recordingManager.isAutoRecord(login: login) {
-                                        recordingManager.removeAutoRecord(login: login)
-                                    } else {
-                                        recordingManager.addAutoRecord(login: login)
-                                    }
-                                }
                             }
                         }
                     }
@@ -1745,9 +1879,6 @@ struct Sidebar: View {
                 sidebarTint.opacity(0.25)
             }
         )
-        .sheet(isPresented: $showScheduleSheet) {
-            ScheduleSheetView(recordingManager: recordingManager)
-        }
     }
 
     private var recentChannels: [String] {
@@ -2124,8 +2255,6 @@ struct PinnedRow: View {
     var onToggleRecordingAllowlist: (() -> Void)?
     var onToggleRecordingBlocklist: (() -> Void)?
     var onCopyURL: (() -> Void)?
-    var onToggleAutoRecord: (() -> Void)?
-    var isAutoRecord: Bool = false
     @State private var isHovered = false
 
     private var displayName: String {
@@ -2216,26 +2345,23 @@ struct PinnedRow: View {
             if let onCopyURL {
                 Button("Copy Stream URL", action: onCopyURL)
             }
-            if let onToggleAutoRecord {
-                Button(isAutoRecord ? "Remove Auto-Record" : "Auto-Record This Channel", action: onToggleAutoRecord)
-            }
-            if onCopyURL != nil || onToggleAutoRecord != nil {
+            if onCopyURL != nil {
                 Divider()
             }
             Button(channel.notifyEnabled ? "Disable notifications" : "Enable notifications", action: onToggleNotifications)
             if let onToggleRecordingAllowlist {
                 Button(
                     isRecordingAllowlisted
-                        ? "Remove from recording allowlist"
-                        : "Add to recording allowlist",
+                        ? "Remove from Custom Auto-Record List"
+                        : "Add to Custom Auto-Record List",
                     action: onToggleRecordingAllowlist
                 )
             }
             if let onToggleRecordingBlocklist {
                 Button(
                     isRecordingBlocked
-                        ? "Unblock from recording"
-                        : "Block from recording",
+                        ? "Allow Auto-Record Again"
+                        : "Never Auto-Record This Streamer",
                     action: onToggleRecordingBlocklist
                 )
             }
@@ -2516,185 +2642,6 @@ struct LoadingOverlay: View {
             }
             dotOffset = 2
         }
-    }
-}
-
-struct ScheduleSheetView: View {
-    @ObservedObject var recordingManager: RecordingManager
-    @Environment(\.dismiss) private var dismiss
-
-    @State private var channelInput = ""
-    @State private var startDate = Date().addingTimeInterval(300)
-    @State private var quality = "best"
-
-    private let qualityOptions = ["best", "1080p60", "720p60", "480p"]
-
-    var body: some View {
-        VStack(spacing: 0) {
-            sheetHeader
-            Divider().background(Color.white.opacity(0.1))
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    addForm
-                    scheduleList
-                }
-                .padding(20)
-            }
-        }
-        .frame(width: 420, height: 540)
-        .background(Color(red: 0.08, green: 0.08, blue: 0.10))
-    }
-
-    @ViewBuilder
-    private var sheetHeader: some View {
-        HStack {
-            Text("Scheduled Recordings")
-                .font(.system(size: 16, weight: .semibold))
-                .foregroundStyle(.white)
-            Spacer()
-            Button(action: { dismiss() }) {
-                Image(systemName: "xmark.circle.fill")
-                    .font(.system(size: 16))
-                    .foregroundStyle(.white.opacity(0.4))
-            }
-            .buttonStyle(.plain)
-        }
-        .padding(.horizontal, 20)
-        .padding(.top, 20)
-        .padding(.bottom, 16)
-    }
-
-    @ViewBuilder
-    private var addForm: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("New Scheduled Recording")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.5))
-                .tracking(0.5)
-            TextField("Channel login (e.g. monstercat)", text: $channelInput)
-                .textFieldStyle(.plain)
-                .font(.system(size: 13))
-                .foregroundStyle(.white)
-                .padding(10)
-                .background(Color.white.opacity(0.07))
-                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-            DatePicker(
-                "Start time",
-                selection: $startDate,
-                in: Date()...,
-                displayedComponents: [.date, .hourAndMinute]
-            )
-            .datePickerStyle(.compact)
-            .font(.system(size: 13))
-            .foregroundStyle(.white)
-            .colorScheme(.dark)
-            Picker("Quality", selection: $quality) {
-                ForEach(qualityOptions, id: \.self) { opt in
-                    Text(opt).tag(opt)
-                }
-            }
-            .pickerStyle(.menu)
-            .font(.system(size: 13))
-            scheduleButton
-        }
-        .padding(16)
-        .background(Color.white.opacity(0.04))
-        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-    }
-
-    @ViewBuilder
-    private var scheduleButton: some View {
-        Button(action: scheduleRecording) {
-            HStack(spacing: 6) {
-                Image(systemName: "calendar.badge.plus")
-                Text("Schedule Recording")
-                    .font(.system(size: 13, weight: .semibold))
-            }
-            .foregroundStyle(.white)
-            .padding(.horizontal, 16)
-            .padding(.vertical, 9)
-            .frame(maxWidth: .infinity)
-            .background(Color.purple.opacity(0.75))
-            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-        }
-        .buttonStyle(.plain)
-        .disabled(channelInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-    }
-
-    @ViewBuilder
-    private var scheduleList: some View {
-        if recordingManager.scheduledRecordings.isEmpty {
-            Text("No scheduled recordings")
-                .font(.system(size: 12))
-                .foregroundStyle(.white.opacity(0.35))
-                .frame(maxWidth: .infinity)
-                .padding(.top, 8)
-        } else {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("SCHEDULED")
-                    .font(.system(size: 10, weight: .bold))
-                    .foregroundStyle(.white.opacity(0.35))
-                    .tracking(1)
-                ForEach(recordingManager.scheduledRecordings) { schedule in
-                    scheduleRow(schedule)
-                }
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func scheduleRow(_ schedule: RecordingManager.ScheduledRecording) -> some View {
-        HStack(spacing: 12) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(schedule.channelLogin)
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(.white)
-                Text(schedule.startDate.formatted(date: .abbreviated, time: .shortened))
-                    .font(.system(size: 11))
-                    .foregroundStyle(.white.opacity(0.5))
-            }
-            Spacer()
-            HStack(spacing: 6) {
-                Text(schedule.quality)
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.7))
-                    .padding(.horizontal, 7)
-                    .padding(.vertical, 3)
-                    .background(Color.white.opacity(0.1))
-                    .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
-                if schedule.hasStarted {
-                    Text("Started")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(.green.opacity(0.85))
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 3)
-                        .background(Color.green.opacity(0.12))
-                        .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
-                }
-                Button {
-                    recordingManager.removeScheduledRecording(id: schedule.id)
-                } label: {
-                    Image(systemName: "trash")
-                        .font(.system(size: 12))
-                        .foregroundStyle(.white.opacity(0.35))
-                }
-                .buttonStyle(.plain)
-                .help("Remove scheduled recording")
-            }
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-        .background(Color.white.opacity(0.04))
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-    }
-
-    private func scheduleRecording() {
-        let login = channelInput.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !login.isEmpty else { return }
-        recordingManager.addScheduledRecording(channelLogin: login, startDate: startDate, quality: quality)
-        channelInput = ""
-        startDate = Date().addingTimeInterval(300)
-        quality = "best"
     }
 }
 

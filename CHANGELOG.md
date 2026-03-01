@@ -4,6 +4,45 @@ All notable user-visible changes are tracked here.
 
 ## Unreleased
 
+## 1.4.1 - 2026-03-01
+
+### Added
+- Biometric privacy lock system with per-section visibility controls for:
+  - Recordings navigation/content
+  - Pinned section
+  - Recent section
+- Configurable biometric hotkey trigger with modifier selection and lock/unlock toggle behavior.
+- Privacy settings to:
+  - authenticate when opening Settings
+  - auto-protect custom auto-record allowlisted streamers
+  - hide the Privacy Lock settings card while locked
+- Per-streamer protection controls:
+  - protected streamers list editor
+  - import-from-record-list action
+  - optional auto-add when streamers are allowlisted
+- Recording-at-rest hardening:
+  - encrypted `.glitcho` storage
+  - hashed/opaque on-disk filenames
+  - secure decrypt-on-export flow
+  - encrypted-thumbnail sidecar support so library thumbnails still render
+- In-memory encryption-key caching with Touch ID reuse context to reduce repeated key prompts.
+
+### Changed
+- Recording library now hides protected streamers while locked and refreshes immediately when lock state changes.
+- Sidebar now consistently hides protected streamers from pinned/recent/following surfaces while locked.
+- Context menu recording actions were clarified and simplified:
+  - removed confusing "always record" flow
+  - custom allowlist/blocklist wording made explicit
+  - custom allowlist action only shown when relevant
+- Opening the recordings tab can now require authentication without exposing protected content.
+
+### Removed
+- Always-record per-streamer mode and related UI/state paths.
+- Scheduled recording feature:
+  - Schedule sidebar shortcut
+  - Schedule recording sheet UI
+  - scheduled recording manager state/monitoring APIs
+
 ## 1.3.1 - 2026-02-19
 
 ### Added
