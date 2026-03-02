@@ -108,6 +108,38 @@ final class BackgroundRecorderAgentManager: ObservableObject {
         recordings.removeAll { $0.login == normalized }
         manualRecordings = recordings
     }
+
+    @discardableResult
+    func stopRecording(login: String) -> Bool {
+        syncQueue.sync {
+            let normalized = login.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !normalized.isEmpty else { return false }
+
+            // Always clear manual intent so the agent config no longer requests this login.
+            var recordings = manualRecordings
+            recordings.removeAll { $0.login == normalized }
+            manualRecordings = recordings
+
+            let lockURL = activeSessionLockURL(for: normalized)
+            guard FileManager.default.fileExists(atPath: lockURL.path),
+                  let data = try? Data(contentsOf: lockURL),
+                  let session = try? JSONDecoder().decode(BackgroundAgentActiveSession.self, from: data) else {
+                try? FileManager.default.removeItem(at: lockURL)
+                return false
+            }
+
+            guard session.pid > 0 else {
+                try? FileManager.default.removeItem(at: lockURL)
+                return false
+            }
+
+            let didSignal = Darwin.kill(session.pid, SIGTERM) == 0 || errno == ESRCH
+            if didSignal || !isProcessAlive(session.pid) {
+                try? FileManager.default.removeItem(at: lockURL)
+            }
+            return didSignal
+        }
+    }
     
     func sync(
         enabled: Bool,
@@ -185,6 +217,14 @@ final class BackgroundRecorderAgentManager: ObservableObject {
         .sorted { lhs, rhs in
             lhs.login.localizedCaseInsensitiveCompare(rhs.login) == .orderedAscending
         }
+    }
+
+    private func activeSessionLockURL(for login: String) -> URL {
+        let safe = login
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "/", with: "_")
+        return activeSessionsDirectory.appendingPathComponent("\(safe).json")
     }
 
     private func bundledHelperPath() -> URL? {
@@ -417,6 +457,14 @@ final class BackgroundRecorderAgentManager: ObservableObject {
             try? FileManager.default.removeItem(at: file)
         }
         return (stopped, failed)
+    }
+
+    private func isProcessAlive(_ pid: Int32) -> Bool {
+        guard pid > 0 else { return false }
+        if Darwin.kill(pid, 0) == 0 {
+            return true
+        }
+        return errno == EPERM
     }
 }
 

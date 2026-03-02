@@ -1682,6 +1682,43 @@ struct HybridTwitchView: View {
                                             isChannelOffline: isStreamOffline,
                                             onSelectPlayback: { request in
                                                 playback = request
+                                            },
+                                            onDownload: { item in
+                                                let target = item.url.absoluteString
+                                                if item.kind == .vod {
+                                                    Task {
+                                                        let resolvedProcessTarget: String?
+                                                        do {
+                                                            let resolvedURL = try await streamlink.getStreamURL(target: target)
+                                                            resolvedProcessTarget = resolvedURL.absoluteString
+                                                        } catch {
+                                                            resolvedProcessTarget = nil
+                                                        }
+
+                                                        let started = await MainActor.run {
+                                                            recordingManager.startRecording(
+                                                                target: target,
+                                                                channelName: channel,
+                                                                quality: "best",
+                                                                processTargetOverride: resolvedProcessTarget
+                                                            )
+                                                        }
+                                                        if !started {
+                                                            await MainActor.run {
+                                                                recordingError = recordingManager.errorMessage ?? "Failed to start download."
+                                                            }
+                                                        }
+                                                    }
+                                                } else {
+                                                    let started = recordingManager.startRecording(
+                                                        target: target,
+                                                        channelName: channel,
+                                                        quality: "best"
+                                                    )
+                                                    if !started {
+                                                        recordingError = recordingManager.errorMessage ?? "Failed to start download."
+                                                    }
+                                                }
                                             }
                                         )
                                     case .schedule:
@@ -3301,7 +3338,7 @@ final class ChannelVideosStore: NSObject, ObservableObject, WKNavigationDelegate
         if #available(macOS 12.0, *) {
             webView.underPageBackgroundColor = .clear
         }
-        webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15"
+        webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Safari/605.1.15"
         return webView
     }
 
@@ -4080,7 +4117,7 @@ final class ChannelScheduleStore: NSObject, ObservableObject, WKNavigationDelega
         if #available(macOS 12.0, *) {
             webView.underPageBackgroundColor = .clear
         }
-        webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15"
+        webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Safari/605.1.15"
         return webView
     }
 
@@ -4726,6 +4763,7 @@ struct ChannelVideosPanelView: View {
     @ObservedObject var store: ChannelVideosStore
     let isChannelOffline: Bool
     let onSelectPlayback: (NativePlaybackRequest) -> Void
+    let onDownload: (ChannelVideoItem) -> Void
 
     private let gridColumns = [
         GridItem(.adaptive(minimum: 200, maximum: 280), spacing: 16, alignment: .top)
@@ -4738,6 +4776,14 @@ struct ChannelVideosPanelView: View {
         case .clips:
             return store.clips
         }
+    }
+
+    private func playbackRequest(for item: ChannelVideoItem) -> NativePlaybackRequest {
+        NativePlaybackRequest(
+            kind: item.kind,
+            streamlinkTarget: item.url.absoluteString,
+            channelName: channelName
+        )
     }
 
     var body: some View {
@@ -4802,17 +4848,23 @@ struct ChannelVideosPanelView: View {
                     LazyVGrid(columns: gridColumns, alignment: .leading, spacing: 16) {
                         ForEach(currentItems) { item in
                             Button {
-                                onSelectPlayback(
-                                    NativePlaybackRequest(
-                                        kind: item.kind,
-                                        streamlinkTarget: item.url.absoluteString,
-                                        channelName: channelName
-                                    )
-                                )
+                                onSelectPlayback(playbackRequest(for: item))
                             } label: {
                                 ChannelVideoCardView(item: item)
                             }
                             .buttonStyle(.plain)
+                            .contextMenu {
+                                Button("Play") {
+                                    onSelectPlayback(playbackRequest(for: item))
+                                }
+                                Button("Download") {
+                                    onDownload(item)
+                                }
+                                Divider()
+                                Button("Open on Twitch") {
+                                    NSWorkspace.shared.open(item.url)
+                                }
+                            }
                         }
                     }
                     .padding(.top, 6)
@@ -5977,7 +6029,7 @@ struct ChannelInfoView: NSViewRepresentable {
         if #available(macOS 12.0, *) {
             webView.underPageBackgroundColor = .clear
         }
-        webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15"
+        webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Safari/605.1.15"
         
         // Load the About page (users can switch tabs to Videos/Schedule)
         let url = URL(string: "https://www.twitch.tv/\(channelName)/about")!
@@ -6120,7 +6172,7 @@ struct ChannelPageWebView: NSViewRepresentable {
         if #available(macOS 12.0, *) {
             webView.underPageBackgroundColor = .clear
         }
-        webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15"
+        webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Safari/605.1.15"
         
         // Charger la page principale de la chaîne (pas /about)
         let url = URL(string: "https://www.twitch.tv/\(channelName)")!

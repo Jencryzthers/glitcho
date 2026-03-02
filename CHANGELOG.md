@@ -4,6 +4,27 @@ All notable user-visible changes are tracked here.
 
 ## Unreleased
 
+## 1.4.2 - 2026-03-02
+
+### Added
+- Downloads badge in the sidebar with live count of active queue items (queued + running).
+- Expanded download queue controls:
+  - remove item from queue/history
+  - resume failed/canceled items
+  - clearer download state labeling
+- Download organization enhancements in the library:
+  - create folders
+  - move selected files between folders/root
+  - capture type labeling (recorded stream vs stream download vs clip download)
+- One-shot background helper mode in `GlitchoRecorderAgent` for download execution.
+
+### Changed
+- Download execution now routes through the bundled background worker helper process.
+- VOD download launch path keeps the native-resolved URL workflow; clip downloads stay on direct clip URL flow.
+- Opening the Downloads page now avoids interactive keychain prompts during list/metadata rendering.
+- Removed start notifications for downloads/recordings (saved/completed notifications remain).
+- Hardened Twitch web/native handoff behavior to reduce hidden background web playback during native switches.
+
 ## 1.4.1 - 2026-03-01
 
 ### Added

@@ -1,6 +1,9 @@
 #if canImport(SwiftUI)
 import Foundation
 import AppKit
+import CryptoKit
+import Network
+import Security
 import WebKit
 
 struct NativePlaybackRequest: Equatable {
@@ -62,6 +65,12 @@ struct ChannelPinRequest: Equatable {
     let nonce: UUID
 }
 
+struct ExternalAuthNotice: Equatable {
+    let message: String
+    let isError: Bool
+    let nonce: UUID
+}
+
 final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WKNavigationDelegate, WKUIDelegate {
     let webView: WKWebView
     let homeURL: URL
@@ -82,6 +91,8 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
     @Published var shouldSwitchToNativePlayback: NativePlaybackRequest? = nil
     @Published var channelNotificationToggle: ChannelNotificationToggle? = nil
     @Published var channelPinRequest: ChannelPinRequest? = nil
+    @Published var externalAuthInProgress = false
+    @Published var externalAuthNotice: ExternalAuthNotice? = nil
 
     private var observations: [NSKeyValueObservation] = []
     private var backgroundWebView: WKWebView?
@@ -96,11 +107,277 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
     private var followedWarmupAttempts = 0
     private var lastFollowedLiveUpdateAt = Date.distantPast
     private var lastFollowedChannelsSyncAt = Date.distantPast
+    private var mainWebViewUsesAuthProfile = false
+    private var hasPurgedTwitchDataForAuth = false
+    private var externalAuthState: StoredExternalAuthState?
+    private var externalAuthTask: Task<Void, Never>?
 
     private static let sharedProcessPool = WKProcessPool()
     private static let twitchWebClientID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
     private static let followedChannelsCacheKey = "webview.followedChannelLogins.v1"
     private static let avatarCacheKey = "webview.offlineAvatarURLs.v1"
+    private static let externalAuthStorageKey = "webview.externalAuthState.v1"
+    private static let externalAuthClientIDOverrideKey = "webview.externalAuthClientID"
+    private static let externalAuthCallbackPath = "/oauth/callback"
+    private static let externalAuthScopes = "user:read:follows"
+
+    private struct StoredExternalAuthState: Codable {
+        let accessToken: String
+        let refreshToken: String?
+        let expiresAt: Date?
+        let login: String?
+        let displayName: String?
+        let avatarURLString: String?
+    }
+
+    private struct OAuthTokenResponse: Decodable {
+        let access_token: String
+        let refresh_token: String?
+        let expires_in: Int?
+    }
+
+    private struct OAuthDeviceCodeResponse: Decodable {
+        let device_code: String
+        let user_code: String
+        let verification_uri: String
+        let verification_uri_complete: String?
+        let expires_in: Int
+        let interval: Int?
+    }
+
+    private struct OAuthValidateResponse: Decodable {
+        let login: String?
+        let user_id: String?
+        let expires_in: Int?
+    }
+
+    private struct OAuthErrorResponse: Decodable {
+        let error: String?
+        let message: String?
+        let status: Int?
+    }
+
+    private enum ExternalOAuthError: LocalizedError {
+        case callbackTimeout
+        case callbackMissingCode
+        case stateMismatch
+        case browserOpenFailed
+        case tokenExchangeFailed(String)
+        case validateFailed(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .callbackTimeout:
+                return "External login timed out waiting for Twitch redirect back to Glitcho."
+            case .callbackMissingCode:
+                return "Login callback did not include an authorization code."
+            case .stateMismatch:
+                return "Login callback state did not match."
+            case .browserOpenFailed:
+                return "Unable to open the system browser for Twitch login."
+            case .tokenExchangeFailed(let message):
+                return "OAuth token exchange failed: \(message)"
+            case .validateFailed(let message):
+                return "OAuth token validation failed: \(message)"
+            }
+        }
+    }
+
+    private final class OAuthCallbackListener {
+        private let expectedState: String
+        private let callbackPath: String
+        private let listener: NWListener
+        private let queue = DispatchQueue(label: "com.glitcho.external-auth-callback")
+        private let readySemaphore = DispatchSemaphore(value: 0)
+        private let callbackSemaphore = DispatchSemaphore(value: 0)
+        private var callbackResult: Result<String, Error>?
+
+        private(set) var port: UInt16 = 0
+
+        init(expectedState: String, callbackPath: String) throws {
+            self.expectedState = expectedState
+            self.callbackPath = callbackPath
+            self.listener = try NWListener(using: .tcp, on: .any)
+
+            listener.stateUpdateHandler = { [weak self] state in
+                guard let self else { return }
+                switch state {
+                case .ready:
+                    self.readySemaphore.signal()
+                case .failed(let error):
+                    self.complete(.failure(error))
+                    self.readySemaphore.signal()
+                case .cancelled:
+                    self.complete(.failure(ExternalOAuthError.callbackTimeout))
+                    self.readySemaphore.signal()
+                default:
+                    break
+                }
+            }
+
+            listener.newConnectionHandler = { [weak self] connection in
+                self?.handle(connection: connection)
+            }
+
+            listener.start(queue: queue)
+            let ready = readySemaphore.wait(timeout: .now() + 5)
+            guard ready == .success,
+                  let rawPort = listener.port?.rawValue else {
+                listener.cancel()
+                throw ExternalOAuthError.callbackTimeout
+            }
+            self.port = rawPort
+        }
+
+        func waitForCode(timeout: TimeInterval) throws -> String {
+            let result = callbackSemaphore.wait(timeout: .now() + timeout)
+            listener.cancel()
+            guard result == .success else {
+                throw ExternalOAuthError.callbackTimeout
+            }
+            guard let callbackResult else {
+                throw ExternalOAuthError.callbackTimeout
+            }
+            switch callbackResult {
+            case .success(let code):
+                return code
+            case .failure(let error):
+                throw error
+            }
+        }
+
+        func cancel() {
+            listener.cancel()
+        }
+
+        private func complete(_ result: Result<String, Error>) {
+            queue.async {
+                guard self.callbackResult == nil else { return }
+                self.callbackResult = result
+                self.callbackSemaphore.signal()
+            }
+        }
+
+        private func handle(connection: NWConnection) {
+            connection.start(queue: queue)
+            connection.receive(minimumIncompleteLength: 1, maximumLength: 16384) { [weak self] data, _, _, error in
+                guard let self else { return }
+                if let error {
+                    self.sendResponse(
+                        to: connection,
+                        status: 500,
+                        title: "Login Error",
+                        body: "Failed to read OAuth callback (\(error.localizedDescription))."
+                    )
+                    self.complete(.failure(error))
+                    return
+                }
+
+                let request = String(data: data ?? Data(), encoding: .utf8) ?? ""
+                let firstLine = request.split(whereSeparator: { $0 == "\r" || $0 == "\n" }).first ?? ""
+                let tokens = firstLine.split(separator: " ")
+                guard tokens.count >= 2 else {
+                    self.sendResponse(
+                        to: connection,
+                        status: 400,
+                        title: "Login Error",
+                        body: "Malformed OAuth callback request."
+                    )
+                    self.complete(.failure(ExternalOAuthError.callbackMissingCode))
+                    return
+                }
+
+                let target = String(tokens[1])
+                guard let components = URLComponents(string: "http://127.0.0.1\(target)") else {
+                    self.sendResponse(
+                        to: connection,
+                        status: 400,
+                        title: "Login Error",
+                        body: "Malformed callback URL."
+                    )
+                    self.complete(.failure(ExternalOAuthError.callbackMissingCode))
+                    return
+                }
+
+                let path = components.path
+                guard path == callbackPath else {
+                    self.sendResponse(
+                        to: connection,
+                        status: 404,
+                        title: "Login Error",
+                        body: "Unexpected callback path."
+                    )
+                    self.complete(.failure(ExternalOAuthError.callbackMissingCode))
+                    return
+                }
+
+                let queryItems = components.queryItems ?? []
+                let errorMessage = queryItems.first(where: { $0.name == "error_description" })?.value
+                    ?? queryItems.first(where: { $0.name == "error" })?.value
+                if let errorMessage, !errorMessage.isEmpty {
+                    self.sendResponse(
+                        to: connection,
+                        status: 400,
+                        title: "Login Error",
+                        body: errorMessage
+                    )
+                    self.complete(.failure(ExternalOAuthError.tokenExchangeFailed(errorMessage)))
+                    return
+                }
+
+                let callbackState = queryItems.first(where: { $0.name == "state" })?.value ?? ""
+                guard callbackState == expectedState else {
+                    self.sendResponse(
+                        to: connection,
+                        status: 400,
+                        title: "Login Error",
+                        body: "State verification failed."
+                    )
+                    self.complete(.failure(ExternalOAuthError.stateMismatch))
+                    return
+                }
+
+                guard let code = queryItems.first(where: { $0.name == "code" })?.value,
+                      !code.isEmpty else {
+                    self.sendResponse(
+                        to: connection,
+                        status: 400,
+                        title: "Login Error",
+                        body: "Authorization code is missing."
+                    )
+                    self.complete(.failure(ExternalOAuthError.callbackMissingCode))
+                    return
+                }
+
+                self.sendResponse(
+                    to: connection,
+                    status: 200,
+                    title: "Login Complete",
+                    body: "You can return to Glitcho."
+                )
+                self.complete(.success(code))
+            }
+        }
+
+        private func sendResponse(to connection: NWConnection, status: Int, title: String, body: String) {
+            let html = """
+            <html><head><meta charset="utf-8"><title>\(title)</title></head>
+            <body style="font-family:-apple-system,system-ui,sans-serif;background:#111;color:#f5f5f5;padding:32px;">
+            <h2>\(title)</h2><p>\(body)</p></body></html>
+            """
+            let payload = Data(html.utf8)
+            var response = "HTTP/1.1 \(status)\r\n"
+            response += "Content-Type: text/html; charset=utf-8\r\n"
+            response += "Content-Length: \(payload.count)\r\n"
+            response += "Connection: close\r\n\r\n"
+
+            var content = Data(response.utf8)
+            content.append(payload)
+            connection.send(content: content, completion: .contentProcessed { _ in
+                connection.cancel()
+            })
+        }
+    }
 
     private struct HelixUsersResponse: Decodable {
         let data: [HelixUser]
@@ -108,6 +385,16 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
 
     private struct HelixUser: Decodable {
         let id: String
+    }
+
+    private struct HelixProfileUsersResponse: Decodable {
+        let data: [HelixProfileUser]
+    }
+
+    private struct HelixProfileUser: Decodable {
+        let login: String
+        let display_name: String?
+        let profile_image_url: String?
     }
 
     private struct HelixFollowedStreamsResponse: Decodable {
@@ -148,7 +435,7 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
         config.userContentController = contentController
         config.websiteDataStore = .default()
         config.defaultWebpagePreferences.allowsContentJavaScript = true
-        config.mediaTypesRequiringUserActionForPlayback = []
+        config.mediaTypesRequiringUserActionForPlayback = [.audio, .video]
 
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.setValue(false, forKey: "drawsBackground")
@@ -162,6 +449,7 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
         super.init()
         followedChannelLogins = loadCachedFollowedChannelLogins()
         offlineChannelAvatarURLs = loadCachedAvatarURLs()
+        restoreExternalAuthStateFromStorage()
         followActionDelegate.onDidFinish = { [weak self] webView in
             self?.runFollowScript(in: webView)
         }
@@ -173,20 +461,12 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
         contentController.add(self, name: "channelPin")
         contentController.add(self, name: "consoleLog")
         contentController.add(self, name: "vodThumbnailRequest")
-        contentController.addUserScript(Self.initialHideScript)
-        contentController.addUserScript(Self.adBlockScript)
-        contentController.addUserScript(Self.codecWorkaroundScript)
-        contentController.addUserScript(Self.twitchNoSubScript)
-        contentController.addUserScript(Self.hideChromeScript)
-        contentController.addUserScript(Self.channelActionsScript)
-        contentController.addUserScript(Self.channelPinContextMenuScript)
-        contentController.addUserScript(Self.ensureLiveStreamScript)
-        contentController.addUserScript(Self.followedLiveScript)
-        contentController.addUserScript(Self.profileScript)
-        contentController.addUserScript(Self.autoPlayScript)
+        Self.installDefaultMainUserScripts(on: contentController)
         webView.navigationDelegate = self
         webView.uiDelegate = self
-        webView.load(URLRequest(url: normalizedTwitchURL(url)))
+        let initialURL = normalizedTwitchURL(url)
+        configureMainWebViewProfile(for: initialURL)
+        webView.load(URLRequest(url: initialURL))
         backgroundWebView = makeBackgroundWebView()
         loadFollowedLiveInBackground()
 
@@ -243,6 +523,7 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
     deinit {
         followedRefreshTimer?.invalidate()
         followActionTeardownWork?.cancel()
+        externalAuthTask?.cancel()
         observations.forEach { $0.invalidate() }
     }
 
@@ -259,11 +540,29 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
     }
 
     func goHome() {
-        webView.load(URLRequest(url: normalizedTwitchURL(homeURL)))
+        let url = normalizedTwitchURL(homeURL)
+        configureMainWebViewProfile(for: url)
+        webView.load(URLRequest(url: url))
     }
 
     func navigate(to url: URL) {
-        webView.load(URLRequest(url: normalizedTwitchURL(url)))
+        let normalized = normalizedTwitchURL(url)
+        configureMainWebViewProfile(for: normalized)
+        if Self.isAuthRoute(url: normalized) {
+            purgeTwitchDataForAuthIfNeeded { [weak self] in
+                self?.webView.load(URLRequest(url: normalized))
+            }
+            return
+        }
+        webView.load(URLRequest(url: normalized))
+    }
+
+    func startExternalBrowserAuth() {
+        if externalAuthInProgress { return }
+        externalAuthTask?.cancel()
+        externalAuthTask = Task { [weak self] in
+            await self?.runExternalBrowserAuthFlow()
+        }
     }
 
     func followChannel(login: String) {
@@ -361,7 +660,7 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
 
         var request = URLRequest(url: components.url!)
         request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
-        request.setValue(Self.twitchWebClientID, forHTTPHeaderField: "Client-Id")
+        request.setValue(currentOAuthClientID(), forHTTPHeaderField: "Client-Id")
 
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse,
@@ -393,7 +692,7 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
 
             var request = URLRequest(url: components.url!)
             request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
-            request.setValue(Self.twitchWebClientID, forHTTPHeaderField: "Client-Id")
+            request.setValue(currentOAuthClientID(), forHTTPHeaderField: "Client-Id")
 
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let httpResponse = response as? HTTPURLResponse,
@@ -462,7 +761,7 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
 
             var request = URLRequest(url: components.url!)
             request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
-            request.setValue(Self.twitchWebClientID, forHTTPHeaderField: "Client-Id")
+            request.setValue(currentOAuthClientID(), forHTTPHeaderField: "Client-Id")
 
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let httpResponse = response as? HTTPURLResponse,
@@ -512,7 +811,7 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
             request.httpMethod = "POST"
             request.httpBody = jsonData
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            request.setValue(Self.twitchWebClientID, forHTTPHeaderField: "Client-ID")
+            request.setValue(currentOAuthClientID(), forHTTPHeaderField: "Client-ID")
             request.setValue("OAuth \(authToken)", forHTTPHeaderField: "Authorization")
 
             let (data, response) = try await URLSession.shared.data(for: request)
@@ -541,6 +840,9 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
     }
 
     private func twitchAuthToken() async -> String? {
+        if let externalToken = currentExternalAuthToken() {
+            return externalToken
+        }
         let cookies = await webKitCookies()
         let names: Set<String> = ["auth-token", "auth_token", "auth-token-next", "auth_token_next"]
         return cookies.first(where: {
@@ -548,23 +850,41 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
         })?.value
     }
 
-    /// Stoppe toute lecture (vidéo/audio) dans le WebView et retourne à la dernière page non-channel.
+    /// Stoppe toute lecture (vidéo/audio) dans le WebView avant bascule vers le player natif.
     func prepareWebViewForNativePlayer() {
         webView.stopLoading()
+        webView.evaluateJavaScript("window.stop();", completionHandler: nil)
         stopWebPlayback()
-        if let lastNonChannelURL {
-            webView.load(URLRequest(url: lastNonChannelURL))
-        } else {
-            webView.load(URLRequest(url: normalizedTwitchURL(homeURL)))
-        }
     }
 
     private func stopWebPlayback() {
         let js = """
         (function() {
           try {
-            document.querySelectorAll('video').forEach(v => { try { v.pause(); v.muted = true; } catch (e) {} });
-            document.querySelectorAll('audio').forEach(a => { try { a.pause(); a.muted = true; } catch (e) {} });
+            function stopAllMedia() {
+              try {
+                document.querySelectorAll('video,audio').forEach(function(el) {
+                  try { el.pause(); } catch (e) {}
+                  try { el.muted = true; } catch (e) {}
+                  try { el.volume = 0; } catch (e) {}
+                  try { el.removeAttribute('autoplay'); } catch (e) {}
+                });
+              } catch (e) {}
+            }
+
+            stopAllMedia();
+            if (window.__glitcho_native_media_stop_timer) {
+              clearInterval(window.__glitcho_native_media_stop_timer);
+            }
+            window.__glitcho_native_media_stop_timer = setInterval(stopAllMedia, 500);
+            setTimeout(function() {
+              try {
+                if (window.__glitcho_native_media_stop_timer) {
+                  clearInterval(window.__glitcho_native_media_stop_timer);
+                  window.__glitcho_native_media_stop_timer = null;
+                }
+              } catch (_) {}
+            }, 12000);
           } catch (e) {}
         })();
         """
@@ -572,6 +892,8 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
     }
 
     func logout() {
+        externalAuthTask?.cancel()
+        clearExternalAuthState()
         let dataStore = WKWebsiteDataStore.default()
         let types = WKWebsiteDataStore.allWebsiteDataTypes()
 
@@ -597,6 +919,495 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
                 }
             }
         }
+    }
+
+    private func restoreExternalAuthStateFromStorage() {
+        guard let data = UserDefaults.standard.data(forKey: Self.externalAuthStorageKey),
+              let state = try? JSONDecoder().decode(StoredExternalAuthState.self, from: data),
+              !state.accessToken.isEmpty else {
+            return
+        }
+
+        if let expiresAt = state.expiresAt, expiresAt <= Date() {
+            clearExternalAuthState()
+            return
+        }
+
+        externalAuthState = state
+        if let login = Self.normalizedNonEmpty(state.login) {
+            profileLogin = login
+        }
+        if let displayName = Self.normalizedNonEmpty(state.displayName) {
+            profileName = displayName
+        } else if let login = Self.normalizedNonEmpty(state.login), profileName == nil {
+            profileName = login
+        }
+        if let avatarString = Self.normalizedNonEmpty(state.avatarURLString),
+           let avatarURL = URL(string: avatarString) {
+            profileAvatarURL = avatarURL
+        }
+        isLoggedIn = true
+        wasLoggedIn = true
+    }
+
+    private func persistExternalAuthState(_ state: StoredExternalAuthState) {
+        externalAuthState = state
+        guard let data = try? JSONEncoder().encode(state) else { return }
+        UserDefaults.standard.set(data, forKey: Self.externalAuthStorageKey)
+    }
+
+    private func clearExternalAuthState() {
+        externalAuthState = nil
+        UserDefaults.standard.removeObject(forKey: Self.externalAuthStorageKey)
+    }
+
+    private func currentExternalAuthToken() -> String? {
+        guard let state = externalAuthState else { return nil }
+        if let expiresAt = state.expiresAt, expiresAt <= Date() {
+            clearExternalAuthState()
+            return nil
+        }
+        let token = state.accessToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        return token.isEmpty ? nil : token
+    }
+
+    private func runExternalBrowserAuthFlow() async {
+        await MainActor.run {
+            self.externalAuthInProgress = true
+            self.externalAuthNotice = nil
+        }
+
+        do {
+            let clientID = currentOAuthClientID()
+            let tokenResponse: OAuthTokenResponse
+            if shouldUseLoopbackCallbackFlow(clientID: clientID) {
+                tokenResponse = try await runLoopbackCallbackAuth(clientID: clientID)
+            } else {
+                tokenResponse = try await runDeviceCodeAuth(clientID: clientID)
+            }
+            let validateResponse = try? await validateOAuthToken(tokenResponse.access_token)
+            let normalizedLogin = Self.normalizedNonEmpty(validateResponse?.login)
+            let profile = await fetchHelixProfile(login: normalizedLogin, authToken: tokenResponse.access_token)
+            let expiresIn = tokenResponse.expires_in ?? validateResponse?.expires_in
+            let expiresAt = expiresIn.map { Date().addingTimeInterval(TimeInterval(max(0, $0 - 60))) }
+            let displayName = Self.normalizedNonEmpty(profile?.display_name)
+                ?? normalizedLogin
+                ?? "Twitch user"
+            let avatarURL = profile?.profile_image_url
+
+            let storedState = StoredExternalAuthState(
+                accessToken: tokenResponse.access_token,
+                refreshToken: tokenResponse.refresh_token,
+                expiresAt: expiresAt,
+                login: normalizedLogin,
+                displayName: displayName,
+                avatarURLString: avatarURL
+            )
+
+            await MainActor.run {
+                self.persistExternalAuthState(storedState)
+                self.profileLogin = normalizedLogin
+                self.profileName = displayName
+                if let avatarURL, let url = URL(string: avatarURL) {
+                    self.profileAvatarURL = url
+                }
+                self.isLoggedIn = true
+                self.wasLoggedIn = true
+                self.externalAuthNotice = ExternalAuthNotice(
+                    message: "Logged in using the system browser.",
+                    isError: false,
+                    nonce: UUID()
+                )
+                self.externalAuthInProgress = false
+                NSApp.activate(ignoringOtherApps: true)
+            }
+
+            _ = await refreshFollowedLiveUsingAPI()
+            await MainActor.run {
+                self.loadFollowedLiveInBackground()
+            }
+        } catch is CancellationError {
+            await MainActor.run {
+                self.externalAuthInProgress = false
+            }
+        } catch let oauthError as ExternalOAuthError {
+            await MainActor.run {
+                self.externalAuthInProgress = false
+                self.externalAuthNotice = ExternalAuthNotice(
+                    message: oauthError.errorDescription ?? "External login failed.",
+                    isError: true,
+                    nonce: UUID()
+                )
+            }
+        } catch {
+            await MainActor.run {
+                self.externalAuthInProgress = false
+                self.externalAuthNotice = ExternalAuthNotice(
+                    message: "External login failed: \(error.localizedDescription)",
+                    isError: true,
+                    nonce: UUID()
+                )
+            }
+        }
+    }
+
+    private func shouldUseLoopbackCallbackFlow(clientID: String) -> Bool {
+        // Twitch's default web client ID does not accept arbitrary localhost redirects.
+        // Keep callback flow for custom client IDs only.
+        return clientID != Self.twitchWebClientID
+    }
+
+    private func runLoopbackCallbackAuth(clientID: String) async throws -> OAuthTokenResponse {
+        let state = Self.randomURLSafeToken(byteCount: 24)
+        let codeVerifier = Self.randomURLSafeToken(byteCount: 64)
+        let codeChallenge = Self.pkceCodeChallenge(for: codeVerifier)
+        let callbackListener = try OAuthCallbackListener(
+            expectedState: state,
+            callbackPath: Self.externalAuthCallbackPath
+        )
+        defer { callbackListener.cancel() }
+
+        let redirectURI = "http://127.0.0.1:\(callbackListener.port)\(Self.externalAuthCallbackPath)"
+        guard let authorizeURL = Self.makeOAuthAuthorizeURL(
+            clientID: clientID,
+            redirectURI: redirectURI,
+            state: state,
+            codeChallenge: codeChallenge
+        ) else {
+            throw ExternalOAuthError.tokenExchangeFailed("Invalid external login URL.")
+        }
+
+        let opened = await MainActor.run { NSWorkspace.shared.open(authorizeURL) }
+        guard opened else {
+            throw ExternalOAuthError.browserOpenFailed
+        }
+
+        await MainActor.run {
+            self.externalAuthNotice = ExternalAuthNotice(
+                message: "Browser opened. Finish Twitch login; Glitcho is waiting for redirect.",
+                isError: false,
+                nonce: UUID()
+            )
+        }
+
+        let authorizationCode = try callbackListener.waitForCode(timeout: 240)
+        return try await exchangeOAuthCodeForToken(
+            code: authorizationCode,
+            redirectURI: redirectURI,
+            codeVerifier: codeVerifier,
+            clientID: clientID
+        )
+    }
+
+    private func runDeviceCodeAuth(clientID: String) async throws -> OAuthTokenResponse {
+        let deviceCode = try await startDeviceCodeFlow(clientID: clientID)
+        guard let verificationURL = Self.makeDeviceVerificationURL(from: deviceCode) else {
+            throw ExternalOAuthError.tokenExchangeFailed("Invalid external login URL.")
+        }
+
+        let opened = await MainActor.run { NSWorkspace.shared.open(verificationURL) }
+        guard opened else {
+            throw ExternalOAuthError.browserOpenFailed
+        }
+
+        await MainActor.run {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(deviceCode.user_code, forType: .string)
+            self.externalAuthNotice = ExternalAuthNotice(
+                message: "Browser opened for Twitch activation (code copied): \(deviceCode.user_code)",
+                isError: false,
+                nonce: UUID()
+            )
+        }
+
+        return try await pollDeviceCodeForToken(
+            clientID: clientID,
+            deviceCode: deviceCode.device_code,
+            initialInterval: deviceCode.interval ?? 5,
+            expiresIn: deviceCode.expires_in
+        )
+    }
+
+    private func startDeviceCodeFlow(clientID: String) async throws -> OAuthDeviceCodeResponse {
+        guard let url = URL(string: "https://id.twitch.tv/oauth2/device") else {
+            throw ExternalOAuthError.tokenExchangeFailed("Invalid device auth endpoint URL.")
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        request.httpBody = Self.formURLEncodedBody([
+            "client_id": clientID,
+            "scopes": Self.externalAuthScopes
+        ])
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw ExternalOAuthError.tokenExchangeFailed("No HTTP response from device auth endpoint.")
+        }
+
+        if (200...299).contains(http.statusCode),
+           let decoded = try? JSONDecoder().decode(OAuthDeviceCodeResponse.self, from: data) {
+            return decoded
+        }
+
+        if let oauthError = try? JSONDecoder().decode(OAuthErrorResponse.self, from: data),
+           let message = oauthError.message ?? oauthError.error {
+            throw ExternalOAuthError.tokenExchangeFailed(message)
+        }
+
+        throw ExternalOAuthError.tokenExchangeFailed("HTTP \(http.statusCode)")
+    }
+
+    private func pollDeviceCodeForToken(
+        clientID: String,
+        deviceCode: String,
+        initialInterval: Int,
+        expiresIn: Int
+    ) async throws -> OAuthTokenResponse {
+        guard let url = URL(string: "https://id.twitch.tv/oauth2/token") else {
+            throw ExternalOAuthError.tokenExchangeFailed("Invalid token endpoint URL.")
+        }
+
+        let deadline = Date().addingTimeInterval(TimeInterval(max(60, expiresIn)))
+        var pollInterval = max(2, initialInterval)
+
+        while Date() < deadline {
+            try Task.checkCancellation()
+
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+            request.httpBody = Self.formURLEncodedBody([
+                "client_id": clientID,
+                "scopes": Self.externalAuthScopes,
+                "device_code": deviceCode,
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code"
+            ])
+
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                throw ExternalOAuthError.tokenExchangeFailed("No HTTP response from token endpoint.")
+            }
+
+            if (200...299).contains(http.statusCode),
+               let decoded = try? JSONDecoder().decode(OAuthTokenResponse.self, from: data),
+               !decoded.access_token.isEmpty {
+                return decoded
+            }
+
+            if let oauthError = try? JSONDecoder().decode(OAuthErrorResponse.self, from: data) {
+                let message = (oauthError.message ?? oauthError.error ?? "").lowercased()
+                if message.contains("authorization_pending") {
+                    try await Task.sleep(nanoseconds: UInt64(pollInterval) * 1_000_000_000)
+                    continue
+                }
+                if message.contains("slow_down") {
+                    pollInterval += 2
+                    try await Task.sleep(nanoseconds: UInt64(pollInterval) * 1_000_000_000)
+                    continue
+                }
+                if message.contains("access_denied") {
+                    throw ExternalOAuthError.tokenExchangeFailed("Authorization was denied in browser.")
+                }
+                if message.contains("expired_token") {
+                    throw ExternalOAuthError.tokenExchangeFailed("Device login expired. Start login again.")
+                }
+                throw ExternalOAuthError.tokenExchangeFailed(oauthError.message ?? oauthError.error ?? "HTTP \(http.statusCode)")
+            }
+
+            throw ExternalOAuthError.tokenExchangeFailed("HTTP \(http.statusCode)")
+        }
+
+        throw ExternalOAuthError.callbackTimeout
+    }
+
+    private func currentOAuthClientID() -> String {
+        let override = UserDefaults.standard
+            .string(forKey: Self.externalAuthClientIDOverrideKey)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let override, !override.isEmpty {
+            return override
+        }
+        return Self.twitchWebClientID
+    }
+
+    private func exchangeOAuthCodeForToken(
+        code: String,
+        redirectURI: String,
+        codeVerifier: String,
+        clientID: String
+    ) async throws -> OAuthTokenResponse {
+        guard let url = URL(string: "https://id.twitch.tv/oauth2/token") else {
+            throw ExternalOAuthError.tokenExchangeFailed("Invalid token endpoint URL.")
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        request.httpBody = Self.formURLEncodedBody([
+            "client_id": clientID,
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": redirectURI,
+            "code_verifier": codeVerifier
+        ])
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw ExternalOAuthError.tokenExchangeFailed("No HTTP response from token endpoint.")
+        }
+
+        if (200...299).contains(http.statusCode),
+           let decoded = try? JSONDecoder().decode(OAuthTokenResponse.self, from: data),
+           !decoded.access_token.isEmpty {
+            return decoded
+        }
+
+        if let oauthError = try? JSONDecoder().decode(OAuthErrorResponse.self, from: data),
+           let message = oauthError.message ?? oauthError.error {
+            throw ExternalOAuthError.tokenExchangeFailed(message)
+        }
+
+        throw ExternalOAuthError.tokenExchangeFailed("HTTP \(http.statusCode)")
+    }
+
+    private func validateOAuthToken(_ accessToken: String) async throws -> OAuthValidateResponse {
+        guard let url = URL(string: "https://id.twitch.tv/oauth2/validate") else {
+            throw ExternalOAuthError.validateFailed("Invalid validation endpoint URL.")
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("OAuth \(accessToken)", forHTTPHeaderField: "Authorization")
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw ExternalOAuthError.validateFailed("No HTTP response from validation endpoint.")
+        }
+
+        if (200...299).contains(http.statusCode),
+           let decoded = try? JSONDecoder().decode(OAuthValidateResponse.self, from: data) {
+            return decoded
+        }
+
+        if let oauthError = try? JSONDecoder().decode(OAuthErrorResponse.self, from: data),
+           let message = oauthError.message ?? oauthError.error {
+            throw ExternalOAuthError.validateFailed(message)
+        }
+
+        throw ExternalOAuthError.validateFailed("HTTP \(http.statusCode)")
+    }
+
+    private func fetchHelixProfile(login: String?, authToken: String) async -> HelixProfileUser? {
+        guard let login = Self.normalizedNonEmpty(login) else { return nil }
+        var components = URLComponents(string: "https://api.twitch.tv/helix/users")!
+        components.queryItems = [URLQueryItem(name: "login", value: login)]
+
+        var request = URLRequest(url: components.url!)
+        request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
+        request.setValue(currentOAuthClientID(), forHTTPHeaderField: "Client-Id")
+
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              let http = response as? HTTPURLResponse,
+              (200...299).contains(http.statusCode),
+              let decoded = try? JSONDecoder().decode(HelixProfileUsersResponse.self, from: data) else {
+            return nil
+        }
+        return decoded.data.first
+    }
+
+    private static func makeOAuthAuthorizeURL(
+        clientID: String,
+        redirectURI: String,
+        state: String,
+        codeChallenge: String
+    ) -> URL? {
+        var components = URLComponents(string: "https://id.twitch.tv/oauth2/authorize")
+        components?.queryItems = [
+            URLQueryItem(name: "response_type", value: "code"),
+            URLQueryItem(name: "client_id", value: clientID),
+            URLQueryItem(name: "redirect_uri", value: redirectURI),
+            URLQueryItem(name: "scope", value: Self.externalAuthScopes),
+            URLQueryItem(name: "state", value: state),
+            URLQueryItem(name: "code_challenge", value: codeChallenge),
+            URLQueryItem(name: "code_challenge_method", value: "S256"),
+            URLQueryItem(name: "force_verify", value: "true")
+        ]
+        return components?.url
+    }
+
+    private static func makeDeviceVerificationURL(from response: OAuthDeviceCodeResponse) -> URL? {
+        if let complete = normalizedNonEmpty(response.verification_uri_complete),
+           let url = URL(string: complete) {
+            return url
+        }
+
+        guard var components = URLComponents(string: response.verification_uri) else {
+            return nil
+        }
+
+        // Some responses provide only twitch.tv or /activate without the code.
+        if components.path.isEmpty || components.path == "/" {
+            components.path = "/activate"
+        }
+
+        var queryItems = components.queryItems ?? []
+        let hasDeviceCode = queryItems.contains {
+            let name = $0.name.lowercased()
+            return name == "device-code" || name == "device_code" || name == "user_code"
+        }
+        if !hasDeviceCode {
+            queryItems.append(URLQueryItem(name: "device-code", value: response.user_code))
+        }
+        let hasPublicFlag = queryItems.contains { $0.name.lowercased() == "public" }
+        if !hasPublicFlag {
+            queryItems.append(URLQueryItem(name: "public", value: "true"))
+        }
+        components.queryItems = queryItems
+
+        return components.url
+    }
+
+    private static func randomURLSafeToken(byteCount: Int) -> String {
+        var bytes = [UInt8](repeating: 0, count: max(16, byteCount))
+        let result = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        if result == errSecSuccess {
+            return base64URLEncode(Data(bytes))
+        }
+        return UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+    }
+
+    private static func pkceCodeChallenge(for verifier: String) -> String {
+        let digest = SHA256.hash(data: Data(verifier.utf8))
+        return base64URLEncode(Data(digest))
+    }
+
+    private static func base64URLEncode(_ data: Data) -> String {
+        data.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+
+    private static func formURLEncodedBody(_ fields: [String: String]) -> Data? {
+        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~")
+        let encoded = fields.compactMap { key, value -> String? in
+            guard let escapedKey = key.addingPercentEncoding(withAllowedCharacters: allowed),
+                  let escapedValue = value.addingPercentEncoding(withAllowedCharacters: allowed) else {
+                return nil
+            }
+            return "\(escapedKey)=\(escapedValue)"
+        }.joined(separator: "&")
+        return encoded.data(using: .utf8)
+    }
+
+    private static func normalizedNonEmpty(_ value: String?) -> String? {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty else {
+            return nil
+        }
+        return value
     }
 
     private func normalizedTwitchURL(_ url: URL) -> URL {
@@ -718,6 +1529,14 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
                 if isFromBackground && !loggedIn && self.isLoggedIn {
                     return
                 }
+                let hasExternalAuth = (self.externalAuthState != nil)
+                if !loggedIn && hasExternalAuth {
+                    if self.isLoggedIn != true {
+                        self.isLoggedIn = true
+                    }
+                    self.wasLoggedIn = true
+                    return
+                }
                 if loggedIn {
                     if !self.wasLoggedIn {
                         self.profileName = nil
@@ -743,13 +1562,14 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
                     }
                     self.lastFollowedChannelsSyncAt = .distantPast
                 }
-                if self.isLoggedIn != loggedIn {
-                    self.isLoggedIn = loggedIn
+                let effectiveLoggedIn = loggedIn || hasExternalAuth
+                if self.isLoggedIn != effectiveLoggedIn {
+                    self.isLoggedIn = effectiveLoggedIn
                 }
-                if loggedIn && !self.wasLoggedIn {
+                if effectiveLoggedIn && !self.wasLoggedIn {
                     self.loadFollowedLiveInBackground()
                 }
-                self.wasLoggedIn = loggedIn
+                self.wasLoggedIn = effectiveLoggedIn
             }
         case "channelNotification":
             guard let dict = message.body as? [String: Any] else { return }
@@ -860,7 +1680,7 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
             components.queryItems = batch.map { URLQueryItem(name: "login", value: $0) }
             var request = URLRequest(url: components.url!)
             request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
-            request.setValue(Self.twitchWebClientID, forHTTPHeaderField: "Client-Id")
+            request.setValue(currentOAuthClientID(), forHTTPHeaderField: "Client-Id")
 
             guard let (data, response) = try? await URLSession.shared.data(for: request),
                   let http = response as? HTTPURLResponse,
@@ -972,6 +1792,8 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard webView === self.webView else { return }
+        guard let currentURL = webView.url, !Self.isAuthRoute(url: currentURL) else { return }
         webView.evaluateJavaScript(Self.hideChromeScriptSource, completionHandler: nil)
     }
 
@@ -993,13 +1815,27 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
         }
 
         let normalized = normalizedTwitchURL(url)
+        if webView === self.webView {
+            configureMainWebViewProfile(for: normalized)
+            if Self.isAuthRoute(url: normalized) {
+                if !hasPurgedTwitchDataForAuth {
+                    decisionHandler(.cancel)
+                    purgeTwitchDataForAuthIfNeeded { [weak self] in
+                        self?.webView.load(URLRequest(url: normalized))
+                    }
+                    return
+                }
+                decisionHandler(.allow)
+                return
+            }
+        }
         if normalized != url {
             decisionHandler(.cancel)
             webView.load(URLRequest(url: normalized))
             return
         }
         
-        if let request = nativePlaybackRequestIfNeeded(url: url) {
+        if webView === self.webView, let request = nativePlaybackRequestIfNeeded(url: url) {
             prepareWebViewForNativePlayer()
             DispatchQueue.main.async {
                 self.shouldSwitchToNativePlayback = request
@@ -1023,6 +1859,70 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
         return nil
     }
 
+    private func purgeTwitchDataForAuthIfNeeded(completion: @escaping () -> Void) {
+        guard !hasPurgedTwitchDataForAuth else {
+            completion()
+            return
+        }
+        hasPurgedTwitchDataForAuth = true
+
+        let dataStore = WKWebsiteDataStore.default()
+        let types = WKWebsiteDataStore.allWebsiteDataTypes()
+        dataStore.fetchDataRecords(ofTypes: types) { records in
+            let toDelete = records.filter(Self.matchesTwitchDataRecord)
+            dataStore.removeData(ofTypes: types, for: toDelete) {
+                completion()
+            }
+        }
+    }
+
+    private static func installDefaultMainUserScripts(on controller: WKUserContentController) {
+        controller.addUserScript(Self.initialHideScript)
+        controller.addUserScript(Self.adBlockScript)
+        controller.addUserScript(Self.codecWorkaroundScript)
+        controller.addUserScript(Self.twitchNoSubScript)
+        controller.addUserScript(Self.hideChromeScript)
+        controller.addUserScript(Self.channelActionsScript)
+        controller.addUserScript(Self.channelPinContextMenuScript)
+        controller.addUserScript(Self.ensureLiveStreamScript)
+        controller.addUserScript(Self.followedLiveScript)
+        controller.addUserScript(Self.profileScript)
+        controller.addUserScript(Self.autoPlayScript)
+    }
+
+    private static func isAuthRoute(url: URL) -> Bool {
+        guard let host = url.host?.lowercased(), host.hasSuffix("twitch.tv") else { return false }
+        let path = url.path.lowercased()
+        return path.hasPrefix("/signup")
+            || path.hasPrefix("/password")
+            || path.hasPrefix("/reset")
+            || path.hasPrefix("/activate")
+    }
+
+    private static func matchesTwitchDataRecord(_ record: WKWebsiteDataRecord) -> Bool {
+        let name = record.displayName.lowercased()
+        return name.contains("twitch") || name.contains("ttvnw") || name.contains("jtv")
+    }
+
+    private func configureMainWebViewProfile(for url: URL) {
+        guard let host = url.host?.lowercased(), host.hasSuffix("twitch.tv") else { return }
+        guard let controller = mainMessageController else { return }
+
+        let shouldUseAuthProfile = Self.isAuthRoute(url: url)
+        guard shouldUseAuthProfile != mainWebViewUsesAuthProfile else { return }
+
+        controller.removeAllUserScripts()
+        if shouldUseAuthProfile {
+            // Keep auth pages as clean as possible; only set a mainstream UA.
+            webView.customUserAgent = Self.chromeAuthUserAgent
+        } else {
+            Self.installDefaultMainUserScripts(on: controller)
+            webView.customUserAgent = Self.safariUserAgent
+            hasPurgedTwitchDataForAuth = false
+        }
+        mainWebViewUsesAuthProfile = shouldUseAuthProfile
+    }
+
     private func makeBackgroundWebView() -> WKWebView {
         let config = WKWebViewConfiguration()
         let contentController = WKUserContentController()
@@ -1031,7 +1931,7 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
         config.userContentController = contentController
         config.websiteDataStore = .default()
         config.defaultWebpagePreferences.allowsContentJavaScript = true
-        config.mediaTypesRequiringUserActionForPlayback = []
+        config.mediaTypesRequiringUserActionForPlayback = [.audio, .video]
 
         contentController.add(self, name: "followedLive")
         contentController.add(self, name: "sideNavFollowedLogins")
@@ -1964,13 +2864,113 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
         forMainFrameOnly: true
     )
 
-    static let safariUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15"
+    // Use a realistic modern Safari UA for Twitch web compatibility checks.
+    static let safariUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Safari/605.1.15"
+    static let chromeAuthUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+
+    private static let browserCompatScript = WKUserScript(
+        source: #"""
+        (function() {
+          if (window.__glitcho_browser_compat_bootstrap) { return; }
+          window.__glitcho_browser_compat_bootstrap = true;
+
+          const el = document.createElement('script');
+          el.type = 'text/javascript';
+          el.textContent = '(' + function() {
+            if (window.__glitcho_browser_compat) { return; }
+            window.__glitcho_browser_compat = true;
+
+            const ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36";
+
+            function defineProp(target, key, value) {
+              try {
+                Object.defineProperty(target, key, {
+                  configurable: true,
+                  get: function() { return value; }
+                });
+              } catch (_) {}
+            }
+
+            defineProp(navigator, 'userAgent', ua);
+            defineProp(navigator, 'appVersion', ua);
+            defineProp(navigator, 'platform', 'MacIntel');
+            defineProp(navigator, 'vendor', 'Google Inc.');
+            defineProp(navigator, 'productSub', '20030107');
+            defineProp(navigator, 'webdriver', false);
+            defineProp(navigator, 'language', 'en-US');
+            defineProp(navigator, 'languages', ['en-US', 'en']);
+            defineProp(navigator, 'plugins', [{ name: 'Chrome PDF Viewer' }]);
+            defineProp(navigator, 'mimeTypes', [{ type: 'application/pdf' }]);
+
+            try {
+              if (!navigator.userAgentData) {
+                const brands = [
+                  { brand: "Chromium", version: "133" },
+                  { brand: "Google Chrome", version: "133" },
+                  { brand: "Not_A Brand", version: "24" }
+                ];
+                const uaData = {
+                  brands: brands,
+                  mobile: false,
+                  platform: "macOS",
+                  getHighEntropyValues: async function(hints) {
+                    const response = {};
+                    const requested = Array.isArray(hints) ? hints : [];
+                    for (const hint of requested) {
+                      if (hint === "architecture") { response.architecture = "x86"; }
+                      else if (hint === "bitness") { response.bitness = "64"; }
+                      else if (hint === "model") { response.model = ""; }
+                      else if (hint === "platform") { response.platform = "macOS"; }
+                      else if (hint === "platformVersion") { response.platformVersion = "14.7.2"; }
+                      else if (hint === "uaFullVersion") { response.uaFullVersion = "133.0.0.0"; }
+                    }
+                    return response;
+                  }
+                };
+                defineProp(navigator, 'userAgentData', uaData);
+              }
+            } catch (_) {}
+
+            try {
+              if (!window.chrome) {
+                defineProp(window, 'chrome', {
+                  runtime: {},
+                  app: {},
+                  webstore: {},
+                  csi: function() { return {}; },
+                  loadTimes: function() { return {}; }
+                });
+              } else {
+                if (!window.chrome.runtime) { window.chrome.runtime = {}; }
+                if (!window.chrome.webstore) { window.chrome.webstore = {}; }
+              }
+            } catch (_) {}
+          }.toString() + ')();';
+
+          (document.documentElement || document.head || document.body).appendChild(el);
+          try { el.remove(); } catch (_) {}
+        })();
+        """#,
+        injectionTime: .atDocumentStart,
+        forMainFrameOnly: true
+    )
 
     private static let adBlockScript = WKUserScript(
         source: """
         (function() {
           if (window.__purple_adblock) { return; }
           window.__purple_adblock = true;
+
+          const _path = (location.pathname || '').toLowerCase();
+          if (
+            _path.startsWith('/login') ||
+            _path.startsWith('/signup') ||
+            _path.startsWith('/password') ||
+            _path.startsWith('/reset') ||
+            _path.startsWith('/activate')
+          ) {
+            return;
+          }
 
           // Enhanced Adblock - Network request blocking (inspired by uBlock Origin)
           const blockedDomains = new Set([
@@ -2559,6 +3559,18 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
               if (window.__glitcho_twitchnosub) { return; }
               window.__glitcho_twitchnosub = true;
 
+              const _path = (window.location.pathname || '').toLowerCase();
+              // Only run TwitchNoSub logic on VOD/video surfaces.
+              // Running globally can interfere with Twitch auth/app bootstrap.
+              const _isVideoSurface =
+                _path.includes('/videos') ||
+                _path.includes('/clip') ||
+                _path.includes('/clips') ||
+                _path.includes('/collections');
+              if (!_isVideoSurface) {
+                return;
+              }
+
               // Amazon Worker Patch - This needs to run in the Web Worker context
               const amazonWorkerPatchScript = \`
             async function fetchTwitchDataGQL(vodID) {
@@ -2713,14 +3725,25 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
               const oldWorker = window.Worker;
 
               window.Worker = class Worker extends oldWorker {
-                constructor(twitchBlobUrl) {
+                constructor(workerUrl, options) {
+                  const urlString = workerUrl && workerUrl.toString ? workerUrl.toString() : "";
+                  const isBlobWorker = typeof urlString === "string" && urlString.startsWith("blob:");
+                  const isModuleWorker = !!(options && options.type === "module");
+
+                  // Keep native behavior for non-blob or module workers to avoid
+                  // breaking modern loader/runtime workers used by Twitch stories.
+                  if (!isBlobWorker || isModuleWorker) {
+                    super(workerUrl, options);
+                    return;
+                  }
+
                   try {
-                    var workerString = getWasmWorkerJs(twitchBlobUrl.toString().replaceAll("'", "%27"));
-                    const patchedCode = amazonWorkerPatchScript + '\n' + workerString;
+                    const workerString = getWasmWorkerJs(urlString.replaceAll("'", "%27"));
+                    const patchedCode = amazonWorkerPatchScript + '\\n' + workerString;
                     const blobUrl = URL.createObjectURL(new Blob([patchedCode], { type: 'application/javascript' }));
-                    super(blobUrl);
-                  } catch (e) {
-                    throw e;
+                    super(blobUrl, options);
+                  } catch (_) {
+                    super(workerUrl, options);
                   }
                 }
               };
@@ -3255,6 +4278,33 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
         (function() {
           if (window.__twitchglass_autoplay) { return; }
           window.__twitchglass_autoplay = true;
+
+          function isNativeManagedRoute() {
+            try {
+              const host = (location.host || '').toLowerCase();
+              const pathParts = (location.pathname || '')
+                .split('/')
+                .filter(Boolean)
+                .map(p => p.toLowerCase());
+
+              if (host === 'clips.twitch.tv') { return true; }
+              if (!host.endsWith('twitch.tv') || pathParts.length === 0) { return false; }
+
+              const first = pathParts[0];
+              const reserved = new Set([
+                'directory', 'downloads', 'login', 'logout', 'search', 'settings', 'signup', 'p',
+                'following', 'browse', 'drops', 'subs', 'inventory'
+              ]);
+
+              if (first === 'videos' && pathParts.length >= 2) { return true; }
+              if (first === 'clip' && pathParts.length >= 2) { return true; }
+              if (pathParts.length >= 3 && pathParts[1] === 'clip') { return true; }
+              if (!reserved.has(first) && pathParts.length === 1) { return true; }
+            } catch (e) {}
+            return false;
+          }
+
+          if (isNativeManagedRoute()) { return; }
 
           function tryPlayOnce() {
             const video = document.querySelector('video');

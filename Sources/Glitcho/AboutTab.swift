@@ -1114,7 +1114,7 @@ final class AboutTabStore: NSObject, ObservableObject, WKNavigationDelegate, WKS
         if #available(macOS 12.0, *) {
             view.underPageBackgroundColor = .clear
         }
-        view.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15"
+        view.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Safari/605.1.15"
         return view
     }
 

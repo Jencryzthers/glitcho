@@ -3,7 +3,12 @@ import Security
 import LocalAuthentication
 
 enum KeychainHelper {
-    static func get(service: String, account: String, allowUserInteraction: Bool = false) -> String? {
+    struct LookupResult {
+        let status: OSStatus
+        let data: Data?
+    }
+
+    static func getData(service: String, account: String, allowUserInteraction: Bool = false) -> LookupResult {
         var query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: service,
@@ -12,13 +17,24 @@ enum KeychainHelper {
             kSecMatchLimit: kSecMatchLimitOne
         ]
         let context = LAContext()
-        context.touchIDAuthenticationAllowableReuseDuration = LATouchIDAuthenticationMaximumAllowableReuseDuration
         context.interactionNotAllowed = !allowUserInteraction
+        if allowUserInteraction {
+            context.touchIDAuthenticationAllowableReuseDuration = LATouchIDAuthenticationMaximumAllowableReuseDuration
+        }
         query[kSecUseAuthenticationContext] = context
 
         var result: AnyObject?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
-        guard status == errSecSuccess, let data = result as? Data else { return nil }
+        return LookupResult(status: status, data: result as? Data)
+    }
+
+    static func get(service: String, account: String, allowUserInteraction: Bool = false) -> String? {
+        let lookup = getData(
+            service: service,
+            account: account,
+            allowUserInteraction: allowUserInteraction
+        )
+        guard lookup.status == errSecSuccess, let data = lookup.data else { return nil }
         return String(data: data, encoding: .utf8)
     }
 

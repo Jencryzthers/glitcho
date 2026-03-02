@@ -22,6 +22,13 @@ private struct RetryState {
     var nextAttemptAt: Date
 }
 
+struct OneShotDownloadConfig {
+    let streamlinkPath: String?
+    let target: String
+    let quality: String
+    let outputPath: String
+}
+
 private struct RecordingSession {
     let process: Process
     let errorPipe: Pipe
@@ -34,6 +41,134 @@ private struct ActiveSessionLock: Codable {
     let pid: Int32
     let outputPath: String
     let startedAt: Date
+}
+
+private func argumentValue(for flag: String, in arguments: [String]) -> String? {
+    guard let index = arguments.firstIndex(of: flag),
+          arguments.indices.contains(index + 1) else {
+        return nil
+    }
+    return arguments[index + 1]
+}
+
+private func parseOneShotDownloadConfig(from arguments: [String]) -> OneShotDownloadConfig? {
+    guard arguments.contains("--run-download") else { return nil }
+    guard let target = argumentValue(for: "--target", in: arguments)?
+        .trimmingCharacters(in: .whitespacesAndNewlines),
+          !target.isEmpty,
+          let outputPath = argumentValue(for: "--output", in: arguments)?
+        .trimmingCharacters(in: .whitespacesAndNewlines),
+          !outputPath.isEmpty else {
+        return nil
+    }
+
+    let quality = argumentValue(for: "--quality", in: arguments)?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    let streamlinkPath = argumentValue(for: "--streamlink-path", in: arguments)?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+
+    return OneShotDownloadConfig(
+        streamlinkPath: streamlinkPath?.isEmpty == false ? streamlinkPath : nil,
+        target: target,
+        quality: quality?.isEmpty == false ? quality! : "best",
+        outputPath: outputPath
+    )
+}
+
+private func resolveStreamlinkExecutable(configuredPath: String?) -> String? {
+    if let configured = configuredPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+       !configured.isEmpty,
+       FileManager.default.isExecutableFile(atPath: configured) {
+        return configured
+    }
+
+    let candidates = [
+        "/opt/homebrew/bin/streamlink",
+        "/usr/local/bin/streamlink",
+        "/usr/bin/streamlink"
+    ]
+    for path in candidates where FileManager.default.isExecutableFile(atPath: path) {
+        return path
+    }
+    return nil
+}
+
+final class OneShotDownloadRunner {
+    private var streamlinkProcess: Process?
+    private var signalSources: [DispatchSourceSignal] = []
+
+    func run(config: OneShotDownloadConfig) -> Int32 {
+        guard let streamlinkPath = resolveStreamlinkExecutable(configuredPath: config.streamlinkPath) else {
+            fputs("[RecorderAgent] Streamlink path not found\n", stderr)
+            return 1
+        }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: streamlinkPath)
+        process.arguments = [
+            config.target,
+            config.quality,
+            "--twitch-disable-ads",
+            "--twitch-low-latency",
+            "--output",
+            config.outputPath
+        ]
+
+        let stderrPipe = Pipe()
+        let stdoutPipe = Pipe()
+        process.standardError = stderrPipe
+        process.standardOutput = stdoutPipe
+
+        streamlinkProcess = process
+        installTerminationForwarders()
+        forward(pipe: stderrPipe, to: FileHandle.standardError)
+        forward(pipe: stdoutPipe, to: FileHandle.standardError)
+
+        do {
+            try process.run()
+        } catch {
+            teardownTerminationForwarders()
+            fputs("[RecorderAgent] Failed to start Streamlink: \(error.localizedDescription)\n", stderr)
+            return 1
+        }
+
+        process.waitUntilExit()
+        stderrPipe.fileHandleForReading.readabilityHandler = nil
+        stdoutPipe.fileHandleForReading.readabilityHandler = nil
+        teardownTerminationForwarders()
+        return process.terminationStatus
+    }
+
+    private func forward(pipe: Pipe, to output: FileHandle) {
+        pipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty else {
+                handle.readabilityHandler = nil
+                return
+            }
+            output.write(data)
+        }
+    }
+
+    private func installTerminationForwarders() {
+        signal(SIGTERM, SIG_IGN)
+        signal(SIGINT, SIG_IGN)
+
+        let queue = DispatchQueue(label: "com.glitcho.recorder-agent.download.signals")
+        [SIGTERM, SIGINT].forEach { sig in
+            let source = DispatchSource.makeSignalSource(signal: sig, queue: queue)
+            source.setEventHandler { [weak self] in
+                self?.streamlinkProcess?.terminate()
+            }
+            source.resume()
+            signalSources.append(source)
+        }
+    }
+
+    private func teardownTerminationForwarders() {
+        signalSources.forEach { $0.cancel() }
+        signalSources.removeAll()
+    }
 }
 
 final class RecorderAgent {
@@ -165,6 +300,7 @@ final class RecorderAgent {
                 session.process.terminate()
             }
         }
+        terminateUndesiredLockSessions(desiredLogins: desiredLogins)
 
         guard !combinedChannels.isEmpty else { return }
 
@@ -206,6 +342,41 @@ final class RecorderAgent {
         }
     }
 
+    private func terminateUndesiredLockSessions(desiredLogins: Set<String>) {
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: activeSessionsDirectory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else {
+            return
+        }
+
+        for file in files where file.pathExtension.lowercased() == "json" {
+            guard let data = try? Data(contentsOf: file),
+                  let lock = try? JSONDecoder().decode(ActiveSessionLock.self, from: data) else {
+                try? FileManager.default.removeItem(at: file)
+                continue
+            }
+
+            let login = lock.login.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !desiredLogins.contains(login) else { continue }
+
+            if !isProcessAlive(lock.pid) {
+                try? FileManager.default.removeItem(at: file)
+                continue
+            }
+
+            if kill(lock.pid, SIGTERM) == 0 || errno == ESRCH {
+                print("[RecorderAgent] Stop requested for undesired session \(login) (PID \(lock.pid))")
+                if errno == ESRCH {
+                    try? FileManager.default.removeItem(at: file)
+                }
+            } else {
+                print("[RecorderAgent] Failed to stop undesired session \(login) (PID \(lock.pid))")
+            }
+        }
+    }
+
     private func normalizedChannels(from channels: [AgentChannel]) -> [AgentChannel] {
         var seen = Set<String>()
         return channels.compactMap { channel in
@@ -221,21 +392,7 @@ final class RecorderAgent {
     }
 
     private func resolveStreamlinkPath() -> String? {
-        if let configured = config.streamlinkPath?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !configured.isEmpty,
-           FileManager.default.isExecutableFile(atPath: configured) {
-            return configured
-        }
-
-        let candidates = [
-            "/opt/homebrew/bin/streamlink",
-            "/usr/local/bin/streamlink",
-            "/usr/bin/streamlink"
-        ]
-        for path in candidates where FileManager.default.isExecutableFile(atPath: path) {
-            return path
-        }
-        return nil
+        resolveStreamlinkExecutable(configuredPath: config.streamlinkPath)
     }
 
     private func startRecording(channel: AgentChannel, streamlinkPath: String) throws {
@@ -377,8 +534,15 @@ private func parseConfigPath(from arguments: [String]) -> String? {
     return nil
 }
 
-guard let configPathArgument = parseConfigPath(from: Array(CommandLine.arguments.dropFirst())) else {
+let cliArguments = Array(CommandLine.arguments.dropFirst())
+if let downloadConfig = parseOneShotDownloadConfig(from: cliArguments) {
+    let runner = OneShotDownloadRunner()
+    exit(runner.run(config: downloadConfig))
+}
+
+guard let configPathArgument = parseConfigPath(from: cliArguments) else {
     fputs("Usage: GlitchoRecorderAgent --config <path>\n", stderr)
+    fputs("   or: GlitchoRecorderAgent --run-download --target <url> --output <path> [--quality best] [--streamlink-path /path/to/streamlink]\n", stderr)
     exit(2)
 }
 

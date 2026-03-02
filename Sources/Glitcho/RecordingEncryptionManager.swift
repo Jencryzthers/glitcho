@@ -2,6 +2,7 @@ import Foundation
 import CryptoKit
 import AVFoundation
 import AppKit
+import Security
 
 #if canImport(SwiftUI)
 
@@ -10,6 +11,47 @@ struct RecordingManifestEntry: Codable, Equatable {
     let date: Date
     let quality: String
     let originalFilename: String
+    let sourceType: RecordingCaptureType
+
+    private enum CodingKeys: String, CodingKey {
+        case channelName
+        case date
+        case quality
+        case originalFilename
+        case sourceType
+    }
+
+    init(
+        channelName: String,
+        date: Date,
+        quality: String,
+        originalFilename: String,
+        sourceType: RecordingCaptureType = .liveRecording
+    ) {
+        self.channelName = channelName
+        self.date = date
+        self.quality = quality
+        self.originalFilename = originalFilename
+        self.sourceType = sourceType
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        channelName = try container.decode(String.self, forKey: .channelName)
+        date = try container.decode(Date.self, forKey: .date)
+        quality = try container.decode(String.self, forKey: .quality)
+        originalFilename = try container.decode(String.self, forKey: .originalFilename)
+        sourceType = try container.decodeIfPresent(RecordingCaptureType.self, forKey: .sourceType) ?? .liveRecording
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(channelName, forKey: .channelName)
+        try container.encode(date, forKey: .date)
+        try container.encode(quality, forKey: .quality)
+        try container.encode(originalFilename, forKey: .originalFilename)
+        try container.encode(sourceType, forKey: .sourceType)
+    }
 }
 
 final class RecordingEncryptionManager {
@@ -24,44 +66,138 @@ final class RecordingEncryptionManager {
     /// Override for unit tests to avoid real Keychain access.
     var _keyOverride: SymmetricKey?
 
+    private enum KeyUse {
+        case encrypt
+        case decrypt
+    }
+
     // MARK: - Key Management (Task 1)
 
     func encryptionKey() -> SymmetricKey {
         if let override = _keyOverride { return override }
         if let cached = Self.cachedKey { return cached }
-
-        // Try loading from Keychain.
-        if let stored = KeychainHelper.get(
-            service: Self.keychainService,
-            account: Self.keychainAccount,
-            allowUserInteraction: true
-        ),
-           let data = Data(base64Encoded: stored),
-           data.count == 32 {
-            let key = SymmetricKey(data: data)
-            Self.cachedKey = key
-            return key
+        if let resolved = try? resolveKey(for: .encrypt) {
+            return resolved
         }
 
-        // Generate and persist a new key.
+        // Legacy non-throwing accessor fallback: avoid crashing call-sites that still
+        // use this helper directly. Production encrypt/decrypt paths use `resolveKey`.
         let key = SymmetricKey(size: .bits256)
-        let keyData = key.withUnsafeBytes { Data($0) }
-        let persisted = KeychainHelper.set(
-            keyData.base64EncodedString(),
-            service: Self.keychainService,
-            account: Self.keychainAccount
-        )
-        if !persisted {
-            GlitchoTelemetry.track("encryption_key_persist_failed")
-        }
         Self.cachedKey = key
         return key
+    }
+
+    private func securityMessage(for status: OSStatus) -> String {
+        guard let text = SecCopyErrorMessageString(status, nil) as String? else {
+            return "\(status)"
+        }
+        return "\(status) (\(text))"
+    }
+
+    private func resolveKey(for use: KeyUse) throws -> SymmetricKey {
+        if let override = _keyOverride { return override }
+        if let cached = Self.cachedKey { return cached }
+
+        var requiredInteractiveUnlock = false
+        var lookup = KeychainHelper.getData(
+            service: Self.keychainService,
+            account: Self.keychainAccount,
+            allowUserInteraction: false
+        )
+        if lookup.status == errSecInteractionNotAllowed {
+            requiredInteractiveUnlock = true
+            lookup = KeychainHelper.getData(
+                service: Self.keychainService,
+                account: Self.keychainAccount,
+                allowUserInteraction: true
+            )
+        }
+
+        switch lookup.status {
+        case errSecSuccess:
+            guard let raw = lookup.data,
+                  let stored = String(data: raw, encoding: .utf8),
+                  let keyData = Data(base64Encoded: stored),
+                  keyData.count == 32 else {
+                throw EncryptionError.keyMaterialCorrupted
+            }
+
+            // Legacy builds may have created the key with ACL that always prompts.
+            // After one successful interactive unlock, normalize the item to our
+            // default non-interactive accessibility to prevent repeated prompts.
+            if requiredInteractiveUnlock {
+                _ = KeychainHelper.set(
+                    keyData.base64EncodedString(),
+                    service: Self.keychainService,
+                    account: Self.keychainAccount
+                )
+            }
+
+            let key = SymmetricKey(data: keyData)
+            Self.cachedKey = key
+            return key
+
+        case errSecItemNotFound:
+            // Never auto-create on decrypt/read paths; that would silently "rotate"
+            // and make existing recordings appear corrupted.
+            guard use == .encrypt else {
+                throw EncryptionError.missingKey
+            }
+
+            let key = SymmetricKey(size: .bits256)
+            let keyData = key.withUnsafeBytes { Data($0) }
+            let persisted = KeychainHelper.set(
+                keyData.base64EncodedString(),
+                service: Self.keychainService,
+                account: Self.keychainAccount
+            )
+            guard persisted else {
+                throw EncryptionError.keyPersistFailed
+            }
+            Self.cachedKey = key
+            return key
+
+        default:
+            throw EncryptionError.keychainAccessFailed(securityMessage(for: lookup.status))
+        }
+    }
+
+    fileprivate func decryptionKeyForStreaming() throws -> SymmetricKey {
+        try resolveKey(for: .decrypt)
+    }
+
+    private func resolveKeyIfAvailableWithoutInteraction(for use: KeyUse) throws -> SymmetricKey? {
+        if let override = _keyOverride { return override }
+        if let cached = Self.cachedKey { return cached }
+
+        let lookup = KeychainHelper.getData(
+            service: Self.keychainService,
+            account: Self.keychainAccount,
+            allowUserInteraction: false
+        )
+
+        switch lookup.status {
+        case errSecSuccess:
+            guard let raw = lookup.data,
+                  let stored = String(data: raw, encoding: .utf8),
+                  let keyData = Data(base64Encoded: stored),
+                  keyData.count == 32 else {
+                throw EncryptionError.keyMaterialCorrupted
+            }
+            let key = SymmetricKey(data: keyData)
+            Self.cachedKey = key
+            return key
+        case errSecInteractionNotAllowed, errSecItemNotFound:
+            return nil
+        default:
+            throw EncryptionError.keychainAccessFailed(securityMessage(for: lookup.status))
+        }
     }
 
     // MARK: - Encrypt & Decrypt (Task 2)
 
     func encrypt(data: Data) throws -> Data {
-        let key = encryptionKey()
+        let key = try resolveKey(for: .encrypt)
         let sealed = try AES.GCM.seal(data, using: key)
         guard let combined = sealed.combined else {
             throw EncryptionError.sealFailed
@@ -70,15 +206,25 @@ final class RecordingEncryptionManager {
     }
 
     func decrypt(data: Data) throws -> Data {
-        let key = encryptionKey()
-        let box = try AES.GCM.SealedBox(combined: data)
-        return try AES.GCM.open(box, using: key)
+        let key = try resolveKey(for: .decrypt)
+        do {
+            let box = try AES.GCM.SealedBox(combined: data)
+            return try AES.GCM.open(box, using: key)
+        } catch {
+            // Hide raw CryptoKit errors so UI can present a meaningful recovery hint.
+            throw EncryptionError.decryptionFailed
+        }
     }
 
     enum EncryptionError: LocalizedError {
         case sealFailed
         case manifestCorrupted
         case fileNotFound(String)
+        case decryptionFailed
+        case missingKey
+        case keyMaterialCorrupted
+        case keyPersistFailed
+        case keychainAccessFailed(String)
 
         var errorDescription: String? {
             switch self {
@@ -88,6 +234,16 @@ final class RecordingEncryptionManager {
                 return "The recordings manifest could not be read. Recordings metadata may be lost."
             case .fileNotFound(let name):
                 return "Recording file not found: \(name)"
+            case .decryptionFailed:
+                return "This recording could not be decrypted with the current key. The key may have changed, or the file is corrupted."
+            case .missingKey:
+                return "Recording key was not found in Keychain. Existing encrypted recordings cannot be decrypted."
+            case .keyMaterialCorrupted:
+                return "Recording key in Keychain is invalid."
+            case .keyPersistFailed:
+                return "Could not save recording key to Keychain."
+            case .keychainAccessFailed(let detail):
+                return "Keychain access failed: \(detail)"
             }
         }
     }
@@ -128,6 +284,33 @@ final class RecordingEncryptionManager {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         return try decoder.decode([String: RecordingManifestEntry].self, from: json)
+    }
+
+    /// Non-interactive manifest read used by list rendering paths. Returns `nil`
+    /// when the key is currently unavailable without user interaction.
+    func loadManifestIfAvailableWithoutInteraction(from directory: URL) -> [String: RecordingManifestEntry]? {
+        manifestQueue.sync {
+            let url = directory.appendingPathComponent(Self.manifestFilename)
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                return [:]
+            }
+            guard let key = try? resolveKeyIfAvailableWithoutInteraction(for: .decrypt) else {
+                return nil
+            }
+            guard let encrypted = try? Data(contentsOf: url) else {
+                return [:]
+            }
+
+            do {
+                let box = try AES.GCM.SealedBox(combined: encrypted)
+                let json = try AES.GCM.open(box, using: key)
+                let decoder = JSONDecoder()
+                decoder.dateDecodingStrategy = .iso8601
+                return try decoder.decode([String: RecordingManifestEntry].self, from: json)
+            } catch {
+                return [:]
+            }
+        }
     }
 
     // MARK: - Serialized Manifest Access
@@ -218,7 +401,8 @@ final class RecordingEncryptionManager {
         in directory: URL,
         channelName: String? = nil,
         quality: String = "best",
-        date: Date = Date()
+        date: Date = Date(),
+        sourceType: RecordingCaptureType = .liveRecording
     ) throws -> EncryptFileResult {
         let originalFilename = sourceURL.lastPathComponent
 
@@ -275,7 +459,8 @@ final class RecordingEncryptionManager {
             channelName: resolvedChannelName,
             date: resolvedDate,
             quality: quality,
-            originalFilename: originalFilename
+            originalFilename: originalFilename,
+            sourceType: sourceType
         )
 
         return EncryptFileResult(hashFilename: hashFilename, entry: entry)
@@ -442,6 +627,10 @@ final class RecordingEncryptionManager {
         let stem = filename.replacingOccurrences(of: ".mp4", with: "")
         let parts = stem.split(separator: "_")
         guard parts.count >= 3 else { return stem }
+        if parts.count >= 4,
+           RecordingCaptureType.fromFilenameTag(String(parts[parts.count - 3])) != nil {
+            return parts.dropLast(3).joined(separator: "_")
+        }
         return parts.dropLast(2).joined(separator: "_")
     }
 
@@ -552,7 +741,7 @@ final class GlitchoStreamResourceLoader: NSObject, AVAssetResourceLoaderDelegate
             // Legacy single-block: decrypt everything once and cache it.
             fh.seek(toFileOffset: 0)
             let encrypted = fh.readDataToEndOfFile()
-            let key = encryptionManager.encryptionKey()
+            let key = try encryptionManager.decryptionKeyForStreaming()
             let box = try AES.GCM.SealedBox(combined: encrypted)
             let plain = try AES.GCM.open(box, using: key)
             cachedLegacyData = plain
@@ -584,7 +773,7 @@ final class GlitchoStreamResourceLoader: NSObject, AVAssetResourceLoaderDelegate
             let endChunk   = min(chunkCount - 1, (reqEnd - 1) / Self.plainChunkSize)
             guard startChunk <= endChunk else { return }
 
-            let key = encryptionManager.encryptionKey()
+            let key = try encryptionManager.decryptionKeyForStreaming()
             for idx in startChunk...endChunk {
                 let chunkFileOff = UInt64(Self.headerSize + idx * Self.chunkBlockSize)
                 fh.seek(toFileOffset: chunkFileOff)
@@ -611,7 +800,7 @@ final class GlitchoStreamResourceLoader: NSObject, AVAssetResourceLoaderDelegate
             } else {
                 fh.seek(toFileOffset: 0)
                 let encrypted = fh.readDataToEndOfFile()
-                let key = encryptionManager.encryptionKey()
+                let key = try encryptionManager.decryptionKeyForStreaming()
                 let box = try AES.GCM.SealedBox(combined: encrypted)
                 plain = try AES.GCM.open(box, using: key)
                 cachedLegacyData = plain

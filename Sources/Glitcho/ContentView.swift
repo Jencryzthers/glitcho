@@ -82,7 +82,6 @@ struct ContentView: View {
     @State private var toastMessage: String? = nil
     @State private var toastIcon: String = "pin.slash"
     @State private var pendingManualRecordingAction: PendingManualRecordingAction?
-    private let pinnedLimit = 8
     private let autoRecordEvaluationTimer = Timer.publish(every: 20, on: .main, in: .common).autoconnect()
     @State private var pendingSyncWork: DispatchWorkItem?
     @State private var pendingFollowedLiveWork: DispatchWorkItem?
@@ -155,6 +154,13 @@ struct ContentView: View {
             guard let request else { return }
             handleChannelPinRequest(request)
             store.channelPinRequest = nil
+        }
+        .onChange(of: store.externalAuthNotice) { notice in
+            guard let notice else { return }
+            showToast(
+                message: notice.message,
+                icon: notice.isError ? "exclamationmark.triangle.fill" : "checkmark.circle.fill"
+            )
         }
         .onChange(of: liveAlertsEnabled) { isEnabled in
             if isEnabled, let notificationManager {
@@ -365,7 +371,6 @@ struct ContentView: View {
                 store: store,
                 recordingManager: recordingManager,
                 pinnedChannels: $pinnedChannels,
-                pinnedLimit: pinnedLimit,
                 liveAlertsEnabled: $liveAlertsEnabled,
                 onTogglePin: { channel in
                     togglePinned(channel: channel)
@@ -419,10 +424,7 @@ struct ContentView: View {
                 showPinnedSection: shouldShowPinned,
                 showRecentSection: shouldShowRecent,
                 protectedStreamerLogins: protectedStreamerLogins,
-                isBiometricUnlocked: canViewProtectedStreamerContent,
-                onPinLimitReached: {
-                    showToast(message: "You've reached the limit of \(pinnedLimit) favorites! 💜", icon: "heart.fill")
-                }
+                isBiometricUnlocked: canViewProtectedStreamerContent
             )
             .navigationSplitViewColumnWidth(295)
         } detail: {
@@ -591,7 +593,7 @@ struct ContentView: View {
         if recordingManager.isRecording(channelLogin: login) {
             recordingManager.stopRecording(channelLogin: login)
         }
-        backgroundAgentManager.removeManualRecording(login: login)
+        _ = backgroundAgentManager.stopRecording(login: login)
         scheduleSyncBackgroundRecordingAgent()
         autoRecordSuppressedLogins.insert(login)
         autoRecordRetryState.removeValue(forKey: login)
@@ -608,7 +610,7 @@ struct ContentView: View {
         let decoded = decodePinnedChannels(from: pinnedChannelsJSON)
         var seen = Set<String>()
         let unique = decoded.filter { seen.insert($0.login).inserted }
-        pinnedChannels = Array(unique.prefix(pinnedLimit))
+        pinnedChannels = unique
         updateChannelBellStateIfNeeded()
     }
 
@@ -654,8 +656,6 @@ struct ContentView: View {
             pinnedChannels = updated
             return true
         }
-
-        guard pinnedChannels.count < pinnedLimit else { return false }
 
         var updated = pinnedChannels
         let pin = PinnedChannel(login: normalized, displayName: displayName, thumbnailURL: thumbnailURL, notifyEnabled: true)
@@ -1386,7 +1386,6 @@ struct Sidebar: View {
     @ObservedObject var store: WebViewStore
     @ObservedObject var recordingManager: RecordingManager
     @Binding var pinnedChannels: [PinnedChannel]
-    let pinnedLimit: Int
     @Binding var liveAlertsEnabled: Bool
     @AppStorage(SidebarTint.storageKey) private var sidebarTintHex = SidebarTint.defaultHex
     var onTogglePin: ((TwitchChannel) -> Void)?
@@ -1407,7 +1406,6 @@ struct Sidebar: View {
     var showRecentSection: Bool = true
     var protectedStreamerLogins: Set<String> = []
     var isBiometricUnlocked: Bool = false
-    var onPinLimitReached: (() -> Void)?
     @AppStorage("recentChannels.v1") private var recentChannelsData: Data = Data()
     @AppStorage("sidebar.pinnedCollapsed") private var pinnedCollapsed = false
     @AppStorage("sidebar.recentCollapsed") private var recentCollapsed = false
@@ -1425,6 +1423,12 @@ struct Sidebar: View {
     ]
     private var sidebarTint: Color {
         SidebarTint.color(from: sidebarTintHex)
+    }
+
+    private var activeDownloadCount: Int {
+        recordingManager.downloadTasks.filter { task in
+            task.state == .running || task.state == .queued
+        }.count
     }
 
     var body: some View {
@@ -1477,21 +1481,33 @@ struct Sidebar: View {
                     .buttonStyle(.plain)
                     .help("Log out")
                 } else {
-                    Button {
-                        let url = URL(string: "https://www.twitch.tv/login")!
-                        onNavigate?(url) ?? store.navigate(to: url)
-                    } label: {
-                        Text("Log in")
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 6)
-                            .background(
-                                Capsule()
-                                    .fill(Color.purple.opacity(0.8))
-                            )
+                    VStack(alignment: .trailing, spacing: 6) {
+                        Button {
+                            store.externalAuthNotice = nil
+                            let url = URL(string: "https://www.twitch.tv/login")!
+                            onNavigate?(url) ?? store.navigate(to: url)
+                        } label: {
+                            Text("Log in")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 6)
+                                .background(
+                                    Capsule()
+                                        .fill(Color.purple.opacity(0.8))
+                                )
+                        }
+                        .buttonStyle(.plain)
+
+                        if let notice = store.externalAuthNotice {
+                            Text(notice.message)
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundStyle(notice.isError ? Color.red.opacity(0.92) : Color.white.opacity(0.62))
+                                .multilineTextAlignment(.trailing)
+                                .frame(maxWidth: 210, alignment: .trailing)
+                                .lineLimit(3)
+                        }
                     }
-                    .buttonStyle(.plain)
                 }
             }
             .padding(.horizontal, 16)
@@ -1554,8 +1570,9 @@ struct Sidebar: View {
 
                     if showRecordingsNavigation {
                         SidebarRow(
-                            title: "Recordings",
-                            systemImage: "record.circle"
+                            title: "Downloads",
+                            systemImage: "record.circle",
+                            badgeCount: activeDownloadCount > 0 ? activeDownloadCount : nil
                         ) {
                             onShowRecordings?()
                         }
@@ -1592,18 +1609,14 @@ struct Sidebar: View {
 
                             if !pinnedCollapsed {
                                 Button(action: {
-                                    if pinnedChannels.count >= pinnedLimit {
-                                        onPinLimitReached?()
-                                    } else {
-                                        toggleAddPin()
-                                    }
+                                    toggleAddPin()
                                 }) {
                                     Image(systemName: "plus.circle.fill")
                                         .font(.system(size: 12, weight: .semibold))
-                                        .foregroundStyle(.white.opacity(pinnedChannels.count >= pinnedLimit ? 0.2 : 0.6))
+                                        .foregroundStyle(.white.opacity(0.6))
                                 }
                                 .buttonStyle(.plain)
-                                .help(pinnedChannels.count >= pinnedLimit ? "Favorites limit reached" : "Add favorite")
+                                .help("Add favorite")
                             }
                         }
                         .padding(.horizontal, 12)
@@ -1821,11 +1834,7 @@ struct Sidebar: View {
                                     NSPasteboard.general.setString(channel.url.absoluteString, forType: .string)
                                 }
                                 Button(pinnedLogins.contains(channel.login) ? "Unpin from Favorites" : "Pin to Favorites") {
-                                    if !pinnedLogins.contains(channel.login) && pinnedChannels.count >= pinnedLimit {
-                                        onPinLimitReached?()
-                                    } else {
-                                        onTogglePin?(channel)
-                                    }
+                                    onTogglePin?(channel)
                                 }
                                 Divider()
                                 if shouldShowAllowlistAction {
@@ -1920,15 +1929,6 @@ struct Sidebar: View {
             pinError = "Enter a channel name."
             return
         }
-        if pinnedChannels.count >= pinnedLimit {
-            onPinLimitReached?()
-            withAnimation(.easeOut(duration: 0.12)) {
-                isAddingPin = false
-            }
-            newPinText = ""
-            pinError = nil
-            return
-        }
         let didAdd = onAddPin?(trimmed) ?? false
         if didAdd {
             newPinText = ""
@@ -1991,7 +1991,7 @@ struct TwitchDestination: Identifiable, Hashable {
     let icon: String
 
     static let home = TwitchDestination(title: "Home", url: URL(string: "https://www.twitch.tv")!, icon: "house")
-    static let following = TwitchDestination(title: "Following", url: URL(string: "https://www.twitch.tv/directory/following")!, icon: "heart")
+    static let following = TwitchDestination(title: "Following", url: URL(string: "https://www.twitch.tv/following")!, icon: "heart")
     static let browse = TwitchDestination(title: "Browse", url: URL(string: "https://www.twitch.tv/directory")!, icon: "sparkles.tv")
     static let categories = TwitchDestination(title: "Categories", url: URL(string: "https://www.twitch.tv/directory/categories")!, icon: "rectangle.grid.2x2")
     static let music = TwitchDestination(title: "Music", url: URL(string: "https://www.twitch.tv/directory/category/music")!, icon: "music.note")
@@ -2026,6 +2026,7 @@ struct GlassCard<Content: View>: View {
 struct SidebarRow: View {
     let title: String
     let systemImage: String
+    var badgeCount: Int? = nil
     let action: () -> Void
     @State private var isHovered = false
 
@@ -2040,6 +2041,17 @@ struct SidebarRow: View {
                     .font(.system(size: 13, weight: .medium))
                     .foregroundColor(isHovered ? .white : .white.opacity(0.7))
                 Spacer()
+                if let badgeCount, badgeCount > 0 {
+                    Text("\(badgeCount)")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(
+                            Capsule(style: .continuous)
+                                .fill(Color.red.opacity(0.92))
+                        )
+                }
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
