@@ -6,7 +6,6 @@ enum BiometricLockSettings {
     static let hideRecordingsStorageKey = "biometricLock.hideRecordings"
     static let recordingsRequireAuthOnOpenStorageKey = "biometricLock.recordingsRequireAuthOnOpen"
     static let hidePinnedStorageKey = "biometricLock.hidePinned"
-    static let hideRecentStorageKey = "biometricLock.hideRecent"
     static let protectedStreamersStorageKey = "biometricLock.protectedStreamers"
     static let autoProtectAllowlistedStorageKey = "biometricLock.autoProtectAllowlisted"
     static let hidePrivacySettingsUntilAuthenticatedStorageKey = "biometricLock.hidePrivacySettingsUntilAuthenticated"

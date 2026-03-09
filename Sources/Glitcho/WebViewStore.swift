@@ -109,6 +109,7 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
     private var lastFollowedChannelsSyncAt = Date.distantPast
     private var mainWebViewUsesAuthProfile = false
     private var hasPurgedTwitchDataForAuth = false
+    private var webPlaybackSuppressed = false
     private var externalAuthState: StoredExternalAuthState?
     private var externalAuthTask: Task<Void, Never>?
 
@@ -852,12 +853,26 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
 
     /// Stoppe toute lecture (vidéo/audio) dans le WebView avant bascule vers le player natif.
     func prepareWebViewForNativePlayer() {
-        webView.stopLoading()
-        webView.evaluateJavaScript("window.stop();", completionHandler: nil)
-        stopWebPlayback()
+        webPlaybackSuppressed = true
+        stopWebPlayback(in: webView, stopLoading: true)
+        stopWebPlayback(in: backgroundWebView)
+        stopWebPlayback(in: followActionWebView)
     }
 
-    private func stopWebPlayback() {
+    func restoreWebPlaybackAfterNativePlayer() {
+        guard webPlaybackSuppressed else { return }
+        webPlaybackSuppressed = false
+        restoreWebPlayback(in: webView)
+        restoreWebPlayback(in: backgroundWebView)
+        restoreWebPlayback(in: followActionWebView)
+    }
+
+    private func stopWebPlayback(in targetWebView: WKWebView?, stopLoading: Bool = false) {
+        guard let targetWebView else { return }
+        if stopLoading {
+            targetWebView.stopLoading()
+            targetWebView.evaluateJavaScript("window.stop();", completionHandler: nil)
+        }
         let js = """
         (function() {
           try {
@@ -872,23 +887,62 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
               } catch (e) {}
             }
 
-            stopAllMedia();
-            if (window.__glitcho_native_media_stop_timer) {
-              clearInterval(window.__glitcho_native_media_stop_timer);
+            if (!window.__glitcho_native_media_original_play &&
+                window.HTMLMediaElement &&
+                HTMLMediaElement.prototype &&
+                typeof HTMLMediaElement.prototype.play === 'function') {
+              window.__glitcho_native_media_original_play = HTMLMediaElement.prototype.play;
+              HTMLMediaElement.prototype.play = function() {
+                try { this.pause(); } catch (e) {}
+                try { this.muted = true; this.volume = 0; } catch (e) {}
+                return Promise.resolve();
+              };
             }
-            window.__glitcho_native_media_stop_timer = setInterval(stopAllMedia, 500);
-            setTimeout(function() {
-              try {
-                if (window.__glitcho_native_media_stop_timer) {
-                  clearInterval(window.__glitcho_native_media_stop_timer);
-                  window.__glitcho_native_media_stop_timer = null;
-                }
-              } catch (_) {}
-            }, 12000);
+
+            stopAllMedia();
+
+            if (!window.__glitcho_native_media_observer &&
+                window.MutationObserver &&
+                document.documentElement) {
+              window.__glitcho_native_media_observer = new MutationObserver(stopAllMedia);
+              window.__glitcho_native_media_observer.observe(document.documentElement, {
+                childList: true,
+                subtree: true
+              });
+            }
+
+            if (!window.__glitcho_native_media_stop_timer) {
+              window.__glitcho_native_media_stop_timer = setInterval(stopAllMedia, 750);
+            }
           } catch (e) {}
         })();
         """
-        webView.evaluateJavaScript(js, completionHandler: nil)
+        targetWebView.evaluateJavaScript(js, completionHandler: nil)
+    }
+
+    private func restoreWebPlayback(in targetWebView: WKWebView?) {
+        guard let targetWebView else { return }
+        let js = """
+        (function() {
+          try {
+            if (window.__glitcho_native_media_stop_timer) {
+              clearInterval(window.__glitcho_native_media_stop_timer);
+              window.__glitcho_native_media_stop_timer = null;
+            }
+            if (window.__glitcho_native_media_observer) {
+              try { window.__glitcho_native_media_observer.disconnect(); } catch (_) {}
+              window.__glitcho_native_media_observer = null;
+            }
+            if (window.__glitcho_native_media_original_play &&
+                window.HTMLMediaElement &&
+                HTMLMediaElement.prototype) {
+              HTMLMediaElement.prototype.play = window.__glitcho_native_media_original_play;
+              window.__glitcho_native_media_original_play = null;
+            }
+          } catch (_) {}
+        })();
+        """
+        targetWebView.evaluateJavaScript(js, completionHandler: nil)
     }
 
     func logout() {
@@ -1469,9 +1523,14 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
             "directory", "downloads", "login", "logout", "search", "settings", "signup", "p",
             "following", "browse", "drops", "subs", "inventory"
         ]
+        let channelSubpages: Set<String> = ["home", "about", "schedule", "videos", "clips", "streams"]
         let channel = first.lowercased()
         guard !reserved.contains(channel) else { return nil }
-        guard parts.count == 1 else { return nil }
+
+        if parts.count >= 2 {
+            let second = parts[1].lowercased()
+            guard channelSubpages.contains(second) else { return nil }
+        }
 
         return NativePlaybackRequest(kind: .liveChannel, streamlinkTarget: "twitch.tv/\(first)", channelName: first)
     }
@@ -1947,6 +2006,9 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
         webView.customUserAgent = Self.safariUserAgent
         webView.navigationDelegate = self
         webView.uiDelegate = self
+        if webPlaybackSuppressed {
+            stopWebPlayback(in: webView)
+        }
         return webView
     }
 
@@ -1964,6 +2026,9 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
         webView.setValue(false, forKey: "drawsBackground")
         if #available(macOS 12.0, *) {
             webView.underPageBackgroundColor = .clear
+        }
+        if webPlaybackSuppressed {
+            stopWebPlayback(in: webView)
         }
 
         followActionWebView = webView

@@ -1,0 +1,19 @@
+{
+  "name": "glitcho-commerce-site",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "NODE_ENV=development node --watch src/server.js",
+    "start": "NODE_ENV=production node src/server.js",
+    "test": "node --test tests/*.test.js"
+  },
+  "dependencies": {
+    "cookie-parser": "^1.4.7",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2",
+    "lowdb": "^7.0.1",
+    "nodemailer": "^6.9.16",
+    "stripe": "^17.5.0"
+  }
+}

@@ -1,0 +1,6 @@
+.env
+
+data/license-keys.json
+data/license-private.pem
+data/license-public.pem
+data/license-public-raw.b64

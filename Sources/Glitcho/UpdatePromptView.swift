@@ -1,11 +1,25 @@
 #if canImport(SwiftUI)
 import SwiftUI
 
+private enum UpdatePromptChrome {
+    static let textPrimary = Color.white.opacity(0.92)
+    static let textSecondary = Color.white.opacity(0.72)
+    static let textMuted = Color.white.opacity(0.58)
+    static let panelBorder = Color.white.opacity(0.12)
+    static let softFill = Color.white.opacity(0.08)
+    static let softFillStrong = Color.white.opacity(0.14)
+}
+
 struct UpdatePromptView: View {
     let update: UpdateChecker.UpdateInfo
     let onDismiss: () -> Void
 
     @Environment(\.openURL) private var openURL
+    @AppStorage(SidebarTint.storageKey) private var sidebarTintHex = SidebarTint.defaultHex
+
+    private var accentColor: Color {
+        SidebarTint.color(from: sidebarTintHex)
+    }
 
     var body: some View {
         ZStack {
@@ -26,9 +40,14 @@ struct UpdatePromptView: View {
             .background(
                 ZStack {
                     LinearGradient(
-                        colors: [Color.white.opacity(0.08), Color.clear],
+                        colors: [accentColor.opacity(0.22), Color.clear],
                         startPoint: .topLeading,
                         endPoint: .bottomTrailing
+                    )
+                    LinearGradient(
+                        colors: [Color.white.opacity(0.07), Color.clear],
+                        startPoint: .bottomTrailing,
+                        endPoint: .topLeading
                     )
                     VisualEffectView(material: .hudWindow, blendingMode: .withinWindow)
                         .opacity(0.9)
@@ -37,7 +56,7 @@ struct UpdatePromptView: View {
             .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .stroke(Color.white.opacity(0.12), lineWidth: 1)
+                    .stroke(UpdatePromptChrome.panelBorder, lineWidth: 1)
             )
             .shadow(color: Color.black.opacity(0.4), radius: 30, x: 0, y: 12)
         }
@@ -55,11 +74,11 @@ struct UpdatePromptView: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Update Available")
                     .font(.system(size: 18, weight: .semibold))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(UpdatePromptChrome.textPrimary)
 
                 Text("Glitcho \(update.latestVersion)")
                     .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.65))
+                    .foregroundStyle(UpdatePromptChrome.textSecondary)
             }
 
             Spacer()
@@ -67,9 +86,9 @@ struct UpdatePromptView: View {
             Button(action: onDismiss) {
                 Image(systemName: "xmark")
                     .font(.system(size: 11, weight: .bold))
-                    .foregroundStyle(.white.opacity(0.6))
+                    .foregroundStyle(UpdatePromptChrome.textSecondary)
                     .frame(width: 26, height: 26)
-                    .background(Color.white.opacity(0.08))
+                    .background(UpdatePromptChrome.softFill)
                     .clipShape(Circle())
             }
             .buttonStyle(.plain)
@@ -80,11 +99,11 @@ struct UpdatePromptView: View {
         VStack(alignment: .leading, spacing: 6) {
             Text("A newer version of Glitcho is ready to install.")
                 .font(.system(size: 13, weight: .medium))
-                .foregroundStyle(.white.opacity(0.9))
+                .foregroundStyle(UpdatePromptChrome.textPrimary)
 
             Text("You are currently on \(update.currentVersion). We recommend updating to ensure the best performance and stability.")
                 .font(.system(size: 12))
-                .foregroundStyle(.white.opacity(0.65))
+                .foregroundStyle(UpdatePromptChrome.textSecondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -93,21 +112,21 @@ struct UpdatePromptView: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("What's new")
                 .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.8))
+                .foregroundStyle(UpdatePromptChrome.textSecondary)
 
             ScrollView {
                 Text(notes)
                     .font(.system(size: 12))
-                    .foregroundStyle(.white.opacity(0.65))
+                    .foregroundStyle(UpdatePromptChrome.textSecondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             .frame(maxHeight: 120)
             .padding(12)
-            .background(Color.white.opacity(0.06))
+            .background(UpdatePromptChrome.softFill)
             .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                    .stroke(Color.white.opacity(0.09), lineWidth: 1)
             )
         }
     }
@@ -116,10 +135,10 @@ struct UpdatePromptView: View {
         HStack(spacing: 12) {
             Button("Not Now", action: onDismiss)
                 .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.75))
+                .foregroundStyle(UpdatePromptChrome.textSecondary)
                 .padding(.horizontal, 16)
                 .padding(.vertical, 8)
-                .background(Color.white.opacity(0.08))
+                .background(UpdatePromptChrome.softFill)
                 .clipShape(Capsule())
                 .buttonStyle(.plain)
 
@@ -134,17 +153,21 @@ struct UpdatePromptView: View {
                     Text("Download Update")
                 }
                 .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(.white)
+                .foregroundStyle(UpdatePromptChrome.textPrimary)
                 .padding(.horizontal, 16)
                 .padding(.vertical, 8)
                 .background(
                     LinearGradient(
-                        colors: [Color.blue.opacity(0.9), Color.cyan.opacity(0.85)],
+                        colors: [accentColor.opacity(0.96), accentColor.opacity(0.72)],
                         startPoint: .leading,
                         endPoint: .trailing
                     )
                 )
                 .clipShape(Capsule())
+                .overlay(
+                    Capsule(style: .continuous)
+                        .stroke(Color.white.opacity(0.16), lineWidth: 1)
+                )
             }
             .buttonStyle(.plain)
         }

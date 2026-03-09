@@ -1,0 +1,14 @@
+{
+  "PRO-ANNUAL-TEST": {
+    "entitlements": ["recording"],
+    "expiresAt": "2027-01-01T00:00:00Z",
+    "revoked": false,
+    "plan": "annual"
+  },
+  "PRO-LIFETIME-TEST": {
+    "entitlements": ["recording"],
+    "expiresAt": null,
+    "revoked": false,
+    "plan": "lifetime"
+  }
+}

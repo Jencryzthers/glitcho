@@ -12,4 +12,8 @@ struct CompanionRecordingStopRequest: Codable {
     let channelLogin: String?
 }
 
+struct CompanionDownloadTaskRequest: Codable {
+    let id: String?
+}
+
 #endif

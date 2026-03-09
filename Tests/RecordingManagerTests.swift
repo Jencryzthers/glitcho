@@ -157,6 +157,21 @@ final class RecordingManagerTests: XCTestCase {
         return condition()
     }
 
+    private func assertEventuallyTrue(
+        timeout: TimeInterval = 5.0,
+        pollIntervalNanoseconds: UInt64 = 50_000_000,
+        _ condition: @escaping () -> Bool,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        let value = await waitUntil(
+            timeout: timeout,
+            pollIntervalNanoseconds: pollIntervalNanoseconds,
+            condition: condition
+        )
+        XCTAssertTrue(value, file: file, line: line)
+    }
+
     private func persistedRecoveryIntents() -> [RecordingManager.RecoveryIntent] {
         guard let data = UserDefaults.standard.data(forKey: recoveryDefaultsKey) else { return [] }
         return (try? JSONDecoder().decode([RecordingManager.RecoveryIntent].self, from: data)) ?? []
@@ -217,7 +232,25 @@ final class RecordingManagerTests: XCTestCase {
         }
     }
 
-    func testPrepareRecordingForPlayback_ThrowsWhenFFmpegNotFound() async throws {
+    func testPrepareRecordingForPlayback_ReturnsTransportStreamTempCopyWhenFFmpegNotFound() async throws {
+        try await withTemporaryDirectory { dir in
+            let inputURL = dir.appendingPathComponent("input.mp4")
+            let tsData = makeTransportStreamLikeData()
+            try tsData.write(to: inputURL)
+
+            let manager = RecordingManager()
+            manager._resolveFFmpegPathOverride = { nil }
+            let result = try await manager.prepareRecordingForPlayback(at: inputURL)
+            defer { try? FileManager.default.removeItem(at: result.url) }
+
+            XCTAssertFalse(result.didRemux)
+            XCTAssertEqual(result.url.pathExtension.lowercased(), "ts")
+            XCTAssertTrue(FileManager.default.fileExists(atPath: result.url.path))
+            XCTAssertEqual(try Data(contentsOf: result.url), tsData)
+        }
+    }
+
+    func testPrepareRecordingForPlayback_ThrowsWhenFFmpegNotFoundAndFallbackDisabled() async throws {
         try await withTemporaryDirectory { dir in
             let inputURL = dir.appendingPathComponent("input.mp4")
             try makeTransportStreamLikeData().write(to: inputURL)
@@ -226,11 +259,55 @@ final class RecordingManagerTests: XCTestCase {
             manager._resolveFFmpegPathOverride = { nil }
 
             do {
-                _ = try await manager.prepareRecordingForPlayback(at: inputURL)
-                XCTFail("Expected prepareRecordingForPlayback() to throw when ffmpeg is not found")
+                _ = try await manager.prepareRecordingForPlayback(
+                    at: inputURL,
+                    allowTransportStreamFallback: false
+                )
+                XCTFail("Expected prepareRecordingForPlayback() to throw when ffmpeg is not found and fallback is disabled")
             } catch {
                 XCTAssertTrue(error.localizedDescription.contains("FFmpeg was not found"))
             }
+        }
+    }
+
+    func testPrepareRecordingForPlayback_DecryptsGlitchoAndFallsBackToTransportTempWhenFFmpegNotFound() async throws {
+        try await withTemporaryDirectory { dir in
+            let sourceURL = dir.appendingPathComponent("encrypted-source.mp4")
+            let tsData = makeTransportStreamLikeData()
+            try tsData.write(to: sourceURL)
+
+            let encryption = RecordingEncryptionManager()
+            let encrypted = try encryption.encryptFile(at: sourceURL, in: dir)
+            let glitchoURL = dir.appendingPathComponent(encrypted.hashFilename)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: glitchoURL.path))
+
+            let manager = RecordingManager()
+            manager._resolveFFmpegPathOverride = { nil }
+
+            let result = try await manager.prepareRecordingForPlayback(at: glitchoURL)
+            defer { try? FileManager.default.removeItem(at: result.url) }
+
+            XCTAssertFalse(result.didRemux)
+            XCTAssertEqual(result.url.pathExtension.lowercased(), "ts")
+            XCTAssertTrue(FileManager.default.fileExists(atPath: result.url.path))
+            XCTAssertEqual(try Data(contentsOf: result.url), tsData)
+        }
+    }
+
+    func testPrepareRecordingForPlayback_DoesNotRequireFFmpegForNonTransportStreamMP4() async throws {
+        try await withTemporaryDirectory { dir in
+            let inputURL = dir.appendingPathComponent("input.mp4")
+            var mp4LikeData = Data(repeating: 0, count: 32)
+            mp4LikeData.replaceSubrange(4..<8, with: Data("ftyp".utf8))
+            try mp4LikeData.write(to: inputURL)
+
+            let manager = RecordingManager()
+            manager._resolveFFmpegPathOverride = { nil }
+
+            let result = try await manager.prepareRecordingForPlayback(at: inputURL)
+            XCTAssertEqual(result.url, inputURL)
+            XCTAssertFalse(result.didRemux)
+            XCTAssertEqual(try Data(contentsOf: inputURL), mp4LikeData)
         }
     }
 
@@ -361,7 +438,7 @@ final class RecordingManagerTests: XCTestCase {
                 }
 
                 manager.stopRecording()
-                XCTAssertTrue(await waitUntil { manager.activeRecordingCount == 0 })
+                await assertEventuallyTrue { manager.activeRecordingCount == 0 }
             }
         }
     }
@@ -380,14 +457,14 @@ final class RecordingManagerTests: XCTestCase {
                 XCTAssertTrue(manager.isRecording(channelLogin: "streamerb"))
 
                 manager.stopRecording(channelLogin: "streamera")
-                XCTAssertTrue(await waitUntil {
+                await assertEventuallyTrue {
                     manager.activeRecordingCount == 1 &&
                     !manager.isRecording(channelLogin: "streamera") &&
                     manager.isRecording(channelLogin: "streamerb")
-                })
+                }
 
                 manager.stopRecording()
-                XCTAssertTrue(await waitUntil { manager.activeRecordingCount == 0 })
+                await assertEventuallyTrue { manager.activeRecordingCount == 0 }
             }
         }
     }
@@ -404,14 +481,14 @@ final class RecordingManagerTests: XCTestCase {
                 XCTAssertEqual(manager.activeRecordingCount, 2)
 
                 manager.toggleRecording(target: "twitch.tv/streamera", channelName: "Streamer A")
-                XCTAssertTrue(await waitUntil {
+                await assertEventuallyTrue {
                     manager.activeRecordingCount == 1 &&
                     !manager.isRecording(channelLogin: "streamera") &&
                     manager.isRecording(channelLogin: "streamerb")
-                })
+                }
 
                 manager.toggleRecording(target: "twitch.tv/streamerb", channelName: "Streamer B")
-                XCTAssertTrue(await waitUntil { manager.activeRecordingCount == 0 })
+                await assertEventuallyTrue { manager.activeRecordingCount == 0 }
             }
         }
     }
@@ -425,7 +502,7 @@ final class RecordingManagerTests: XCTestCase {
                     manager._resolveStreamlinkPathOverride = { fakeStreamlink.path }
 
                     XCTAssertTrue(manager.startRecording(target: "twitch.tv/streamera", channelName: "Streamer A"))
-                    XCTAssertTrue(await waitUntil { manager.isRecording(channelLogin: "streamera") })
+                    await assertEventuallyTrue { manager.isRecording(channelLogin: "streamera") }
 
                     XCTAssertTrue(manager.startRecording(target: "twitch.tv/streamerb", channelName: "Streamer B"))
                     XCTAssertEqual(manager.recorderOrchestrator.state(for: "streamerb"), .queued)
@@ -433,13 +510,13 @@ final class RecordingManagerTests: XCTestCase {
 
                     manager.stopRecording(channelLogin: "streamera")
 
-                    XCTAssertTrue(await waitUntil {
+                    await assertEventuallyTrue {
                         manager.recorderOrchestrator.state(for: "streamerb") == .recording
                             && manager.isRecording(channelLogin: "streamerb")
-                    })
+                    }
 
                     manager.stopRecording()
-                    XCTAssertTrue(await waitUntil { manager.activeRecordingCount == 0 })
+                    await assertEventuallyTrue { manager.activeRecordingCount == 0 }
                 }
             }
         }
@@ -454,7 +531,7 @@ final class RecordingManagerTests: XCTestCase {
                     manager._resolveStreamlinkPathOverride = { fakeStreamlink.path }
 
                     XCTAssertTrue(manager.startRecording(target: "twitch.tv/streamera", channelName: "Streamer A"))
-                    XCTAssertTrue(await waitUntil { manager.isRecording(channelLogin: "streamera") })
+                    await assertEventuallyTrue { manager.isRecording(channelLogin: "streamera") }
 
                     XCTAssertTrue(manager.startRecording(target: "twitch.tv/streamerb", channelName: "Streamer B"))
                     XCTAssertEqual(manager.recorderOrchestrator.state(for: "streamerb"), .queued)
@@ -463,11 +540,11 @@ final class RecordingManagerTests: XCTestCase {
                     XCTAssertEqual(manager.recorderOrchestrator.state(for: "streamerb"), .idle)
 
                     manager.stopRecording(channelLogin: "streamera")
-                    XCTAssertTrue(await waitUntil {
+                    await assertEventuallyTrue {
                         manager.activeRecordingCount == 0
                             && !manager.isRecording(channelLogin: "streamerb")
                             && manager.recorderOrchestrator.state(for: "streamerb") == .idle
-                    })
+                    }
                 }
             }
         }
@@ -482,16 +559,16 @@ final class RecordingManagerTests: XCTestCase {
 
                 XCTAssertEqual(manager.recorderOrchestrator.state(for: "streamera"), .idle)
                 XCTAssertTrue(manager.startRecording(target: "twitch.tv/streamera", channelName: "Streamer A"))
-                XCTAssertTrue(await waitUntil {
+                await assertEventuallyTrue {
                     manager.recorderOrchestrator.state(for: "streamera") == .recording
-                })
+                }
 
                 manager.stopRecording(channelLogin: "streamera")
                 XCTAssertEqual(manager.recorderOrchestrator.state(for: "streamera"), .stopping)
 
-                XCTAssertTrue(await waitUntil {
+                await assertEventuallyTrue {
                     manager.recorderOrchestrator.state(for: "streamera") == .idle
-                })
+                }
                 XCTAssertEqual(manager.activeRecordingCount, 0)
             }
         }
@@ -505,9 +582,9 @@ final class RecordingManagerTests: XCTestCase {
                 manager._resolveStreamlinkPathOverride = { failingStreamlink.path }
 
                 XCTAssertTrue(manager.startRecording(target: "twitch.tv/streamera", channelName: "Streamer A"))
-                XCTAssertTrue(await waitUntil {
+                await assertEventuallyTrue {
                     manager.recorderOrchestrator.state(for: "streamera") == .retrying
-                })
+                }
 
                 guard let metadata = manager.recorderOrchestrator.retryMetadata(for: "streamera") else {
                     XCTFail("Expected retry metadata after failure")
@@ -560,17 +637,245 @@ final class RecordingManagerTests: XCTestCase {
                 manager._resolveStreamlinkPathOverride = { fakeStreamlink.path }
 
                 XCTAssertTrue(manager.startRecording(target: "twitch.tv/streamera", channelName: "Streamer A"))
-                XCTAssertTrue(await waitUntil { manager.activeRecordingCount == 1 })
+                await assertEventuallyTrue { manager.activeRecordingCount == 1 }
 
                 let persistedWhileActive = persistedRecoveryIntents()
                 XCTAssertEqual(persistedWhileActive.count, 1)
                 XCTAssertEqual(persistedWhileActive.first?.channelLogin, "streamera")
 
                 manager.stopRecording()
-                XCTAssertTrue(await waitUntil { manager.activeRecordingCount == 0 })
+                await assertEventuallyTrue { manager.activeRecordingCount == 0 }
 
                 let persistedAfterStop = persistedRecoveryIntents()
                 XCTAssertTrue(persistedAfterStop.isEmpty)
+            }
+        }
+    }
+
+    func testRenameRecording_RenamesPlaintextFile() async throws {
+        try await withTemporaryDirectory { dir in
+            try await withRecordingsDirectory(dir) {
+                let original = dir.appendingPathComponent("old_name.mp4")
+                try Data("payload".utf8).write(to: original)
+
+                let manager = RecordingManager()
+                let renamed = try manager.renameRecording(at: original, to: "new_name")
+
+                XCTAssertEqual(renamed.lastPathComponent, "new_name.mp4")
+                XCTAssertFalse(FileManager.default.fileExists(atPath: original.path))
+                XCTAssertTrue(FileManager.default.fileExists(atPath: renamed.path))
+            }
+        }
+    }
+
+    func testRedownloadRecording_UsesSourceTargetWhenAvailable() async throws {
+        try await withTemporaryDirectory { dir in
+            try await withRecordingsDirectory(dir) {
+                let fakeStreamlink = try makeFakeStreamlinkExecutable(in: dir)
+                let sourceFile = dir.appendingPathComponent("source.mp4")
+                try Data("dummy".utf8).write(to: sourceFile)
+
+                let manager = RecordingManager()
+                manager._resolveStreamlinkPathOverride = { fakeStreamlink.path }
+
+                let entry = RecordingEntry(
+                    url: sourceFile,
+                    channelName: "Streamer A",
+                    recordedAt: Date(),
+                    fileTimestamp: Date(),
+                    sourceType: .liveRecording,
+                    sourceTarget: "twitch.tv/streamera"
+                )
+
+                XCTAssertTrue(manager.redownloadRecording(entry))
+                await assertEventuallyTrue { manager.isRecording(channelLogin: "streamera") }
+                manager.stopRecording()
+                await assertEventuallyTrue { manager.activeRecordingCount == 0 }
+            }
+        }
+    }
+
+    func testPauseAndResumeDownloadTask_WithPersistedQueuedTask() async throws {
+        try await withTemporaryDirectory { dir in
+            try await withRecordingsDirectory(dir) {
+                let fakeStreamlink = try makeFakeStreamlinkExecutable(in: dir)
+                let manager = RecordingManager()
+                manager._resolveStreamlinkPathOverride = { fakeStreamlink.path }
+
+                let task = RecordingManager.DownloadTask(
+                    id: "download-task-1",
+                    target: "twitch.tv/streamera",
+                    channelName: "Streamer A",
+                    quality: "best",
+                    captureType: .streamDownload,
+                    outputURL: nil,
+                    startedAt: Date(),
+                    updatedAt: Date(),
+                    progressFraction: 0.3,
+                    bytesWritten: 1_024,
+                    statusMessage: "Queued",
+                    lastErrorMessage: nil,
+                    retryCount: 0,
+                    state: .queued
+                )
+                manager._replaceDownloadTasksForTesting([task])
+
+                XCTAssertTrue(manager.pauseDownloadTask(id: "download-task-1"))
+                guard let paused = manager._downloadTasksSnapshotForTesting().first else {
+                    XCTFail("Missing paused task")
+                    return
+                }
+                XCTAssertEqual(paused.state, .paused)
+
+                XCTAssertTrue(manager.resumeDownloadTask(id: "download-task-1"))
+                await assertEventuallyTrue { manager.isRecording(channelLogin: "streamera") }
+                manager.stopRecording()
+                await assertEventuallyTrue { manager.activeRecordingCount == 0 }
+            }
+        }
+    }
+
+    func testAutoRetryMarksFailedTaskQueuedImmediately() {
+        let defaults = UserDefaults.standard
+        defaults.set(true, forKey: "recordingDownloadAutoRetryEnabled")
+        defaults.set(2, forKey: "recordingDownloadAutoRetryLimit")
+        defaults.set(60, forKey: "recordingDownloadAutoRetryDelaySeconds")
+        defer {
+            defaults.removeObject(forKey: "recordingDownloadAutoRetryEnabled")
+            defaults.removeObject(forKey: "recordingDownloadAutoRetryLimit")
+            defaults.removeObject(forKey: "recordingDownloadAutoRetryDelaySeconds")
+        }
+
+        let manager = RecordingManager()
+        let failedTask = RecordingManager.DownloadTask(
+            id: "failed-task-1",
+            target: "twitch.tv/streamerb",
+            channelName: "Streamer B",
+            quality: "best",
+            captureType: .streamDownload,
+            outputURL: nil,
+            startedAt: Date(),
+            updatedAt: Date(),
+            progressFraction: nil,
+            bytesWritten: 0,
+            statusMessage: "Failed",
+            lastErrorMessage: "network timeout",
+            retryCount: 0,
+            state: .failed
+        )
+        manager._replaceDownloadTasksForTesting([failedTask])
+
+        manager._triggerAutoRetryForTesting(id: "failed-task-1")
+        guard let queued = manager._downloadTasksSnapshotForTesting().first(where: { $0.id == "failed-task-1" }) else {
+            XCTFail("Missing queued retry task")
+            return
+        }
+        XCTAssertEqual(queued.state, .queued)
+        XCTAssertEqual(queued.retryCount, 1)
+        XCTAssertTrue((queued.statusMessage ?? "").contains("Auto-retry"))
+
+        manager._cancelAutoRetryForTesting(id: "failed-task-1")
+    }
+
+    func testDuplicateRecordingGroupsAndCleanup() async throws {
+        try await withTemporaryDirectory { dir in
+            try await withRecordingsDirectory(dir) {
+                let manager = RecordingManager()
+                let folder = dir.appendingPathComponent("dups", isDirectory: true)
+                try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+
+                let fileA = dir.appendingPathComponent("a.mp4")
+                let fileB = folder.appendingPathComponent("b.mp4")
+                let fileC = dir.appendingPathComponent("c.mp4")
+                let blob = Data(repeating: 0xAA, count: 2048)
+                try blob.write(to: fileA)
+                try blob.write(to: fileB)
+                try Data(repeating: 0xBB, count: 1024).write(to: fileC)
+
+                let capturedAt = Date(timeIntervalSince1970: 1_700_000_000)
+                let entries = [
+                    RecordingEntry(url: fileA, channelName: "Streamer", recordedAt: capturedAt, fileTimestamp: capturedAt, sourceType: .liveRecording, sourceTarget: nil),
+                    RecordingEntry(url: fileB, channelName: "Streamer", recordedAt: capturedAt, fileTimestamp: capturedAt, sourceType: .liveRecording, sourceTarget: nil),
+                    RecordingEntry(url: fileC, channelName: "Streamer", recordedAt: capturedAt.addingTimeInterval(60), fileTimestamp: capturedAt.addingTimeInterval(60), sourceType: .liveRecording, sourceTarget: nil)
+                ]
+
+                let groups = manager.duplicateRecordingGroups(in: entries)
+                XCTAssertEqual(groups.count, 1)
+                XCTAssertEqual(groups.first?.items.count, 2)
+
+                let result = manager.cleanupDuplicateRecordings(in: entries)
+                XCTAssertEqual(result.removedCount, 1)
+                XCTAssertTrue(result.failedMessages.isEmpty)
+
+                let remaining = [fileA, fileB].filter { FileManager.default.fileExists(atPath: $0.path) }
+                XCTAssertEqual(remaining.count, 1)
+            }
+        }
+    }
+
+    func testScanAndRepairIntegrity_RemovesOrphanManifestAndThumbnail() async throws {
+        try await withTemporaryDirectory { dir in
+            try await withRecordingsDirectory(dir) {
+                let manager = RecordingManager()
+                let encryption = RecordingEncryptionManager()
+
+                let existingHash = "exists-\(UUID().uuidString).glitcho"
+                let encryptedNoManifestHash = "encrypted-only-\(UUID().uuidString).glitcho"
+                let orphanHash = "orphan-\(UUID().uuidString).glitcho"
+                let orphanThumbHash = "thumb-orphan-\(UUID().uuidString).glitcho"
+
+                let existingURL = dir.appendingPathComponent(existingHash)
+                try Data([0x00, 0x01, 0x02, 0x03]).write(to: existingURL)
+                let encryptedNoManifestURL = dir.appendingPathComponent(encryptedNoManifestHash)
+                try Data([0x10, 0x11, 0x12, 0x13]).write(to: encryptedNoManifestURL)
+
+                let emptyURL = dir.appendingPathComponent("empty.mp4")
+                try Data().write(to: emptyURL)
+
+                let manifest: [String: RecordingManifestEntry] = [
+                    existingHash: RecordingManifestEntry(
+                        channelName: "Existing",
+                        date: Date(),
+                        quality: "best",
+                        originalFilename: "existing.mp4",
+                        sourceType: .liveRecording,
+                        sourceTarget: "twitch.tv/existing"
+                    ),
+                    orphanHash: RecordingManifestEntry(
+                        channelName: "Orphan",
+                        date: Date(),
+                        quality: "best",
+                        originalFilename: "orphan.mp4",
+                        sourceType: .liveRecording,
+                        sourceTarget: "twitch.tv/orphan"
+                    )
+                ]
+                try encryption.saveManifestSerialized(manifest, to: dir)
+                try FileManager.default.createDirectory(
+                    at: RecordingEncryptionManager.thumbnailCacheDirectory,
+                    withIntermediateDirectories: true
+                )
+                try Data().write(to: RecordingEncryptionManager.thumbnailURL(for: existingHash))
+                try Data("thumb".utf8).write(to: RecordingEncryptionManager.thumbnailURL(for: orphanHash))
+                try Data("thumb".utf8).write(to: RecordingEncryptionManager.thumbnailURL(for: orphanThumbHash))
+
+                let report = manager.scanLibraryIntegrity()
+                XCTAssertEqual(report.issueCount, 2)
+                XCTAssertTrue(report.orphanedManifestEntries.contains(orphanHash))
+                XCTAssertTrue(report.missingThumbnailEntries.contains(existingHash))
+                XCTAssertTrue(report.missingThumbnailEntries.contains(encryptedNoManifestHash))
+                XCTAssertTrue(report.orphanedThumbnailEntries.contains(orphanHash))
+                XCTAssertTrue(report.orphanedThumbnailEntries.contains(orphanThumbHash))
+                XCTAssertTrue(report.unreadableFiles.contains(where: { $0.lastPathComponent == "empty.mp4" }))
+
+                let repair = manager.repairLibraryIntegrity(report)
+                XCTAssertGreaterThanOrEqual(repair.removedManifestEntries, 1)
+                XCTAssertGreaterThanOrEqual(repair.removedOrphanedThumbnails, 2)
+
+                let after = manager.scanLibraryIntegrity()
+                XCTAssertFalse(after.orphanedManifestEntries.contains(orphanHash))
+                XCTAssertFalse(after.orphanedThumbnailEntries.contains(orphanHash))
+                XCTAssertFalse(after.orphanedThumbnailEntries.contains(orphanThumbHash))
             }
         }
     }

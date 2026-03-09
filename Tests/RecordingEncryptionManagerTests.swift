@@ -168,7 +168,10 @@ final class RecordingEncryptionManagerTests: XCTestCase {
             let mgr = makeManager(key: key)
 
             let original = dir.appendingPathComponent("test.mp4")
-            let content = Data("test video content".utf8)
+            var content = Data(repeating: 0, count: 128)
+            content.replaceSubrange(0..<4, with: Data([0x00, 0x00, 0x00, 0x20]))
+            content.replaceSubrange(4..<8, with: Data("ftyp".utf8))
+            content.replaceSubrange(32..<48, with: Data("glitcho-test-data".utf8))
             try content.write(to: original)
 
             let result = try mgr.encryptFile(at: original, in: dir)
@@ -178,6 +181,27 @@ final class RecordingEncryptionManagerTests: XCTestCase {
 
             let decrypted = try Data(contentsOf: decryptedURL)
             XCTAssertEqual(decrypted, content)
+        }
+    }
+
+    func testDecryptFile_ObfuscatedRecordingDoesNotRequireSameKey() throws {
+        try withTemporaryDirectory { dir in
+            let writer = makeManager(key: SymmetricKey(size: .bits256))
+
+            let original = dir.appendingPathComponent("test.mp4")
+            var content = Data(repeating: 0, count: 96)
+            content.replaceSubrange(0..<4, with: Data([0x00, 0x00, 0x00, 0x20]))
+            content.replaceSubrange(4..<8, with: Data("ftyp".utf8))
+            content.replaceSubrange(24..<40, with: Data("playback-ok".utf8))
+            try content.write(to: original)
+
+            let result = try writer.encryptFile(at: original, in: dir)
+
+            let reader = makeManager(key: SymmetricKey(size: .bits256))
+            let destination = dir.appendingPathComponent("restored.mp4")
+            try reader.decryptFile(named: result.hashFilename, in: dir, to: destination)
+
+            XCTAssertEqual(try Data(contentsOf: destination), content)
         }
     }
 
@@ -285,14 +309,19 @@ final class RecordingEncryptionManagerTests: XCTestCase {
     func testCleanupTempFiles_RemovesGlitchoTempFiles() throws {
         let tempDir = FileManager.default.temporaryDirectory
         let tempFile = tempDir.appendingPathComponent("\(UUID().uuidString).glitcho-playback.mp4")
+        let tempTransportFile = tempDir.appendingPathComponent("\(UUID().uuidString).glitcho-playback.ts")
         try Data("temp".utf8).write(to: tempFile)
+        try Data("temp".utf8).write(to: tempTransportFile)
         defer { try? FileManager.default.removeItem(at: tempFile) }
+        defer { try? FileManager.default.removeItem(at: tempTransportFile) }
 
         XCTAssertTrue(FileManager.default.fileExists(atPath: tempFile.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: tempTransportFile.path))
 
         let mgr = makeManager(key: SymmetricKey(size: .bits256))
         mgr.cleanupTempPlaybackFiles()
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: tempFile.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tempTransportFile.path))
     }
 }

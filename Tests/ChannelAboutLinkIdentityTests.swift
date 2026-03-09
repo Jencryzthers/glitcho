@@ -2,23 +2,24 @@ import XCTest
 @testable import Glitcho
 
 final class ChannelAboutLinkIdentityTests: XCTestCase {
-    func testSameURLCanGenerateDistinctIDsWithDifferentOccurrences() throws {
+    func testSameURLCanCarryDistinctIDsForDifferentOccurrences() throws {
         let url = try XCTUnwrap(URL(string: "https://discord.gg/example"))
-        let first = ChannelAboutLink(
-            title: "",
+        let first = AboutLinkModel(
+            id: "discord-example-0",
+            title: "Discord",
             url: url,
-            imageURL: URL(string: "https://static-cdn.jtvnw.net/example.png"),
-            isImageLink: true,
-            occurrence: 0
+            domain: "discord.gg",
+            isImageLink: true
         )
-        let second = ChannelAboutLink(
-            title: "",
+        let second = AboutLinkModel(
+            id: "discord-example-1",
+            title: "Discord",
             url: url,
-            imageURL: URL(string: "https://static-cdn.jtvnw.net/example.png"),
-            isImageLink: true,
-            occurrence: 1
+            domain: "discord.gg",
+            isImageLink: true
         )
 
         XCTAssertNotEqual(first.id, second.id)
+        XCTAssertEqual(first.url, second.url)
     }
 }

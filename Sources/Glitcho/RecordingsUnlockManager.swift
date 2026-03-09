@@ -32,6 +32,12 @@ final class RecordingsUnlockManager: ObservableObject {
         authenticate(interactive: true, onResult: onResult)
     }
 
+    nonisolated static func authenticationPolicy(interactive: Bool) -> LAPolicy {
+        // Interactive flows (manual unlock/hotkey) should allow password fallback
+        // when biometrics are unavailable (e.g. laptop lid closed).
+        interactive ? .deviceOwnerAuthentication : .deviceOwnerAuthenticationWithBiometrics
+    }
+
     private func authenticate(interactive: Bool, onResult: ((Bool) -> Void)? = nil) {
         if isUnlocked {
             onResult?(true)
@@ -50,17 +56,17 @@ final class RecordingsUnlockManager: ObservableObject {
 
         let context = LAContext()
         context.touchIDAuthenticationAllowableReuseDuration = LATouchIDAuthenticationMaximumAllowableReuseDuration
-        context.localizedFallbackTitle = ""
         context.interactionNotAllowed = !interactive
+        let policy = Self.authenticationPolicy(interactive: interactive)
         var authError: NSError?
-        guard context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &authError) else {
+        guard context.canEvaluatePolicy(policy, error: &authError) else {
             onResult?(false)
             return
         }
 
         isAuthenticating = true
         context.evaluatePolicy(
-            .deviceOwnerAuthenticationWithBiometrics,
+            policy,
             localizedReason: "Unlock protected sections."
         ) { [weak self] success, _ in
             Task { @MainActor in

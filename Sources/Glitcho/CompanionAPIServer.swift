@@ -270,6 +270,80 @@ final class CompanionAPIServer: ObservableObject {
             }
             return .json(statusCode: 200, object: ["ok": true, "stopped": true])
 
+        case ("GET", "/downloads/status"):
+            lastRequestSummary = "GET /downloads/status"
+            let tasks = recordingManager.downloadTasks.map { task in
+                [
+                    "id": task.id,
+                    "target": task.target,
+                    "channel_name": task.channelName ?? NSNull(),
+                    "quality": task.quality,
+                    "capture_type": task.captureType.rawValue,
+                    "state": task.state.rawValue,
+                    "started_at": task.startedAt.map(isoDate) ?? NSNull(),
+                    "updated_at": isoDate(task.updatedAt),
+                    "progress_fraction": task.progressFraction ?? NSNull(),
+                    "bytes_written": task.bytesWritten,
+                    "status_message": task.statusMessage ?? NSNull(),
+                    "last_error_message": task.lastErrorMessage ?? NSNull(),
+                    "retry_count": task.retryCount
+                ] as [String: Any]
+            }
+            let summary: [String: Any] = [
+                "total": recordingManager.downloadTasks.count,
+                "active": recordingManager.downloadTasks.filter { $0.state == .running || $0.state == .queued }.count,
+                "paused": recordingManager.downloadTasks.filter { $0.state == .paused }.count,
+                "failed": recordingManager.downloadTasks.filter { $0.state == .failed }.count,
+                "completed": recordingManager.downloadTasks.filter { $0.state == .completed }.count,
+                "canceled": recordingManager.downloadTasks.filter { $0.state == .canceled }.count
+            ]
+            return .json(statusCode: 200, object: ["ok": true, "summary": summary, "tasks": tasks])
+
+        case ("POST", "/downloads/pause"):
+            lastRequestSummary = "POST /downloads/pause"
+            if let payload = try? JSONDecoder().decode(CompanionDownloadTaskRequest.self, from: request.body),
+               let id = payload.id?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !id.isEmpty {
+                let paused = recordingManager.pauseDownloadTask(id: id)
+                return .json(statusCode: paused ? 200 : 404, object: [
+                    "ok": paused,
+                    "paused": paused,
+                    "id": id
+                ])
+            }
+            recordingManager.pauseAllDownloadTasks()
+            return .json(statusCode: 200, object: ["ok": true, "paused_all": true])
+
+        case ("POST", "/downloads/resume"):
+            lastRequestSummary = "POST /downloads/resume"
+            if let payload = try? JSONDecoder().decode(CompanionDownloadTaskRequest.self, from: request.body),
+               let id = payload.id?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !id.isEmpty {
+                let resumed = recordingManager.resumeDownloadTask(id: id)
+                return .json(statusCode: resumed ? 200 : 404, object: [
+                    "ok": resumed,
+                    "resumed": resumed,
+                    "id": id
+                ])
+            }
+            recordingManager.resumeAllDownloadTasks()
+            return .json(statusCode: 200, object: ["ok": true, "resumed_all": true])
+
+        case ("POST", "/downloads/retry-failed"):
+            lastRequestSummary = "POST /downloads/retry-failed"
+            let retried = recordingManager.retryFailedDownloadTasks()
+            return .json(statusCode: 200, object: ["ok": true, "retried": retried])
+
+        case ("POST", "/downloads/clear-completed"):
+            lastRequestSummary = "POST /downloads/clear-completed"
+            let cleared = recordingManager.clearCompletedDownloadTasks()
+            return .json(statusCode: 200, object: ["ok": true, "cleared": cleared])
+
+        case ("POST", "/downloads/cancel-active"):
+            lastRequestSummary = "POST /downloads/cancel-active"
+            let canceled = recordingManager.cancelActiveDownloadTasks()
+            return .json(statusCode: 200, object: ["ok": true, "canceled": canceled])
+
         default:
             return .json(statusCode: 404, object: ["ok": false, "error": "not_found"])
         }

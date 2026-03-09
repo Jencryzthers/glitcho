@@ -3,6 +3,7 @@ import CryptoKit
 import AVFoundation
 import AppKit
 import Security
+import Darwin
 
 #if canImport(SwiftUI)
 
@@ -12,6 +13,7 @@ struct RecordingManifestEntry: Codable, Equatable {
     let quality: String
     let originalFilename: String
     let sourceType: RecordingCaptureType
+    let sourceTarget: String?
 
     private enum CodingKeys: String, CodingKey {
         case channelName
@@ -19,6 +21,7 @@ struct RecordingManifestEntry: Codable, Equatable {
         case quality
         case originalFilename
         case sourceType
+        case sourceTarget
     }
 
     init(
@@ -26,13 +29,15 @@ struct RecordingManifestEntry: Codable, Equatable {
         date: Date,
         quality: String,
         originalFilename: String,
-        sourceType: RecordingCaptureType = .liveRecording
+        sourceType: RecordingCaptureType = .liveRecording,
+        sourceTarget: String? = nil
     ) {
         self.channelName = channelName
         self.date = date
         self.quality = quality
         self.originalFilename = originalFilename
         self.sourceType = sourceType
+        self.sourceTarget = sourceTarget
     }
 
     init(from decoder: Decoder) throws {
@@ -42,6 +47,7 @@ struct RecordingManifestEntry: Codable, Equatable {
         quality = try container.decode(String.self, forKey: .quality)
         originalFilename = try container.decode(String.self, forKey: .originalFilename)
         sourceType = try container.decodeIfPresent(RecordingCaptureType.self, forKey: .sourceType) ?? .liveRecording
+        sourceTarget = try container.decodeIfPresent(String.self, forKey: .sourceTarget)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -51,6 +57,7 @@ struct RecordingManifestEntry: Codable, Equatable {
         try container.encode(quality, forKey: .quality)
         try container.encode(originalFilename, forKey: .originalFilename)
         try container.encode(sourceType, forKey: .sourceType)
+        try container.encodeIfPresent(sourceTarget, forKey: .sourceTarget)
     }
 }
 
@@ -252,7 +259,7 @@ final class RecordingEncryptionManager {
 
     /// Generates a non-deterministic hash filename for the given original filename.
     /// The mapping is one-way (uses a random salt) and must be persisted by the caller
-    /// (e.g. in the encrypted manifest) — it cannot be re-derived from the original name.
+    /// (e.g. in the manifest) — it cannot be re-derived from the original name.
     func generateHashFilename(originalFilename: String) -> String {
         let salt = UUID().uuidString
         let input = "\(originalFilename)\(salt)"
@@ -264,14 +271,37 @@ final class RecordingEncryptionManager {
     // MARK: - Manifest CRUD (Task 4)
 
     static let manifestFilename = "manifest.glitcho"
+    private static let legacyManifestBackupFilename = "manifest.glitcho.legacy.bak"
 
-    func saveManifest(_ manifest: [String: RecordingManifestEntry], to directory: URL) throws {
+    private func manifestEncoder() -> JSONEncoder {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
-        let json = try encoder.encode(manifest)
-        let encrypted = try encrypt(data: json)
+        return encoder
+    }
+
+    private func manifestDecoder() -> JSONDecoder {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return decoder
+    }
+
+    private func decodePlainManifest(from data: Data) throws -> [String: RecordingManifestEntry] {
+        try manifestDecoder().decode([String: RecordingManifestEntry].self, from: data)
+    }
+
+    private func decodeLegacyEncryptedManifest(
+        from data: Data,
+        key: SymmetricKey
+    ) throws -> [String: RecordingManifestEntry] {
+        let box = try AES.GCM.SealedBox(combined: data)
+        let json = try AES.GCM.open(box, using: key)
+        return try manifestDecoder().decode([String: RecordingManifestEntry].self, from: json)
+    }
+
+    func saveManifest(_ manifest: [String: RecordingManifestEntry], to directory: URL) throws {
+        let json = try manifestEncoder().encode(manifest)
         let url = directory.appendingPathComponent(Self.manifestFilename)
-        try encrypted.write(to: url, options: .atomic)
+        try json.write(to: url, options: .atomic)
     }
 
     func loadManifest(from directory: URL) throws -> [String: RecordingManifestEntry] {
@@ -279,11 +309,14 @@ final class RecordingEncryptionManager {
         guard FileManager.default.fileExists(atPath: url.path) else {
             return [:]
         }
-        let encrypted = try Data(contentsOf: url)
-        let json = try decrypt(data: encrypted)
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        return try decoder.decode([String: RecordingManifestEntry].self, from: json)
+        let raw = try Data(contentsOf: url)
+        if let plain = try? decodePlainManifest(from: raw) {
+            return plain
+        }
+
+        // Backward compatibility for older encrypted manifests.
+        let key = try resolveKey(for: .decrypt)
+        return try decodeLegacyEncryptedManifest(from: raw, key: key)
     }
 
     /// Non-interactive manifest read used by list rendering paths. Returns `nil`
@@ -294,19 +327,19 @@ final class RecordingEncryptionManager {
             guard FileManager.default.fileExists(atPath: url.path) else {
                 return [:]
             }
+            guard let raw = try? Data(contentsOf: url) else {
+                return [:]
+            }
+            if let plain = try? decodePlainManifest(from: raw) {
+                return plain
+            }
+
             guard let key = try? resolveKeyIfAvailableWithoutInteraction(for: .decrypt) else {
                 return nil
             }
-            guard let encrypted = try? Data(contentsOf: url) else {
-                return [:]
-            }
 
             do {
-                let box = try AES.GCM.SealedBox(combined: encrypted)
-                let json = try AES.GCM.open(box, using: key)
-                let decoder = JSONDecoder()
-                decoder.dateDecodingStrategy = .iso8601
-                return try decoder.decode([String: RecordingManifestEntry].self, from: json)
+                return try decodeLegacyEncryptedManifest(from: raw, key: key)
             } catch {
                 return [:]
             }
@@ -330,7 +363,28 @@ final class RecordingEncryptionManager {
     /// overwrite each other's entries.
     func upsertManifestEntry(_ entry: RecordingManifestEntry, hashFilename: String, in directory: URL) throws {
         try manifestQueue.sync {
-            var manifest = (try? loadManifest(from: directory)) ?? [:]
+            let url = directory.appendingPathComponent(Self.manifestFilename)
+            var manifest: [String: RecordingManifestEntry] = [:]
+
+            if let raw = try? Data(contentsOf: url), !raw.isEmpty {
+                if let plain = try? decodePlainManifest(from: raw) {
+                    manifest = plain
+                } else if let key = try? resolveKeyIfAvailableWithoutInteraction(for: .decrypt),
+                          let legacy = try? decodeLegacyEncryptedManifest(from: raw, key: key) {
+                    manifest = legacy
+                    let backupURL = directory.appendingPathComponent(Self.legacyManifestBackupFilename)
+                    if !FileManager.default.fileExists(atPath: backupURL.path) {
+                        try? raw.write(to: backupURL, options: .atomic)
+                    }
+                } else {
+                    // Preserve unknown/legacy manifest bytes before replacing with plaintext format.
+                    let backupURL = directory.appendingPathComponent(Self.legacyManifestBackupFilename)
+                    if !FileManager.default.fileExists(atPath: backupURL.path) {
+                        try? FileManager.default.copyItem(at: url, to: backupURL)
+                    }
+                }
+            }
+
             manifest[hashFilename] = entry
             try saveManifest(manifest, to: directory)
         }
@@ -356,32 +410,103 @@ final class RecordingEncryptionManager {
 
     func generateThumbnailSidecar(for videoURL: URL, hashFilename: String) {
         Self.ensureThumbnailCacheDirectoryExists()
+        let thumbURL = Self.thumbnailURL(for: hashFilename)
+        var temporaryInputs: [URL] = []
+        defer {
+            for tempURL in temporaryInputs {
+                try? FileManager.default.removeItem(at: tempURL)
+            }
+        }
+
+        var candidates: [URL] = [videoURL]
+
+        // Some streams are MPEG-TS data with a .mp4 extension; AVAsset probing is
+        // much more reliable when the extension matches the container.
+        if videoURL.pathExtension.lowercased() == "mp4" || Self.isTransportStreamFile(at: videoURL) {
+            let tsTempURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("\(UUID().uuidString).thumb.ts")
+            if (try? cloneOrCopyItem(at: videoURL, to: tsTempURL)) != nil {
+                candidates.append(tsTempURL)
+                temporaryInputs.append(tsTempURL)
+            }
+        }
+
+        for candidate in candidates {
+            guard let image = Self.extractThumbnailImage(from: candidate),
+                  let jpegData = Self.jpegData(from: image) else {
+                continue
+            }
+            try? jpegData.write(to: thumbURL, options: .atomic)
+            return
+        }
+    }
+
+    private static func extractThumbnailImage(from videoURL: URL) -> NSImage? {
         let asset = AVAsset(url: videoURL)
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
         generator.maximumSize = CGSize(width: 320, height: 180)
-        // Be maximally tolerant: snap to any available frame near each candidate time.
         generator.requestedTimeToleranceBefore = CMTime(seconds: 5, preferredTimescale: 600)
         generator.requestedTimeToleranceAfter  = CMTime(seconds: 5, preferredTimescale: 600)
 
-        // Try several timestamps in case the stream starts late or the first second is black.
-        let candidates: [Double] = [1.0, 0.0, 3.0, 5.0, 10.0]
-        var cgImage: CGImage?
-        for seconds in candidates {
-            let t = CMTime(seconds: seconds, preferredTimescale: 600)
-            if let img = try? generator.copyCGImage(at: t, actualTime: nil) {
-                cgImage = img
-                break
-            }
-        }
-        guard let cgImage else { return }
+        let candidateSeconds: [Double] = [1.0, 0.0, 3.0, 5.0, 10.0, 20.0, 30.0, 45.0, 60.0]
 
-        let nsImage = NSImage(cgImage: cgImage, size: .zero)
-        guard let tiffData = nsImage.tiffRepresentation,
+        var seen = Set<Int>()
+        for seconds in candidateSeconds {
+            let bucket = Int((seconds * 10).rounded())
+            if !seen.insert(bucket).inserted {
+                continue
+            }
+            let time = CMTime(seconds: seconds, preferredTimescale: 600)
+            guard let cgImage = try? generator.copyCGImage(at: time, actualTime: nil) else {
+                continue
+            }
+            return NSImage(cgImage: cgImage, size: .zero)
+        }
+
+        return nil
+    }
+
+    private static func jpegData(from image: NSImage) -> Data? {
+        guard let tiffData = image.tiffRepresentation,
               let bitmap = NSBitmapImageRep(data: tiffData),
-              let jpegData = bitmap.representation(using: .jpeg, properties: [.compressionFactor: 0.7])
-        else { return }
-        try? jpegData.write(to: Self.thumbnailURL(for: hashFilename), options: .atomic)
+              let jpegData = bitmap.representation(using: .jpeg, properties: [.compressionFactor: 0.7]) else {
+            return nil
+        }
+        return jpegData
+    }
+
+    private static func isTransportStreamFile(at url: URL) -> Bool {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? handle.close() }
+
+        guard let data = try? handle.read(upToCount: 512),
+              !data.isEmpty else {
+            return false
+        }
+
+        func byte(at offset: Int) -> UInt8? {
+            guard offset >= 0, offset < data.count else { return nil }
+            return data[data.index(data.startIndex, offsetBy: offset)]
+        }
+
+        guard byte(at: 0) == 0x47 else { return false }
+        if let b188 = byte(at: 188), b188 != 0x47 { return false }
+        if let b376 = byte(at: 376), b376 != 0x47 { return false }
+        return true
+    }
+
+    func regenerateThumbnailSidecar(for hashFilename: String, in directory: URL) throws {
+        let sourceURL = directory.appendingPathComponent(hashFilename)
+        guard FileManager.default.fileExists(atPath: sourceURL.path) else {
+            throw EncryptionError.fileNotFound(hashFilename)
+        }
+
+        let tempURL = tempPlaybackURL()
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+
+        try decryptFile(named: hashFilename, in: directory, to: tempURL)
+        generateThumbnailSidecar(for: tempURL, hashFilename: hashFilename)
     }
 
     // MARK: - File-Level Encrypt/Decrypt (Task 5)
@@ -391,10 +516,19 @@ final class RecordingEncryptionManager {
         let entry: RecordingManifestEntry
     }
 
-    // Magic prefix written at the start of every chunked .glitcho file.
-    // Absence of this prefix means the file uses the legacy single-block format.
+    // Magic prefix for legacy chunk-encrypted .glitcho files.
+    // New recordings use lightweight header obfuscation instead of full-file encryption.
     private static let chunkMagic = Data("GLITCHO1".utf8)
-    private static let chunkSize  = 8 * 1024 * 1024  // 8 MB per chunk
+    private static let legacyObfuscationPrefixLength = 4096
+    private static let legacyObfuscationMask: UInt8 = 0xA7
+    private static let obfuscationMinLength = 1024
+    private static let obfuscationMaxLength = 4096
+
+    private struct ObfuscationRecipe {
+        let offset: Int
+        let length: Int
+        let seed: Data
+    }
 
     func encryptFile(
         at sourceURL: URL,
@@ -402,55 +536,28 @@ final class RecordingEncryptionManager {
         channelName: String? = nil,
         quality: String = "best",
         date: Date = Date(),
-        sourceType: RecordingCaptureType = .liveRecording
+        sourceType: RecordingCaptureType = .liveRecording,
+        sourceTarget: String? = nil
     ) throws -> EncryptFileResult {
         let originalFilename = sourceURL.lastPathComponent
 
-        // Generate thumbnail before encryption while the source file is still readable.
+        // Generate thumbnail before protection while the source file is still readable.
         let hashFilename = generateHashFilename(originalFilename: originalFilename)
         generateThumbnailSidecar(for: sourceURL, hashFilename: hashFilename)
 
         let destinationURL = directory.appendingPathComponent(hashFilename)
 
-        // Chunked streaming encryption: read/encrypt/write one chunk at a time so
-        // peak RAM usage is O(chunkSize) rather than O(fileSize).
-        guard let srcHandle = FileHandle(forReadingAtPath: sourceURL.path) else {
-            throw EncryptionError.fileNotFound(sourceURL.lastPathComponent)
-        }
-        defer { srcHandle.closeFile() }
-
-        FileManager.default.createFile(atPath: destinationURL.path, contents: nil)
-        guard let dstHandle = FileHandle(forWritingAtPath: destinationURL.path) else {
-            throw EncryptionError.sealFailed
-        }
-        defer { dstHandle.closeFile() }
-
-        // Header: magic(8) + chunkSize(4) + chunkCount(4, back-patched later).
-        var cs = UInt32(Self.chunkSize).bigEndian
-        var placeholder = UInt32(0).bigEndian
-        dstHandle.write(Self.chunkMagic)
-        dstHandle.write(Data(bytes: &cs, count: 4))
-        let chunkCountOffset = dstHandle.offsetInFile
-        dstHandle.write(Data(bytes: &placeholder, count: 4))
-
-        var chunkCount = UInt32(0)
-        while true {
-            let chunk = srcHandle.readData(ofLength: Self.chunkSize)
-            guard !chunk.isEmpty else { break }
-            let sealed = try encrypt(data: chunk)
-            var sealedLen = UInt32(sealed.count).bigEndian
-            dstHandle.write(Data(bytes: &sealedLen, count: 4))
-            dstHandle.write(sealed)
-            chunkCount += 1
+        if FileManager.default.fileExists(atPath: destinationURL.path) {
+            try FileManager.default.removeItem(at: destinationURL)
         }
 
-        // Back-patch chunk count into header.
-        dstHandle.seek(toFileOffset: chunkCountOffset)
-        var finalCount = chunkCount.bigEndian
-        dstHandle.write(Data(bytes: &finalCount, count: 4))
+        if sourceURL.standardizedFileURL != destinationURL.standardizedFileURL {
+            try FileManager.default.moveItem(at: sourceURL, to: destinationURL)
+        }
 
-        // Delete the plaintext original.
-        try FileManager.default.removeItem(at: sourceURL)
+        // Lightweight protection: alter only a small, per-file region near the MP4 header.
+        // This avoids full-file crypto cost while keeping files non-playable outside Glitcho.
+        try toggleObfuscationRegion(at: destinationURL, hashFilename: hashFilename)
 
         let resolvedChannelName = channelName ?? Self.parseChannelName(from: originalFilename)
         let resolvedDate = Self.parseDate(from: originalFilename) ?? date
@@ -460,7 +567,8 @@ final class RecordingEncryptionManager {
             date: resolvedDate,
             quality: quality,
             originalFilename: originalFilename,
-            sourceType: sourceType
+            sourceType: sourceType,
+            sourceTarget: sourceTarget
         )
 
         return EncryptFileResult(hashFilename: hashFilename, entry: entry)
@@ -488,8 +596,10 @@ final class RecordingEncryptionManager {
         }
         defer { srcHandle.closeFile() }
 
-        let header = srcHandle.readData(ofLength: 8)
+        let probe = srcHandle.readData(ofLength: 512)
+        let header = probe.prefix(8)
         if header == Self.chunkMagic {
+            srcHandle.seek(toFileOffset: 8)
             // Chunked format: read header, decrypt each chunk, stream to destination.
             let chunkSizeData  = srcHandle.readData(ofLength: 4)
             let chunkCountData = srcHandle.readData(ofLength: 4)
@@ -515,6 +625,23 @@ final class RecordingEncryptionManager {
                 if chunkIndex == 0 { onFirstChunk?() }
             }
         } else {
+            let fileSize = ((try? FileManager.default.attributesOfItem(atPath: sourceURL.path)[.size] as? NSNumber)?.intValue) ?? 0
+            if looksLikeV2ObfuscatedMedia(probe: probe, hashFilename: hashFilename, fileSize: fileSize) {
+                try copyObfuscatedFileForPlayback(
+                    from: sourceURL,
+                    to: destinationURL,
+                    hashFilename: hashFilename
+                )
+                onFirstChunk?()
+                return
+            }
+
+            if looksLikeLegacyObfuscatedMP4(header: header) {
+                try copyLegacyObfuscatedFileForPlayback(from: sourceURL, to: destinationURL)
+                onFirstChunk?()
+                return
+            }
+
             // Legacy single-block format: whole file is one AES-GCM sealed blob.
             srcHandle.seek(toFileOffset: 0)
             let encrypted = srcHandle.readDataToEndOfFile()
@@ -523,6 +650,186 @@ final class RecordingEncryptionManager {
             // Single-block: the full file is ready — signal now.
             onFirstChunk?()
         }
+    }
+
+    private func copyObfuscatedFileForPlayback(
+        from sourceURL: URL,
+        to destinationURL: URL,
+        hashFilename: String
+    ) throws {
+        if FileManager.default.fileExists(atPath: destinationURL.path) {
+            try FileManager.default.removeItem(at: destinationURL)
+        }
+        try cloneOrCopyItem(at: sourceURL, to: destinationURL)
+        try toggleObfuscationRegion(at: destinationURL, hashFilename: hashFilename)
+    }
+
+    private func copyLegacyObfuscatedFileForPlayback(from sourceURL: URL, to destinationURL: URL) throws {
+        if FileManager.default.fileExists(atPath: destinationURL.path) {
+            try FileManager.default.removeItem(at: destinationURL)
+        }
+        try cloneOrCopyItem(at: sourceURL, to: destinationURL)
+        try toggleLegacyObfuscationPrefix(at: destinationURL)
+    }
+
+    private func cloneOrCopyItem(at sourceURL: URL, to destinationURL: URL) throws {
+        let didClone = sourceURL.path.withCString { srcPtr in
+            destinationURL.path.withCString { dstPtr in
+                clonefile(srcPtr, dstPtr, 0) == 0
+            }
+        }
+        if didClone {
+            return
+        }
+        try FileManager.default.copyItem(at: sourceURL, to: destinationURL)
+    }
+
+    private func obfuscationRecipe(hashFilename: String, fileSize: Int) -> ObfuscationRecipe {
+        let seed = Data(
+            SHA256.hash(data: Data("glitcho-obf-v2|\(hashFilename)".utf8))
+        )
+        let boundedFileSize = max(0, fileSize)
+        guard boundedFileSize > 0 else {
+            return ObfuscationRecipe(offset: 0, length: 0, seed: seed)
+        }
+
+        let desiredLengthRange = Self.obfuscationMaxLength - Self.obfuscationMinLength + 1
+        let desiredLength = Self.obfuscationMinLength + Int(seed[0]) % max(1, desiredLengthRange)
+        var offset = Int(seed[1] % 5) // keep close to header while varying per file
+        if offset >= boundedFileSize {
+            offset = 0
+        }
+        var length = min(desiredLength, max(0, boundedFileSize - offset))
+        if length < 8 {
+            offset = 0
+            length = min(desiredLength, boundedFileSize)
+        }
+        return ObfuscationRecipe(offset: offset, length: length, seed: seed)
+    }
+
+    private func keyStream(seed: Data, length: Int) -> Data {
+        guard length > 0 else { return Data() }
+        var stream = Data()
+        stream.reserveCapacity(length)
+        var counter: UInt32 = 0
+        while stream.count < length {
+            var material = Data()
+            material.append(seed)
+            var beCounter = counter.bigEndian
+            withUnsafeBytes(of: &beCounter) { bytes in
+                material.append(contentsOf: bytes)
+            }
+            stream.append(contentsOf: SHA256.hash(data: material))
+            counter &+= 1
+        }
+        return stream.prefix(length)
+    }
+
+    private func toggleObfuscationRegion(at url: URL, hashFilename: String) throws {
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        let fileSize = (attributes[.size] as? NSNumber)?.intValue ?? 0
+        let recipe = obfuscationRecipe(hashFilename: hashFilename, fileSize: fileSize)
+        guard recipe.length > 0 else { return }
+
+        guard let handle = FileHandle(forUpdatingAtPath: url.path) else {
+            throw EncryptionError.fileNotFound(url.lastPathComponent)
+        }
+        defer { handle.closeFile() }
+
+        handle.seek(toFileOffset: UInt64(recipe.offset))
+        var chunk = handle.readData(ofLength: recipe.length)
+        guard !chunk.isEmpty else { return }
+        let stream = keyStream(seed: recipe.seed, length: chunk.count)
+
+        chunk.withUnsafeMutableBytes { buffer in
+            guard let base = buffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+            for index in 0..<buffer.count {
+                base[index] ^= stream[stream.index(stream.startIndex, offsetBy: index)]
+            }
+        }
+
+        handle.seek(toFileOffset: UInt64(recipe.offset))
+        handle.write(chunk)
+    }
+
+    private func toggleLegacyObfuscationPrefix(at url: URL) throws {
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        let fileSize = (attributes[.size] as? NSNumber)?.intValue ?? 0
+        let length = min(Self.legacyObfuscationPrefixLength, max(0, fileSize))
+        guard length > 0 else { return }
+
+        guard let handle = FileHandle(forUpdatingAtPath: url.path) else {
+            throw EncryptionError.fileNotFound(url.lastPathComponent)
+        }
+        defer { handle.closeFile() }
+
+        handle.seek(toFileOffset: 0)
+        var prefix = handle.readData(ofLength: length)
+        guard !prefix.isEmpty else { return }
+
+        prefix.withUnsafeMutableBytes { buffer in
+            guard let base = buffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+            for index in 0..<buffer.count {
+                base[index] ^= Self.legacyObfuscationMask
+            }
+        }
+
+        handle.seek(toFileOffset: 0)
+        handle.write(prefix)
+    }
+
+    private func looksLikeV2ObfuscatedMedia(probe: Data, hashFilename: String, fileSize: Int) -> Bool {
+        guard !probe.isEmpty else { return false }
+        let recipe = obfuscationRecipe(hashFilename: hashFilename, fileSize: fileSize)
+        guard recipe.length > 0 else { return false }
+
+        var bytes = [UInt8](probe)
+        if recipe.offset < bytes.count {
+            let overlapStart = max(0, recipe.offset)
+            let overlapEnd = min(bytes.count, recipe.offset + recipe.length)
+            if overlapStart < overlapEnd {
+                let stream = keyStream(seed: recipe.seed, length: overlapEnd - recipe.offset)
+                for absoluteIndex in overlapStart..<overlapEnd {
+                    let streamIndex = absoluteIndex - recipe.offset
+                    bytes[absoluteIndex] ^= stream[stream.index(stream.startIndex, offsetBy: streamIndex)]
+                }
+            }
+        }
+
+        if looksLikeMP4Header(bytes) {
+            return true
+        }
+        return looksLikeTransportStreamHeader(bytes)
+    }
+
+    private func looksLikeLegacyObfuscatedMP4(header: Data) -> Bool {
+        guard header.count >= 8 else { return false }
+        var bytes = [UInt8](header.prefix(8))
+        for index in 0..<bytes.count {
+            bytes[index] ^= Self.legacyObfuscationMask
+        }
+        return looksLikeMP4Header(bytes)
+    }
+
+    private func looksLikeMP4Header(_ bytes: [UInt8]) -> Bool {
+        guard bytes.count >= 8 else { return false }
+        let boxSize = (UInt32(bytes[0]) << 24)
+            | (UInt32(bytes[1]) << 16)
+            | (UInt32(bytes[2]) << 8)
+            | UInt32(bytes[3])
+
+        guard boxSize >= 8, boxSize <= 1_048_576 else { return false }
+        return bytes[4] == 0x66
+            && bytes[5] == 0x74
+            && bytes[6] == 0x79
+            && bytes[7] == 0x70
+    }
+
+    private func looksLikeTransportStreamHeader(_ bytes: [UInt8]) -> Bool {
+        guard !bytes.isEmpty, bytes[0] == 0x47 else { return false }
+        if bytes.count > 188, bytes[188] != 0x47 { return false }
+        if bytes.count > 376, bytes[376] != 0x47 { return false }
+        return true
     }
 
     // MARK: - Migration Logic (Task 6)
@@ -576,9 +883,15 @@ final class RecordingEncryptionManager {
     // MARK: - Temp File Cleanup (Task 7)
 
     static let tempPlaybackSuffix = ".glitcho-playback.mp4"
+    static let tempPlaybackTransportSuffix = ".glitcho-playback.ts"
 
     func tempPlaybackURL() -> URL {
         let filename = "\(UUID().uuidString)\(Self.tempPlaybackSuffix)"
+        return FileManager.default.temporaryDirectory.appendingPathComponent(filename)
+    }
+
+    func tempTransportPlaybackURL() -> URL {
+        let filename = "\(UUID().uuidString)\(Self.tempPlaybackTransportSuffix)"
         return FileManager.default.temporaryDirectory.appendingPathComponent(filename)
     }
 
@@ -590,8 +903,11 @@ final class RecordingEncryptionManager {
             options: [.skipsHiddenFiles]
         ) else { return }
 
-        for file in files where file.lastPathComponent.hasSuffix(Self.tempPlaybackSuffix) {
-            try? FileManager.default.removeItem(at: file)
+        for file in files {
+            let name = file.lastPathComponent
+            if name.hasSuffix(Self.tempPlaybackSuffix) || name.hasSuffix(Self.tempPlaybackTransportSuffix) {
+                try? FileManager.default.removeItem(at: file)
+            }
         }
     }
 

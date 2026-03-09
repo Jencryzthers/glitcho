@@ -40,10 +40,6 @@ enum RecordingCaptureType: String, Codable, Hashable {
         }
     }
 
-    var savedNotificationTitle: String {
-        isDownload ? "Download saved" : "Recording saved"
-    }
-
     static func fromFilenameTag(_ tag: String) -> RecordingCaptureType? {
         switch tag.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "live":

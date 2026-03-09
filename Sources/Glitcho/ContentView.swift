@@ -50,7 +50,6 @@ struct ContentView: View {
     @AppStorage(BiometricLockSettings.hideRecordingsStorageKey) private var biometricLockHideRecordings = true
     @AppStorage(BiometricLockSettings.recordingsRequireAuthOnOpenStorageKey) private var biometricLockRecordingsRequireAuthOnOpen = BiometricLockSettings.defaultRecordingsRequireAuthOnOpen
     @AppStorage(BiometricLockSettings.hidePinnedStorageKey) private var biometricLockHidePinned = true
-    @AppStorage(BiometricLockSettings.hideRecentStorageKey) private var biometricLockHideRecent = true
     @AppStorage(BiometricLockSettings.autoProtectAllowlistedStorageKey) private var biometricLockAutoProtectAllowlisted = BiometricLockSettings.defaultAutoProtectAllowlisted
     @AppStorage(BiometricLockSettings.authenticateOnSettingsOpenStorageKey) private var biometricLockAuthenticateOnSettingsOpen = false
     @AppStorage(BiometricLockSettings.hotkeyKeyStorageKey) private var biometricLockHotkeyKey = BiometricLockSettings.defaultHotkeyKey
@@ -364,7 +363,6 @@ struct ContentView: View {
         let canViewProtectedStreamerContent = !biometricLockEnabled || recordingsUnlockManager.isUnlocked
         let shouldShowRecordings = shouldShowProtectedSection(isEnabled: biometricLockHideRecordings)
         let shouldShowPinned = shouldShowProtectedSection(isEnabled: biometricLockHidePinned)
-        let shouldShowRecent = shouldShowProtectedSection(isEnabled: biometricLockHideRecent)
         return NavigationSplitView(columnVisibility: $columnVisibility) {
             Sidebar(
                 searchText: $searchText,
@@ -422,7 +420,6 @@ struct ContentView: View {
                 activeAutoRecordMode: autoRecordMode(),
                 showRecordingsNavigation: shouldShowRecordings,
                 showPinnedSection: shouldShowPinned,
-                showRecentSection: shouldShowRecent,
                 protectedStreamerLogins: protectedStreamerLogins,
                 isBiometricUnlocked: canViewProtectedStreamerContent
             )
@@ -445,6 +442,11 @@ struct ContentView: View {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                     store.shouldSwitchToNativePlayback = nil
                 }
+            }
+        }
+        .onChange(of: detailMode) { mode in
+            if mode != .native {
+                store.restoreWebPlaybackAfterNativePlayer()
             }
         }
         .navigationSplitViewColumnWidth(min: 300, ideal: 320, max: 340)
@@ -1403,12 +1405,9 @@ struct Sidebar: View {
     var activeAutoRecordMode: AutoRecordMode = .pinnedAndFollowed
     var showRecordingsNavigation: Bool = true
     var showPinnedSection: Bool = true
-    var showRecentSection: Bool = true
     var protectedStreamerLogins: Set<String> = []
     var isBiometricUnlocked: Bool = false
-    @AppStorage("recentChannels.v1") private var recentChannelsData: Data = Data()
     @AppStorage("sidebar.pinnedCollapsed") private var pinnedCollapsed = false
-    @AppStorage("sidebar.recentCollapsed") private var recentCollapsed = false
     @AppStorage("sidebar.followingCollapsed") private var followingCollapsed = false
     @State private var isAddingPin = false
     @State private var newPinText = ""
@@ -1681,13 +1680,8 @@ struct Sidebar: View {
                                     liveChannel: liveChannel,
                                     isRecording: isRecording,
                                     onOpen: {
-                                        if let liveChannel {
-                                            onChannelSelected?(liveChannel.login)
-                                            addToRecent(login: liveChannel.login)
-                                        } else {
-                                            onNavigate?(pin.url) ?? store.navigate(to: pin.url)
-                                            addToRecent(login: pin.login)
-                                        }
+                                        let targetLogin = liveChannel?.login ?? pin.login
+                                        onChannelSelected?(targetLogin)
                                     },
                                     onRemove: { onRemovePin?(pin) },
                                     onToggleNotifications: { onTogglePinNotifications?(pin) },
@@ -1707,67 +1701,6 @@ struct Sidebar: View {
                             }
                         }
                         } // end if !pinnedCollapsed
-
-                        Rectangle()
-                            .fill(Color.white.opacity(0.08))
-                            .frame(height: 1)
-                            .padding(.vertical, 12)
-                            .padding(.horizontal, 12)
-                    }
-
-                    let visibleRecentChannels = recentChannels.filter { login in
-                        !protectedStreamerLogins.contains(login) || isBiometricUnlocked
-                    }
-
-                    if showRecentSection, !visibleRecentChannels.isEmpty {
-                        HStack {
-                            Button(action: { withAnimation(.easeOut(duration: 0.15)) { recentCollapsed.toggle() } }) {
-                                HStack(spacing: 4) {
-                                    Image(systemName: recentCollapsed ? "chevron.right" : "chevron.down")
-                                        .font(.system(size: 8, weight: .bold))
-                                        .foregroundStyle(.white.opacity(0.25))
-                                    Text("RECENT")
-                                        .font(.system(size: 10, weight: .bold))
-                                        .foregroundStyle(.white.opacity(0.25))
-                                        .tracking(1)
-                                }
-                            }
-                            .buttonStyle(.plain)
-                            Spacer()
-                        }
-                        .padding(.horizontal, 12)
-                        .padding(.top, 8)
-                        .padding(.bottom, 4)
-
-                        if !recentCollapsed {
-                        let liveLoginSet = Set(store.followedLive.map(\.login))
-                        let liveAvatarByLogin = Dictionary(store.followedLive.compactMap { ch in ch.thumbnailURL.map { (ch.login, $0) } }, uniquingKeysWith: { first, _ in first })
-                        let pinnedAvatarByLogin = Dictionary(pinnedChannels.compactMap { p in p.thumbnailURL.map { (p.login, $0) } }, uniquingKeysWith: { first, _ in first })
-                        ForEach(visibleRecentChannels, id: \.self) { login in
-                            OfflineFollowingRow(
-                                login: login,
-                                avatarURL: liveAvatarByLogin[login] ?? pinnedAvatarByLogin[login] ?? store.offlineChannelAvatarURLs[login],
-                                isLive: liveLoginSet.contains(login)
-                            ) {
-                                onChannelSelected?(login)
-                                addToRecent(login: login)
-                            }
-                            .contextMenu {
-                                Button("Copy Stream URL") {
-                                    NSPasteboard.general.clearContents()
-                                    NSPasteboard.general.setString("https://twitch.tv/\(login)", forType: .string)
-                                }
-                            }
-                            .overlay(alignment: .trailing) {
-                                if liveLoginSet.contains(login) {
-                                    Circle()
-                                        .fill(Color.red)
-                                        .frame(width: 6, height: 6)
-                                        .padding(.trailing, 12)
-                                }
-                            }
-                        }
-                        } // end if !recentCollapsed
 
                         Rectangle()
                             .fill(Color.white.opacity(0.08))
@@ -1826,7 +1759,6 @@ struct Sidebar: View {
                             ) {
                                 let channelName = channel.url.lastPathComponent
                                 onChannelSelected?(channelName)
-                                addToRecent(login: channel.login)
                             }
                             .contextMenu {
                                 Button("Copy Stream URL") {
@@ -1864,7 +1796,6 @@ struct Sidebar: View {
                                 avatarURL: pinnedChannels.first(where: { $0.login == login })?.thumbnailURL ?? store.offlineChannelAvatarURLs[login]
                             ) {
                                 onChannelSelected?(login)
-                                addToRecent(login: login)
                             }
                             .contextMenu {
                                 Button("Copy Stream URL") {
@@ -1888,18 +1819,6 @@ struct Sidebar: View {
                 sidebarTint.opacity(0.25)
             }
         )
-    }
-
-    private var recentChannels: [String] {
-        (try? JSONDecoder().decode([String].self, from: recentChannelsData)) ?? []
-    }
-
-    private func addToRecent(login: String) {
-        var recent = recentChannels
-        recent.removeAll { $0 == login }
-        recent.insert(login, at: 0)
-        if recent.count > 8 { recent = Array(recent.prefix(8)) }
-        recentChannelsData = (try? JSONEncoder().encode(recent)) ?? Data()
     }
 
     private func normalized(_ value: String?) -> String? {

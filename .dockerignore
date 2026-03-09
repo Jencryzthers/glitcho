@@ -1,0 +1,14 @@
+.git
+.gitignore
+.build
+Build
+.swiftpm
+.local
+**/.DS_Store
+**/node_modules
+**/*.swp
+deploy/license-server/data/*.pem
+deploy/license-server/data/*.b64
+deploy/commerce-site/data/*.pem
+deploy/commerce-site/data/*.b64
+deploy/commerce-site/data/*.json

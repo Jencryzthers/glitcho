@@ -1,0 +1,22 @@
+services:
+  commerce-site:
+    container_name: glitcho-commerce-site
+    build:
+      context: ../..
+      dockerfile: deploy/commerce-site/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      PORT: 8080
+      DATA_DIR: /data
+    ports:
+      - "${COMMERCE_SITE_PORT:-8080}:8080"
+    volumes:
+      - ./data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8080/health >/dev/null || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 20s

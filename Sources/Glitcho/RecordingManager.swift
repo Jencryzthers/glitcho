@@ -19,10 +19,11 @@ final class RecordingManager: ObservableObject {
         case running
         case completed
         case failed
+        case paused
         case canceled
     }
 
-    struct DownloadTask: Identifiable, Hashable {
+    struct DownloadTask: Identifiable, Codable, Hashable {
         let id: String
         let target: String
         let channelName: String?
@@ -34,7 +35,76 @@ final class RecordingManager: ObservableObject {
         var progressFraction: Double?
         var bytesWritten: Int64
         var statusMessage: String?
+        var lastErrorMessage: String?
+        var retryCount: Int
         var state: DownloadTaskState
+
+        private enum CodingKeys: String, CodingKey {
+            case id
+            case target
+            case channelName
+            case quality
+            case captureType
+            case outputURL
+            case startedAt
+            case updatedAt
+            case progressFraction
+            case bytesWritten
+            case statusMessage
+            case lastErrorMessage
+            case retryCount
+            case state
+        }
+
+        init(
+            id: String,
+            target: String,
+            channelName: String?,
+            quality: String,
+            captureType: RecordingCaptureType,
+            outputURL: URL?,
+            startedAt: Date?,
+            updatedAt: Date,
+            progressFraction: Double?,
+            bytesWritten: Int64,
+            statusMessage: String?,
+            lastErrorMessage: String?,
+            retryCount: Int,
+            state: DownloadTaskState
+        ) {
+            self.id = id
+            self.target = target
+            self.channelName = channelName
+            self.quality = quality
+            self.captureType = captureType
+            self.outputURL = outputURL
+            self.startedAt = startedAt
+            self.updatedAt = updatedAt
+            self.progressFraction = progressFraction
+            self.bytesWritten = bytesWritten
+            self.statusMessage = statusMessage
+            self.lastErrorMessage = lastErrorMessage
+            self.retryCount = retryCount
+            self.state = state
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            id = try container.decode(String.self, forKey: .id)
+            target = try container.decode(String.self, forKey: .target)
+            channelName = try container.decodeIfPresent(String.self, forKey: .channelName)
+            quality = try container.decode(String.self, forKey: .quality)
+            captureType = try container.decode(RecordingCaptureType.self, forKey: .captureType)
+            outputURL = try container.decodeIfPresent(URL.self, forKey: .outputURL)
+            startedAt = try container.decodeIfPresent(Date.self, forKey: .startedAt)
+            updatedAt = try container.decode(Date.self, forKey: .updatedAt)
+            progressFraction = try container.decodeIfPresent(Double.self, forKey: .progressFraction)
+            bytesWritten = try container.decodeIfPresent(Int64.self, forKey: .bytesWritten) ?? 0
+            statusMessage = try container.decodeIfPresent(String.self, forKey: .statusMessage)
+            lastErrorMessage = try container.decodeIfPresent(String.self, forKey: .lastErrorMessage)
+            retryCount = try container.decodeIfPresent(Int.self, forKey: .retryCount) ?? 0
+            state = try container.decode(DownloadTaskState.self, forKey: .state)
+        }
 
         var displayName: String {
             if let channelName, !channelName.isEmpty {
@@ -47,7 +117,7 @@ final class RecordingManager: ObservableObject {
         }
 
         var canResume: Bool {
-            state == .failed || state == .canceled
+            state == .failed || state == .canceled || state == .paused
         }
     }
 
@@ -97,11 +167,56 @@ final class RecordingManager: ObservableObject {
         let failedCount: Int
     }
 
+    struct LibraryIntegrityReport {
+        let scannedAt: Date
+        let manifestEntryCount: Int
+        let encryptedFileCount: Int
+        let orphanedManifestEntries: [String]
+        let missingThumbnailEntries: [String]
+        let orphanedThumbnailEntries: [String]
+        let unreadableFiles: [URL]
+
+        var issueCount: Int {
+            orphanedManifestEntries.count
+                + unreadableFiles.count
+        }
+    }
+
+    struct LibraryIntegrityRepairResult {
+        let reportBefore: LibraryIntegrityReport
+        let removedManifestEntries: Int
+        let regeneratedThumbnails: Int
+        let removedOrphanedThumbnails: Int
+        let unresolvedUnreadableFiles: [URL]
+
+        var changed: Bool {
+            removedManifestEntries > 0
+                || regeneratedThumbnails > 0
+                || removedOrphanedThumbnails > 0
+        }
+    }
+
+    struct DuplicateRecordingGroup {
+        let key: String
+        let items: [RecordingEntry]
+        let wastedBytes: Int64
+    }
+
+    struct DuplicateCleanupResult {
+        let removedCount: Int
+        let failedMessages: [String]
+    }
+
     private struct QueuedRecordingRequest {
         let target: String
         let channelName: String?
         let quality: String
         let captureType: RecordingCaptureType
+    }
+
+    private enum DownloadStopReason {
+        case canceled
+        case paused
     }
 
     private final class StreamlinkStderrCollector: @unchecked Sendable {
@@ -115,6 +230,12 @@ final class RecordingManager: ObservableObject {
     private var backgroundRecordingMonitor: Timer?
     private var pendingRecoveryIntents: [RecoveryIntent] = []
     private let recoveryDefaultsKey = "recordingRecoveryIntents.v1"
+    private let downloadTasksDefaultsKey = "recordingDownloadTasks.v1"
+    private let downloadAutoRetryEnabledKey = "recordingDownloadAutoRetryEnabled"
+    private let downloadAutoRetryLimitKey = "recordingDownloadAutoRetryLimit"
+    private let downloadAutoRetryDelayKey = "recordingDownloadAutoRetryDelaySeconds"
+    private var downloadStopReasons: [String: DownloadStopReason] = [:]
+    private var scheduledDownloadRetryTasks: [String: Task<Void, Never>] = [:]
 
 
     private let filenameDateFormatter: DateFormatter = {
@@ -135,6 +256,8 @@ final class RecordingManager: ObservableObject {
         self.recorderOrchestrator = recorderOrchestrator ?? RecorderOrchestrator()
         syncOrchestratorConcurrencyLimit()
         pendingRecoveryIntents = loadPersistedRecoveryIntents()
+        downloadTasks = loadPersistedDownloadTasks()
+        normalizeDownloadTasksAfterLaunch()
         refreshBackgroundRecordingState()
         startBackgroundRecordingMonitor()
         recordingEncryptionManager.cleanupTempPlaybackFiles()
@@ -143,6 +266,9 @@ final class RecordingManager: ObservableObject {
 
     deinit {
         backgroundRecordingMonitor?.invalidate()
+        for task in scheduledDownloadRetryTasks.values {
+            task.cancel()
+        }
     }
 
     func consumeRecoveryIntents() -> [RecoveryIntent] {
@@ -218,7 +344,8 @@ final class RecordingManager: ObservableObject {
                 channelName: parsed.channelName,
                 recordedAt: parsed.recordedAt ?? fileTimestamp,
                 fileTimestamp: fileTimestamp,
-                sourceType: parsed.sourceType
+                sourceType: parsed.sourceType,
+                sourceTarget: nil
             )
         }
     }
@@ -302,7 +429,8 @@ final class RecordingManager: ObservableObject {
                 channelName: entry.channelName,
                 recordedAt: entry.date,
                 fileTimestamp: fileTimestamp,
-                sourceType: entry.sourceType
+                sourceType: entry.sourceType,
+                sourceTarget: entry.sourceTarget
             )
         }
 
@@ -320,7 +448,8 @@ final class RecordingManager: ObservableObject {
                     channelName: "Encrypted Recording",
                     recordedAt: fallbackDate,
                     fileTimestamp: fallbackDate,
-                    sourceType: .liveRecording
+                    sourceType: .liveRecording,
+                    sourceTarget: nil
                 )
             )
         }
@@ -408,6 +537,97 @@ final class RecordingManager: ObservableObject {
         return recordingURL.lastPathComponent
     }
 
+    func recordingSourceTarget(for recordingURL: URL) -> String? {
+        if recordingURL.pathExtension.lowercased() == "glitcho",
+           let manifest = recordingEncryptionManager
+               .loadManifestIfAvailableWithoutInteraction(from: recordingsDirectory()),
+           let entry = manifest[recordingURL.lastPathComponent] {
+            return entry.sourceTarget
+        }
+        return nil
+    }
+
+    @discardableResult
+    func redownloadRecording(_ recording: RecordingEntry) -> Bool {
+        let fallbackChannel = recording.channelName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedTarget: String? = {
+            if let sourceTarget = recording.sourceTarget?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !sourceTarget.isEmpty {
+                return sourceTarget
+            }
+            if let sourceTarget = recordingSourceTarget(for: recording.url)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+               !sourceTarget.isEmpty {
+                return sourceTarget
+            }
+            if recording.sourceType == .liveRecording, !fallbackChannel.isEmpty {
+                let loginLike = fallbackChannel
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .replacingOccurrences(of: " ", with: "")
+                    .lowercased()
+                return "twitch.tv/\(loginLike)"
+            }
+            return nil
+        }()
+
+        guard let resolvedTarget else {
+            errorMessage = "Original source URL is unavailable for this recording."
+            return false
+        }
+
+        let quality = "best"
+        let channelName = fallbackChannel.isEmpty ? nil : fallbackChannel
+        return startRecording(target: resolvedTarget, channelName: channelName, quality: quality)
+    }
+
+    @discardableResult
+    func renameRecording(at sourceURL: URL, to requestedName: String) throws -> URL {
+        let trimmed = requestedName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw NSError(
+                domain: "RecordingError",
+                code: 30,
+                userInfo: [NSLocalizedDescriptionKey: "Name cannot be empty."]
+            )
+        }
+
+        if sourceURL.pathExtension.lowercased() == "glitcho" {
+            let directory = recordingsDirectory()
+            var manifest = try recordingEncryptionManager.loadManifestSerialized(from: directory)
+            guard var entry = manifest[sourceURL.lastPathComponent] else {
+                throw NSError(
+                    domain: "RecordingError",
+                    code: 31,
+                    userInfo: [NSLocalizedDescriptionKey: "Unable to find recording metadata."]
+                )
+            }
+            let currentExt = (entry.originalFilename as NSString).pathExtension
+            let ext = currentExt.isEmpty ? "mp4" : currentExt
+            let safeStem = sanitizedFilenameComponent(from: trimmed) ?? "recording"
+            entry = RecordingManifestEntry(
+                channelName: entry.channelName,
+                date: entry.date,
+                quality: entry.quality,
+                originalFilename: "\(safeStem).\(ext)",
+                sourceType: entry.sourceType,
+                sourceTarget: entry.sourceTarget
+            )
+            manifest[sourceURL.lastPathComponent] = entry
+            try recordingEncryptionManager.saveManifestSerialized(manifest, to: directory)
+            NotificationCenter.default.post(name: .recordingLibraryDidChange, object: nil)
+            return sourceURL
+        }
+
+        let ext = sourceURL.pathExtension
+        let safeStem = sanitizedFilenameComponent(from: trimmed) ?? "recording"
+        let filename = ext.isEmpty ? safeStem : "\(safeStem).\(ext)"
+        let destinationDir = sourceURL.deletingLastPathComponent()
+        let destination = uniqueDestinationURL(in: destinationDir, preferredFilename: filename)
+        try FileManager.default.moveItem(at: sourceURL, to: destination)
+        NotificationCenter.default.post(name: .recordingLibraryDidChange, object: nil)
+        return destination
+    }
+
     @discardableResult
     func exportRecording(at sourceURL: URL, to destinationDir: URL) throws -> URL {
         if sourceURL.pathExtension.lowercased() == "glitcho" {
@@ -433,118 +653,6 @@ final class RecordingManager: ObservableObject {
         }
         try FileManager.default.copyItem(at: sourceURL, to: destination)
         return destination
-    }
-
-    struct MoveResult {
-        let movedCount: Int
-        let failed: [String]
-    }
-
-    func listRecordingFolders() -> [String] {
-        let root = recordingsDirectory().standardizedFileURL
-        var folders = Set<String>()
-        guard let enumerator = FileManager.default.enumerator(
-            at: root,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles]
-        ) else {
-            return []
-        }
-
-        for case let url as URL in enumerator {
-            let values = try? url.resourceValues(forKeys: [.isDirectoryKey])
-            guard values?.isDirectory == true else { continue }
-            let standardized = url.standardizedFileURL
-            guard standardized.path != root.path else { continue }
-            guard standardized.path.hasPrefix(root.path) else { continue }
-
-            var relative = String(standardized.path.dropFirst(root.path.count))
-            while relative.hasPrefix("/") { relative.removeFirst() }
-            if !relative.isEmpty {
-                folders.insert(relative)
-            }
-        }
-        return folders.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
-    }
-
-    @discardableResult
-    func createRecordingFolder(named rawName: String) throws -> String {
-        let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty else {
-            throw NSError(
-                domain: "RecordingError",
-                code: 20,
-                userInfo: [NSLocalizedDescriptionKey: "Folder name cannot be empty."]
-            )
-        }
-        let invalid = CharacterSet(charactersIn: "/\\:*?\"<>|")
-        let sanitized = name.components(separatedBy: invalid).joined(separator: "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !sanitized.isEmpty else {
-            throw NSError(
-                domain: "RecordingError",
-                code: 21,
-                userInfo: [NSLocalizedDescriptionKey: "Folder name is invalid."]
-            )
-        }
-
-        let destination = recordingsDirectory().appendingPathComponent(sanitized, isDirectory: true)
-        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
-        return sanitized
-    }
-
-    func moveRecordings(_ urls: [URL], toFolder folder: String?) -> MoveResult {
-        let uniqueURLs = Array(Set(urls.map(\.standardizedFileURL)))
-        guard !uniqueURLs.isEmpty else {
-            return MoveResult(movedCount: 0, failed: [])
-        }
-
-        let targetDirectory: URL
-        if let folder, !folder.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            let trimmed = folder.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.contains(".."),
-                  !trimmed.hasPrefix("/") else {
-                return MoveResult(movedCount: 0, failed: ["Invalid folder path."])
-            }
-            targetDirectory = recordingsDirectory().appendingPathComponent(trimmed, isDirectory: true)
-        } else {
-            targetDirectory = recordingsDirectory()
-        }
-
-        var moved = 0
-        var failed: [String] = []
-        for source in uniqueURLs {
-            do {
-                guard source.isFileURL else { continue }
-                if isRecording(outputURL: source) {
-                    throw NSError(
-                        domain: "RecordingError",
-                        code: 22,
-                        userInfo: [NSLocalizedDescriptionKey: "File is currently recording/downloading."]
-                    )
-                }
-                let destination = uniqueDestinationURL(
-                    in: targetDirectory,
-                    preferredFilename: source.lastPathComponent
-                )
-                if source.standardizedFileURL == destination.standardizedFileURL {
-                    continue
-                }
-                try FileManager.default.createDirectory(
-                    at: targetDirectory,
-                    withIntermediateDirectories: true
-                )
-                try FileManager.default.moveItem(at: source, to: destination)
-                moved += 1
-            } catch {
-                failed.append("\(source.lastPathComponent): \(error.localizedDescription)")
-            }
-        }
-
-        if moved > 0 {
-            NotificationCenter.default.post(name: .recordingLibraryDidChange, object: nil)
-        }
-        return MoveResult(movedCount: moved, failed: failed)
     }
 
     private func uniqueDestinationURL(in directory: URL, preferredFilename: String) -> URL {
@@ -610,6 +718,8 @@ final class RecordingManager: ObservableObject {
         }
         let sessionKey = recordingKey(target: target, channelLogin: resolvedChannelLogin)
         guard recordingSessions[sessionKey] == nil else { return false }
+        cancelScheduledDownloadRetry(for: sessionKey)
+        downloadStopReasons.removeValue(forKey: sessionKey)
 
         if let resolvedChannelLogin,
            maybeQueueRecordingRequest(
@@ -633,7 +743,15 @@ final class RecordingManager: ObservableObject {
             return false
         }
 
-        let directory = recordingsDirectory()
+        let rootDirectory = recordingsDirectory()
+        let startedAt = Date()
+        let directory = recordingOutputDirectory(
+            rootDirectory: rootDirectory,
+            displayName: channelName,
+            login: resolvedChannelLogin,
+            captureType: captureType,
+            startedAt: startedAt
+        )
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         } catch {
@@ -655,7 +773,7 @@ final class RecordingManager: ObservableObject {
         if let resolvedChannelLogin {
             clearPendingRecoveryIntent(channelLogin: resolvedChannelLogin)
         }
-        let timestamp = filenameDateFormatter.string(from: Date())
+        let timestamp = filenameDateFormatter.string(from: startedAt)
         let safeChannel = sanitizedFilenameComponent(from: displayName)
             ?? sanitizedFilenameComponent(from: resolvedChannelLogin)
             ?? "twitch"
@@ -789,8 +907,16 @@ final class RecordingManager: ObservableObject {
                 }
 
                 if session.captureType.isDownload {
+                    let stopReason = self.downloadStopReasons.removeValue(forKey: session.key)
                     let finalState: DownloadTaskState = {
-                        if didUserStop { return .canceled }
+                        if didUserStop {
+                            switch stopReason {
+                            case .paused:
+                                return .paused
+                            default:
+                                return .canceled
+                            }
+                        }
                         if proc.terminationStatus == 0 { return .completed }
                         return .failed
                     }()
@@ -800,6 +926,11 @@ final class RecordingManager: ObservableObject {
                         statusMessage: failureMessage,
                         outputURL: session.outputURL
                     )
+                    if finalState == .failed {
+                        self.scheduleAutomaticDownloadRetryIfNeeded(id: session.key)
+                    } else {
+                        self.cancelScheduledDownloadRetry(for: session.key)
+                    }
                 }
 
                 // Streamlink outputs MPEG-TS data even when the filename ends with .mp4.
@@ -813,27 +944,13 @@ final class RecordingManager: ObservableObject {
                     shouldAttemptFinalize = proc.terminationStatus == 0 || didUserStop
                 }
                 if shouldAttemptFinalize {
-                    let displayForNotif = session.channelName ?? session.login ?? "Unknown"
                     if session.captureType == .liveRecording && streamEndedNaturally {
                         if let login = session.login {
                             self.autoStoppedRecordings.append(login)
                         }
-                        self.sendNotification(
-                            title: "Stream ended",
-                            body: "\(displayForNotif) recording saved"
-                        )
                         GlitchoTelemetry.track(
                             "recording_auto_stopped_stream_ended",
                             metadata: ["login": session.login ?? "unknown"]
-                        )
-                    } else {
-                        let duration = Int(Date().timeIntervalSince(session.startedAt))
-                        let mins = duration / 60
-                        let secs = duration % 60
-                        let durationStr = mins > 0 ? "\(mins)m \(secs)s" : "\(secs)s"
-                        self.sendNotification(
-                            title: session.captureType.savedNotificationTitle,
-                            body: "\(displayForNotif) (\(durationStr))"
                         )
                     }
                     await self.secureRecordedOutputIfNeeded(session: session)
@@ -858,7 +975,7 @@ final class RecordingManager: ObservableObject {
             quality: quality,
             outputURL: outputURL,
             process: process,
-            startedAt: Date(),
+            startedAt: startedAt,
             userInitiatedStop: false
         )
 
@@ -871,10 +988,11 @@ final class RecordingManager: ObservableObject {
                 captureType: captureType,
                 outputURL: outputURL,
                 state: .running,
-                startedAt: Date(),
+                startedAt: startedAt,
                 progressFraction: nil,
                 bytesWritten: 0,
-                statusMessage: nil
+                statusMessage: nil,
+                lastErrorMessage: nil
             )
         }
         syncPublishedRecordingState()
@@ -903,6 +1021,7 @@ final class RecordingManager: ObservableObject {
                     statusMessage: message,
                     outputURL: outputURL
                 )
+                scheduleAutomaticDownloadRetryIfNeeded(id: sessionKey)
             }
             GlitchoTelemetry.track(
                 "recording_start_failed_launch",
@@ -916,33 +1035,53 @@ final class RecordingManager: ObservableObject {
     }
 
     private func secureRecordedOutputIfNeeded(session: RecordingSession) async {
+        let startedAt = Date()
+        func elapsedMs() -> String {
+            String(Int(Date().timeIntervalSince(startedAt) * 1000))
+        }
+
         do {
-            let prepared = try await prepareRecordingForPlayback(at: session.outputURL)
+            let prepared = try await prepareRecordingForPlayback(
+                at: session.outputURL,
+                allowTransportStreamFallback: false
+            )
             let outputURL = prepared.url
             guard outputURL.pathExtension.lowercased() == "mp4" else { return }
 
-            let directory = recordingsDirectory()
+            let destinationDirectory = outputURL.deletingLastPathComponent()
+            let manifestDirectory = recordingsDirectory()
             let encrypted = try recordingEncryptionManager.encryptFile(
                 at: outputURL,
-                in: directory,
+                in: destinationDirectory,
                 channelName: session.channelName,
                 quality: session.quality,
                 date: session.startedAt,
-                sourceType: session.captureType
+                sourceType: session.captureType,
+                sourceTarget: session.target
             )
             try recordingEncryptionManager.upsertManifestEntry(
                 encrypted.entry,
                 hashFilename: encrypted.hashFilename,
-                in: directory
+                in: manifestDirectory
             )
             NotificationCenter.default.post(name: .recordingLibraryDidChange, object: nil)
+            GlitchoTelemetry.track(
+                "recording_secure_finalize_completed",
+                metadata: [
+                    "login": session.login ?? "unknown",
+                    "capture_type": session.captureType.rawValue,
+                    "container": "glitcho_obf_v2",
+                    "elapsed_ms": elapsedMs()
+                ]
+            )
         } catch {
             errorMessage = "Could not secure \(session.captureType.actionLabel.lowercased()): \(error.localizedDescription)"
             GlitchoTelemetry.track(
                 "recording_secure_finalize_failed",
                 metadata: [
                     "login": session.login ?? "unknown",
-                    "error": error.localizedDescription
+                    "error": error.localizedDescription,
+                    "elapsed_ms": elapsedMs()
                 ]
             )
         }
@@ -965,11 +1104,43 @@ final class RecordingManager: ObservableObject {
 
     @discardableResult
     func cancelDownloadTask(id: String) -> Bool {
-        guard let session = recordingSessions[id], session.captureType.isDownload else {
+        if let session = recordingSessions[id], session.captureType.isDownload {
+            downloadStopReasons[id] = .canceled
+            stopRecording(forKey: id)
+            return true
+        }
+        guard let index = downloadTasks.firstIndex(where: { $0.id == id }) else {
             return false
         }
-        stopRecording(forKey: id)
-        return true
+        if downloadTasks[index].state == .running || downloadTasks[index].state == .queued {
+            downloadTasks[index].state = .canceled
+            downloadTasks[index].updatedAt = Date()
+            downloadTasks[index].statusMessage = "Canceled."
+            persistDownloadTasks()
+            return true
+        }
+        return false
+    }
+
+    @discardableResult
+    func pauseDownloadTask(id: String) -> Bool {
+        if let session = recordingSessions[id], session.captureType.isDownload {
+            downloadStopReasons[id] = .paused
+            stopRecording(forKey: id)
+            return true
+        }
+        guard let index = downloadTasks.firstIndex(where: { $0.id == id }) else {
+            return false
+        }
+        if downloadTasks[index].state == .running || downloadTasks[index].state == .queued {
+            downloadTasks[index].state = .paused
+            downloadTasks[index].updatedAt = Date()
+            downloadTasks[index].progressFraction = nil
+            downloadTasks[index].statusMessage = "Paused."
+            persistDownloadTasks()
+            return true
+        }
+        return false
     }
 
     @discardableResult
@@ -978,6 +1149,7 @@ final class RecordingManager: ObservableObject {
               task.canResume else {
             return false
         }
+        cancelScheduledDownloadRetry(for: id)
         return startRecording(
             target: task.target,
             channelName: task.channelName,
@@ -990,11 +1162,65 @@ final class RecordingManager: ObservableObject {
         if let session = recordingSessions[id], session.captureType.isDownload {
             stopRecording(forKey: id)
         }
+        cancelScheduledDownloadRetry(for: id)
+        downloadStopReasons.removeValue(forKey: id)
         guard let index = downloadTasks.firstIndex(where: { $0.id == id }) else {
             return false
         }
         downloadTasks.remove(at: index)
+        persistDownloadTasks()
         return true
+    }
+
+    func pauseAllDownloadTasks() {
+        let activeIDs = downloadTasks
+            .filter { $0.state == .running || $0.state == .queued }
+            .map(\.id)
+        for id in activeIDs {
+            _ = pauseDownloadTask(id: id)
+        }
+    }
+
+    func resumeAllDownloadTasks() {
+        let resumableIDs = downloadTasks
+            .filter(\.canResume)
+            .map(\.id)
+        for id in resumableIDs {
+            _ = resumeDownloadTask(id: id)
+        }
+    }
+
+    @discardableResult
+    func retryFailedDownloadTasks() -> Int {
+        let failedIDs = downloadTasks
+            .filter { $0.state == .failed }
+            .map(\.id)
+        for id in failedIDs {
+            _ = resumeDownloadTask(id: id)
+        }
+        return failedIDs.count
+    }
+
+    @discardableResult
+    func clearCompletedDownloadTasks() -> Int {
+        let removable = downloadTasks
+            .filter { $0.state == .completed || $0.state == .canceled }
+            .map(\.id)
+        for id in removable {
+            _ = removeDownloadTask(id: id)
+        }
+        return removable.count
+    }
+
+    @discardableResult
+    func cancelActiveDownloadTasks() -> Int {
+        let active = downloadTasks
+            .filter { $0.state == .running || $0.state == .queued }
+            .map(\.id)
+        for id in active {
+            _ = cancelDownloadTask(id: id)
+        }
+        return active.count
     }
 
     private func upsertDownloadTask(
@@ -1008,7 +1234,8 @@ final class RecordingManager: ObservableObject {
         startedAt: Date?,
         progressFraction: Double?,
         bytesWritten: Int64,
-        statusMessage: String?
+        statusMessage: String?,
+        lastErrorMessage: String?
     ) {
         if let index = downloadTasks.firstIndex(where: { $0.id == id }) {
             var existing = downloadTasks[index]
@@ -1017,7 +1244,19 @@ final class RecordingManager: ObservableObject {
             existing.updatedAt = Date()
             existing.progressFraction = progressFraction ?? existing.progressFraction
             existing.bytesWritten = max(bytesWritten, existing.bytesWritten)
-            existing.statusMessage = statusMessage ?? existing.statusMessage
+            if let statusMessage {
+                existing.statusMessage = statusMessage
+            } else if state == .running || state == .queued {
+                existing.statusMessage = nil
+            }
+            if let lastErrorMessage {
+                existing.lastErrorMessage = lastErrorMessage
+            } else if state == .running || state == .queued || state == .completed {
+                existing.lastErrorMessage = nil
+            }
+            if state == .completed {
+                existing.retryCount = 0
+            }
             existing.state = state
             downloadTasks[index] = existing
         } else {
@@ -1034,6 +1273,8 @@ final class RecordingManager: ObservableObject {
                     progressFraction: progressFraction,
                     bytesWritten: bytesWritten,
                     statusMessage: statusMessage,
+                    lastErrorMessage: lastErrorMessage,
+                    retryCount: 0,
                     state: state
                 )
             )
@@ -1042,9 +1283,10 @@ final class RecordingManager: ObservableObject {
         downloadTasks.sort { lhs, rhs in
             lhs.updatedAt > rhs.updatedAt
         }
-        if downloadTasks.count > 24 {
-            downloadTasks = Array(downloadTasks.prefix(24))
+        if downloadTasks.count > 120 {
+            downloadTasks = Array(downloadTasks.prefix(120))
         }
+        persistDownloadTasks()
     }
 
     private func updateDownloadTaskProgress(id: String, line: String, outputURL: URL) {
@@ -1063,21 +1305,24 @@ final class RecordingManager: ObservableObject {
             task.bytesWritten = max(task.bytesWritten, fileBytes)
         }
         task.statusMessage = line
+        task.lastErrorMessage = nil
         task.updatedAt = Date()
         task.state = .running
         downloadTasks[index] = task
         downloadTasks.sort { lhs, rhs in lhs.updatedAt > rhs.updatedAt }
+        persistDownloadTasks()
     }
 
     private func updateDownloadTaskFinalState(
         id: String,
         state: DownloadTaskState,
         statusMessage: String?,
-        outputURL: URL
+        outputURL: URL?
     ) {
         guard let index = downloadTasks.firstIndex(where: { $0.id == id }) else { return }
         var task = downloadTasks[index]
-        if let attrs = try? FileManager.default.attributesOfItem(atPath: outputURL.path),
+        if let outputURL,
+           let attrs = try? FileManager.default.attributesOfItem(atPath: outputURL.path),
            let fileBytes = attrs[.size] as? Int64 {
             task.bytesWritten = max(task.bytesWritten, fileBytes)
         }
@@ -1086,9 +1331,17 @@ final class RecordingManager: ObservableObject {
         task.statusMessage = statusMessage ?? task.statusMessage
         if state == .completed {
             task.progressFraction = 1.0
+            task.lastErrorMessage = nil
+            task.retryCount = 0
+        } else if state == .failed {
+            let errorText = statusMessage?.trimmingCharacters(in: .whitespacesAndNewlines)
+            task.lastErrorMessage = (errorText?.isEmpty == false) ? errorText : task.statusMessage
+        } else if state == .paused {
+            task.progressFraction = nil
         }
         downloadTasks[index] = task
         downloadTasks.sort { lhs, rhs in lhs.updatedAt > rhs.updatedAt }
+        persistDownloadTasks()
     }
 
     private func parseDownloadProgressFraction(from line: String) -> Double? {
@@ -1179,10 +1432,20 @@ final class RecordingManager: ObservableObject {
     // MARK: - Notification Support
 
     func requestNotificationPermission() {
+        if NSClassFromString("XCTestCase") != nil {
+            return
+        }
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
 
     func sendNotification(title: String, body: String) {
+        // Test host processes do not have a valid application bundle for
+        // UserNotifications, which can throw NSInternalInconsistencyException.
+        if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+            || NSClassFromString("XCTestCase") != nil
+            || Bundle.main.bundleURL.path.contains("/Contents/Developer/usr/bin") {
+            return
+        }
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
@@ -1396,6 +1659,191 @@ final class RecordingManager: ObservableObject {
         return RetentionResult(deletedCount: deletedCount, failedCount: failedCount)
     }
 
+    func scanLibraryIntegrity() -> LibraryIntegrityReport {
+        let directory = recordingsDirectory()
+        let allFiles = Self.recordingFileURLs(in: directory)
+        let encryptedFiles = allFiles.filter {
+            $0.pathExtension.lowercased() == "glitcho"
+                && $0.lastPathComponent != RecordingEncryptionManager.manifestFilename
+        }
+        let encryptedHashFilenames = Set(encryptedFiles.map(\.lastPathComponent))
+
+        let manifest = recordingEncryptionManager.loadManifestIfAvailableWithoutInteraction(from: directory)
+            ?? (try? recordingEncryptionManager.loadManifestSerialized(from: directory))
+            ?? [:]
+        let manifestHashFilenames = Set(manifest.keys)
+
+        let orphanedManifestEntries = manifestHashFilenames
+            .subtracting(encryptedHashFilenames)
+            .sorted()
+        let missingThumbnailEntries = encryptedHashFilenames
+            .filter { hashFilename in
+                let thumbURL = RecordingEncryptionManager.thumbnailURL(for: hashFilename)
+                guard FileManager.default.isReadableFile(atPath: thumbURL.path) else {
+                    return true
+                }
+                let attrs = try? FileManager.default.attributesOfItem(atPath: thumbURL.path)
+                let size = (attrs?[.size] as? Int64) ?? 0
+                return size <= 0
+            }
+            .sorted()
+
+        let orphanedThumbnailEntries: [String] = {
+            let thumbnailsDir = RecordingEncryptionManager.thumbnailCacheDirectory
+            guard let files = try? FileManager.default.contentsOfDirectory(
+                at: thumbnailsDir,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            ) else { return [] }
+            return files
+                .filter { $0.pathExtension.lowercased() == "thumb" }
+                .map { $0.deletingPathExtension().lastPathComponent }
+                .filter { hashFilename in
+                    !encryptedHashFilenames.contains(hashFilename)
+                }
+                .sorted()
+        }()
+
+        let unreadableFiles = allFiles.filter { url in
+            guard url.lastPathComponent != RecordingEncryptionManager.manifestFilename else {
+                return false
+            }
+            let path = url.path
+            guard FileManager.default.isReadableFile(atPath: path) else { return true }
+            let attrs = try? FileManager.default.attributesOfItem(atPath: path)
+            let size = (attrs?[.size] as? Int64) ?? 0
+            return size <= 0
+        }
+        .sorted { $0.lastPathComponent.localizedCaseInsensitiveCompare($1.lastPathComponent) == .orderedAscending }
+
+        return LibraryIntegrityReport(
+            scannedAt: Date(),
+            manifestEntryCount: manifest.count,
+            encryptedFileCount: encryptedFiles.count,
+            orphanedManifestEntries: orphanedManifestEntries,
+            missingThumbnailEntries: missingThumbnailEntries,
+            orphanedThumbnailEntries: orphanedThumbnailEntries,
+            unreadableFiles: unreadableFiles
+        )
+    }
+
+    func repairLibraryIntegrity(_ baseline: LibraryIntegrityReport? = nil) -> LibraryIntegrityRepairResult {
+        let report = baseline ?? scanLibraryIntegrity()
+        let directory = recordingsDirectory()
+
+        var removedManifestEntries = 0
+        var regeneratedThumbnails = 0
+        var removedOrphanedThumbnails = 0
+
+        do {
+            var manifest = try recordingEncryptionManager.loadManifestSerialized(from: directory)
+            for hashFilename in report.orphanedManifestEntries {
+                if manifest.removeValue(forKey: hashFilename) != nil {
+                    removedManifestEntries += 1
+                }
+            }
+            if removedManifestEntries > 0 {
+                try recordingEncryptionManager.saveManifestSerialized(manifest, to: directory)
+            }
+        } catch {
+            // Keep repair best-effort; unresolved issues remain in the returned report.
+        }
+
+        for hashFilename in report.missingThumbnailEntries {
+            do {
+                try recordingEncryptionManager.regenerateThumbnailSidecar(
+                    for: hashFilename,
+                    in: directory
+                )
+                regeneratedThumbnails += 1
+            } catch {
+                continue
+            }
+        }
+
+        for hashFilename in report.orphanedThumbnailEntries {
+            let thumbURL = RecordingEncryptionManager.thumbnailURL(for: hashFilename)
+            guard FileManager.default.fileExists(atPath: thumbURL.path) else { continue }
+            do {
+                try FileManager.default.removeItem(at: thumbURL)
+                removedOrphanedThumbnails += 1
+            } catch {
+                continue
+            }
+        }
+
+        let result = LibraryIntegrityRepairResult(
+            reportBefore: report,
+            removedManifestEntries: removedManifestEntries,
+            regeneratedThumbnails: regeneratedThumbnails,
+            removedOrphanedThumbnails: removedOrphanedThumbnails,
+            unresolvedUnreadableFiles: report.unreadableFiles
+        )
+
+        if result.changed {
+            NotificationCenter.default.post(name: .recordingLibraryDidChange, object: nil)
+        }
+        return result
+    }
+
+    func duplicateRecordingGroups(in entries: [RecordingEntry]? = nil) -> [DuplicateRecordingGroup] {
+        let sourceEntries = entries ?? listRecordings()
+        var buckets: [String: [RecordingEntry]] = [:]
+
+        for entry in sourceEntries {
+            let channel = entry.channelName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !channel.isEmpty else { continue }
+            guard let capturedAt = entry.recordedAt ?? entry.fileTimestamp else { continue }
+            let size = fileSizeBytes(for: entry.url)
+            guard size > 0 else { continue }
+            let timestamp = Int(capturedAt.timeIntervalSince1970)
+            let key = "\(channel)|\(timestamp)|\(size)"
+            buckets[key, default: []].append(entry)
+        }
+
+        let groups = buckets.compactMap { key, values -> DuplicateRecordingGroup? in
+            guard values.count > 1 else { return nil }
+            let sorted = values.sorted { lhs, rhs in
+                let leftDate = lhs.recordedAt ?? lhs.fileTimestamp ?? Date.distantPast
+                let rightDate = rhs.recordedAt ?? rhs.fileTimestamp ?? Date.distantPast
+                if leftDate != rightDate { return leftDate > rightDate }
+                return fileSizeBytes(for: lhs.url) > fileSizeBytes(for: rhs.url)
+            }
+            let wasted = sorted.dropFirst().reduce(Int64(0)) { partial, entry in
+                partial + fileSizeBytes(for: entry.url)
+            }
+            return DuplicateRecordingGroup(key: key, items: sorted, wastedBytes: wasted)
+        }
+
+        return groups.sorted { lhs, rhs in lhs.wastedBytes > rhs.wastedBytes }
+    }
+
+    func cleanupDuplicateRecordings(in entries: [RecordingEntry]? = nil) -> DuplicateCleanupResult {
+        let groups = duplicateRecordingGroups(in: entries)
+        guard !groups.isEmpty else {
+            return DuplicateCleanupResult(removedCount: 0, failedMessages: [])
+        }
+
+        var removedCount = 0
+        var failedMessages: [String] = []
+        for group in groups {
+            for duplicate in group.items.dropFirst() {
+                do {
+                    try deleteRecording(at: duplicate.url)
+                    removedCount += 1
+                } catch {
+                    failedMessages.append("\(duplicate.url.lastPathComponent): \(error.localizedDescription)")
+                }
+            }
+        }
+        return DuplicateCleanupResult(removedCount: removedCount, failedMessages: failedMessages)
+    }
+
+    private func fileSizeBytes(for url: URL) -> Int64 {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+        return (attrs?[.size] as? Int64) ?? 0
+    }
+
     private func syncPublishedRecordingState() {
         let sessions = recordingSessions.values.sorted { lhs, rhs in
             lhs.startedAt > rhs.startedAt
@@ -1494,12 +1942,180 @@ final class RecordingManager: ObservableObject {
             }
     }
 
+    private func loadPersistedDownloadTasks() -> [DownloadTask] {
+        guard let data = UserDefaults.standard.data(forKey: downloadTasksDefaultsKey),
+              let decoded = try? JSONDecoder().decode([DownloadTask].self, from: data) else {
+            return []
+        }
+        var unique: [String: DownloadTask] = [:]
+        for task in decoded {
+            if let existing = unique[task.id] {
+                unique[task.id] = (task.updatedAt > existing.updatedAt) ? task : existing
+            } else {
+                unique[task.id] = task
+            }
+        }
+        return unique.values.sorted { lhs, rhs in lhs.updatedAt > rhs.updatedAt }
+    }
+
+    private func persistDownloadTasks() {
+        if downloadTasks.isEmpty {
+            UserDefaults.standard.removeObject(forKey: downloadTasksDefaultsKey)
+            return
+        }
+        if let data = try? JSONEncoder().encode(downloadTasks) {
+            UserDefaults.standard.set(data, forKey: downloadTasksDefaultsKey)
+        }
+    }
+
+    private func normalizeDownloadTasksAfterLaunch() {
+        guard !downloadTasks.isEmpty else { return }
+        let now = Date()
+        for index in downloadTasks.indices {
+            if downloadTasks[index].state == .running || downloadTasks[index].state == .queued {
+                downloadTasks[index].state = .paused
+                downloadTasks[index].updatedAt = now
+                let existing = downloadTasks[index].statusMessage?.trimmingCharacters(in: .whitespacesAndNewlines)
+                if existing?.isEmpty ?? true {
+                    downloadTasks[index].statusMessage = "Paused after app relaunch."
+                } else {
+                    downloadTasks[index].statusMessage = "\(existing ?? "") (paused after relaunch)"
+                }
+            }
+        }
+        downloadTasks.sort { lhs, rhs in lhs.updatedAt > rhs.updatedAt }
+        persistDownloadTasks()
+    }
+
+    private func downloadAutoRetryEnabled() -> Bool {
+        if UserDefaults.standard.object(forKey: downloadAutoRetryEnabledKey) == nil {
+            return true
+        }
+        return UserDefaults.standard.bool(forKey: downloadAutoRetryEnabledKey)
+    }
+
+    private func downloadAutoRetryLimit() -> Int {
+        if UserDefaults.standard.object(forKey: downloadAutoRetryLimitKey) == nil {
+            return 2
+        }
+        return min(max(UserDefaults.standard.integer(forKey: downloadAutoRetryLimitKey), 0), 8)
+    }
+
+    private func downloadAutoRetryDelaySeconds() -> TimeInterval {
+        if UserDefaults.standard.object(forKey: downloadAutoRetryDelayKey) == nil {
+            return 15
+        }
+        let raw = UserDefaults.standard.integer(forKey: downloadAutoRetryDelayKey)
+        return TimeInterval(min(max(raw, 3), 300))
+    }
+
+    private func cancelScheduledDownloadRetry(for id: String) {
+        if let task = scheduledDownloadRetryTasks.removeValue(forKey: id) {
+            task.cancel()
+        }
+    }
+
+    private func scheduleAutomaticDownloadRetryIfNeeded(id: String) {
+        guard downloadAutoRetryEnabled(),
+              let index = downloadTasks.firstIndex(where: { $0.id == id }) else {
+            return
+        }
+
+        var task = downloadTasks[index]
+        guard task.state == .failed else { return }
+
+        let limit = downloadAutoRetryLimit()
+        guard task.retryCount < limit else { return }
+
+        cancelScheduledDownloadRetry(for: id)
+
+        task.retryCount += 1
+        let delay = downloadAutoRetryDelaySeconds()
+        task.state = .queued
+        let lastError = task.lastErrorMessage ?? "Unknown failure"
+        task.statusMessage = "Auto-retry \(task.retryCount)/\(limit) in \(Int(delay))s: \(lastError)"
+        task.updatedAt = Date()
+        downloadTasks[index] = task
+        persistDownloadTasks()
+
+        let retryTask = Task { [weak self] in
+            let nanos = UInt64(max(1, delay) * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: nanos)
+            guard !Task.isCancelled else { return }
+            guard let self else { return }
+            self.scheduledDownloadRetryTasks.removeValue(forKey: id)
+            guard let refreshed = self.downloadTasks.first(where: { $0.id == id }),
+                  refreshed.state == .queued,
+                  self.recordingSessions[id] == nil else {
+                return
+            }
+            let didStart = self.startRecording(
+                target: refreshed.target,
+                channelName: refreshed.channelName,
+                quality: refreshed.quality
+            )
+            if !didStart {
+                self.updateDownloadTaskFinalState(
+                    id: id,
+                    state: .failed,
+                    statusMessage: self.errorMessage ?? "Unable to resume download.",
+                    outputURL: refreshed.outputURL
+                )
+            }
+        }
+        scheduledDownloadRetryTasks[id] = retryTask
+    }
+
+    private func recordingOutputDirectory(
+        rootDirectory: URL,
+        displayName: String?,
+        login: String?,
+        captureType: RecordingCaptureType,
+        startedAt: Date
+    ) -> URL {
+        _ = displayName
+        _ = login
+        _ = captureType
+        _ = startedAt
+        return rootDirectory
+    }
+
+#if DEBUG
+    func _replaceDownloadTasksForTesting(_ tasks: [DownloadTask]) {
+        downloadTasks = tasks
+        persistDownloadTasks()
+    }
+
+    func _downloadTasksSnapshotForTesting() -> [DownloadTask] {
+        downloadTasks
+    }
+
+    func _triggerAutoRetryForTesting(id: String) {
+        scheduleAutomaticDownloadRetryIfNeeded(id: id)
+    }
+
+    func _cancelAutoRetryForTesting(id: String) {
+        cancelScheduledDownloadRetry(for: id)
+    }
+#endif
+
     /// Ensures the given recording file is playable by AVPlayer.
     ///
     /// Streamlink writes MPEG transport stream data to disk by default. Even if the filename
     /// ends with `.mp4`, the file may actually be `.ts` data and will fail to play in AVPlayer.
     /// This method detects that case and remuxes the file in-place using ffmpeg.
-    func prepareRecordingForPlayback(at url: URL) async throws -> (url: URL, didRemux: Bool) {
+    ///
+    /// When `allowTransportStreamFallback` is true and ffmpeg is unavailable, Glitcho creates
+    /// a temporary `.ts` copy for playback so the recording can still be opened.
+    func prepareRecordingForPlayback(
+        at url: URL,
+        allowTransportStreamFallback: Bool = true
+    ) async throws -> (url: URL, didRemux: Bool) {
+        let startedAt = Date()
+        func elapsedMs() -> String {
+            String(Int(Date().timeIntervalSince(startedAt) * 1000))
+        }
+
         guard url.isFileURL else { return (url, false) }
         let pathExt = url.pathExtension.lowercased()
         if pathExt == "glitcho" {
@@ -1511,12 +2127,155 @@ final class RecordingManager: ObservableObject {
                 in: directory,
                 to: tempURL
             )
-            return (tempURL, false)
+            guard isTransportStreamFile(at: tempURL) else {
+                GlitchoTelemetry.track(
+                    "recording_playback_prepare_completed",
+                    metadata: [
+                        "source_ext": pathExt,
+                        "operation": "decrypt_temp",
+                        "did_remux": "false",
+                        "elapsed_ms": elapsedMs()
+                    ]
+                )
+                return (tempURL, false)
+            }
+
+            guard let ffmpegPath = resolveFFmpegPath() else {
+                if allowTransportStreamFallback {
+                    let transportTempURL = recordingEncryptionManager.tempTransportPlaybackURL()
+                    do {
+                        try await copyTransportStreamForPlaybackToTemp(sourceURL: tempURL, tempURL: transportTempURL)
+                        try? FileManager.default.removeItem(at: tempURL)
+                        GlitchoTelemetry.track(
+                            "recording_playback_prepare_completed",
+                            metadata: [
+                                "source_ext": pathExt,
+                                "operation": "decrypt_transport_passthrough_temp",
+                                "did_remux": "false",
+                                "elapsed_ms": elapsedMs()
+                            ]
+                        )
+                        return (transportTempURL, false)
+                    } catch {
+                        GlitchoTelemetry.track(
+                            "recording_playback_prepare_failed",
+                            metadata: [
+                                "source_ext": pathExt,
+                                "operation": "decrypt_transport_passthrough_temp",
+                                "error": error.localizedDescription,
+                                "elapsed_ms": elapsedMs()
+                            ]
+                        )
+                    }
+                }
+
+                GlitchoTelemetry.track(
+                    "recording_playback_prepare_failed",
+                    metadata: [
+                        "source_ext": pathExt,
+                        "operation": "decrypt_remux",
+                        "error": "ffmpeg_not_found",
+                        "elapsed_ms": elapsedMs()
+                    ]
+                )
+                throw NSError(
+                    domain: "RecordingError",
+                    code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "FFmpeg was not found. Set it in Settings → Recording, or install ffmpeg (e.g. via Homebrew)."]
+                )
+            }
+
+            let remuxTempURL = uniqueTemporaryMP4URL(for: tempURL)
+            do {
+                let didRemux = try await _remuxIfNeeded(url: tempURL, ffmpegPath: ffmpegPath, tempURL: remuxTempURL)
+                GlitchoTelemetry.track(
+                    "recording_playback_prepare_completed",
+                    metadata: [
+                        "source_ext": pathExt,
+                        "operation": didRemux ? "decrypt_remux" : "decrypt_temp",
+                        "did_remux": didRemux ? "true" : "false",
+                        "elapsed_ms": elapsedMs()
+                    ]
+                )
+                return (tempURL, didRemux)
+            } catch {
+                GlitchoTelemetry.track(
+                    "recording_playback_prepare_failed",
+                    metadata: [
+                        "source_ext": pathExt,
+                        "operation": "decrypt_remux",
+                        "error": error.localizedDescription,
+                        "elapsed_ms": elapsedMs()
+                    ]
+                )
+                throw error
+            }
         }
-        guard pathExt == "mp4" else { return (url, false) }
+        guard pathExt == "mp4" else {
+            GlitchoTelemetry.track(
+                "recording_playback_prepare_completed",
+                metadata: [
+                    "source_ext": pathExt.isEmpty ? "none" : pathExt,
+                    "operation": "passthrough",
+                    "did_remux": "false",
+                    "elapsed_ms": elapsedMs()
+                ]
+            )
+            return (url, false)
+        }
+
+        // No remux needed for already-playable MP4 files.
+        guard isTransportStreamFile(at: url) else {
+            GlitchoTelemetry.track(
+                "recording_playback_prepare_completed",
+                metadata: [
+                    "source_ext": pathExt,
+                    "operation": "passthrough",
+                    "did_remux": "false",
+                    "elapsed_ms": elapsedMs()
+                ]
+            )
+            return (url, false)
+        }
 
         // Resolve main-actor-bound state up front (fast, no disk I/O).
         guard let ffmpegPath = resolveFFmpegPath() else {
+            if allowTransportStreamFallback {
+                let tempURL = recordingEncryptionManager.tempTransportPlaybackURL()
+                do {
+                    try await copyTransportStreamForPlaybackToTemp(sourceURL: url, tempURL: tempURL)
+                    GlitchoTelemetry.track(
+                        "recording_playback_prepare_completed",
+                        metadata: [
+                            "source_ext": pathExt,
+                            "operation": "transport_passthrough_temp",
+                            "did_remux": "false",
+                            "elapsed_ms": elapsedMs()
+                        ]
+                    )
+                    return (tempURL, false)
+                } catch {
+                    GlitchoTelemetry.track(
+                        "recording_playback_prepare_failed",
+                        metadata: [
+                            "source_ext": pathExt,
+                            "operation": "transport_passthrough_temp",
+                            "error": error.localizedDescription,
+                            "elapsed_ms": elapsedMs()
+                        ]
+                    )
+                }
+            }
+
+            GlitchoTelemetry.track(
+                "recording_playback_prepare_failed",
+                metadata: [
+                    "source_ext": pathExt,
+                    "operation": "remux",
+                    "error": "ffmpeg_not_found",
+                    "elapsed_ms": elapsedMs()
+                ]
+            )
             throw NSError(
                 domain: "RecordingError",
                 code: 2,
@@ -1528,7 +2287,31 @@ final class RecordingManager: ObservableObject {
         // Awaiting a nonisolated async function from @MainActor suspends the main actor and
         // runs the callee on the cooperative thread pool — no Task.detached needed and no
         // self-capture that could trigger an unexpected hop back to main actor.
-        let didRemux = try await _remuxIfNeeded(url: url, ffmpegPath: ffmpegPath, tempURL: tempURL)
+        let didRemux: Bool
+        do {
+            didRemux = try await _remuxIfNeeded(url: url, ffmpegPath: ffmpegPath, tempURL: tempURL)
+        } catch {
+            GlitchoTelemetry.track(
+                "recording_playback_prepare_failed",
+                metadata: [
+                    "source_ext": pathExt,
+                    "operation": "remux",
+                    "error": error.localizedDescription,
+                    "elapsed_ms": elapsedMs()
+                ]
+            )
+            throw error
+        }
+
+        GlitchoTelemetry.track(
+            "recording_playback_prepare_completed",
+            metadata: [
+                "source_ext": pathExt,
+                "operation": didRemux ? "remux" : "passthrough",
+                "did_remux": didRemux ? "true" : "false",
+                "elapsed_ms": elapsedMs()
+            ]
+        )
         return (url, didRemux)
     }
 
@@ -1555,6 +2338,22 @@ final class RecordingManager: ObservableObject {
         } catch {
             try? FileManager.default.removeItem(at: tempURL)
             throw error
+        }
+    }
+
+    nonisolated private func copyTransportStreamForPlaybackToTemp(sourceURL: URL, tempURL: URL) async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async {
+                do {
+                    if FileManager.default.fileExists(atPath: tempURL.path) {
+                        try FileManager.default.removeItem(at: tempURL)
+                    }
+                    try FileManager.default.copyItem(at: sourceURL, to: tempURL)
+                    continuation.resume(returning: ())
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
         }
     }
 

@@ -22,6 +22,49 @@ private struct RestartAgentStatus {
     let isSuccess: Bool
 }
 
+private enum SettingsChrome {
+    static let canvasBackground = Color(red: 0.05, green: 0.05, blue: 0.07)
+    static let panelBackground = Color(red: 0.07, green: 0.07, blue: 0.09)
+    static let cardFill = Color.white.opacity(0.05)
+    static let cardBorder = Color.white.opacity(0.08)
+    static let cardFillStrong = Color.white.opacity(0.08)
+    static let divider = Color.white.opacity(0.06)
+    static let controlFill = Color.white.opacity(0.08)
+    static let controlBorder = Color.white.opacity(0.09)
+    static let textPrimary = Color.white.opacity(0.9)
+    static let textSecondary = Color.white.opacity(0.74)
+    static let textMuted = Color.white.opacity(0.58)
+    static let textSubtle = Color.white.opacity(0.45)
+}
+
+private struct SettingsSurfaceModifier: ViewModifier {
+    var fill: Color = SettingsChrome.cardFill
+    var stroke: Color = SettingsChrome.cardBorder
+    var cornerRadius: CGFloat = 10
+
+    func body(content: Content) -> some View {
+        content
+            .background(
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .fill(fill)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .stroke(stroke, lineWidth: 1)
+            )
+    }
+}
+
+private extension View {
+    func settingsSurface(
+        fill: Color = SettingsChrome.cardFill,
+        stroke: Color = SettingsChrome.cardBorder,
+        cornerRadius: CGFloat = 10
+    ) -> some View {
+        modifier(SettingsSurfaceModifier(fill: fill, stroke: stroke, cornerRadius: cornerRadius))
+    }
+}
+
 struct SettingsDetailView: View {
     @AppStorage("liveAlertsEnabled") private var liveAlertsEnabled = true
     @AppStorage("liveAlertsPinnedOnly") private var liveAlertsPinnedOnly = false
@@ -48,12 +91,10 @@ struct SettingsDetailView: View {
     @AppStorage("video.imageOptimize.lighting") private var imageOptimizeLighting = ImageOptimizationConfiguration.productionDefault.lighting
     @AppStorage("video.imageOptimize.denoiser") private var imageOptimizeDenoiser = ImageOptimizationConfiguration.productionDefault.denoiser
     @AppStorage("video.imageOptimize.neuralClarity") private var imageOptimizeNeuralClarity = ImageOptimizationConfiguration.productionDefault.neuralClarity
-    @AppStorage("recentChannels.v1") private var recentChannelsData: Data = Data()
     @AppStorage(BiometricLockSettings.enabledStorageKey) private var biometricLockEnabled = false
     @AppStorage(BiometricLockSettings.hideRecordingsStorageKey) private var biometricLockHideRecordings = true
     @AppStorage(BiometricLockSettings.recordingsRequireAuthOnOpenStorageKey) private var biometricLockRecordingsRequireAuthOnOpen = BiometricLockSettings.defaultRecordingsRequireAuthOnOpen
     @AppStorage(BiometricLockSettings.hidePinnedStorageKey) private var biometricLockHidePinned = true
-    @AppStorage(BiometricLockSettings.hideRecentStorageKey) private var biometricLockHideRecent = true
     @AppStorage(BiometricLockSettings.hidePrivacySettingsUntilAuthenticatedStorageKey) private var biometricLockHidePrivacySettingsUntilAuthenticated = BiometricLockSettings.defaultHidePrivacySettingsUntilAuthenticated
     @AppStorage(BiometricLockSettings.protectedStreamersStorageKey) private var protectedStreamersJSON = "[]"
     @AppStorage(BiometricLockSettings.authenticateOnSettingsOpenStorageKey) private var biometricLockAuthenticateOnSettingsOpen = false
@@ -117,6 +158,10 @@ struct SettingsDetailView: View {
         return isBiometricUnlocked
     }
 
+    private var themeAccent: Color {
+        sidebarTintBinding.wrappedValue
+    }
+
     private var protectedStreamerLogins: Set<String> {
         guard let data = protectedStreamersJSON.data(using: .utf8),
               let decoded = try? JSONDecoder().decode([String].self, from: data) else {
@@ -145,7 +190,7 @@ struct SettingsDetailView: View {
                 HStack {
                     Text("Settings")
                         .font(.system(size: 22, weight: .bold))
-                        .foregroundStyle(.white)
+                        .foregroundStyle(SettingsChrome.textPrimary)
                     Spacer()
                 }
                 .padding(.horizontal, 24)
@@ -305,15 +350,6 @@ struct SettingsDetailView: View {
                             title: "Pinned",
                             detail: "Hide the pinned channels section in the sidebar.",
                             isOn: $biometricLockHidePinned,
-                            accentColor: sidebarTintBinding.wrappedValue
-                        )
-                        .disabled(!biometricLockEnabled)
-                        .opacity(biometricLockEnabled ? 1 : 0.5)
-
-                        SettingsToggleRow(
-                            title: "Recent",
-                            detail: "Hide the recent channels section in the sidebar.",
-                            isOn: $biometricLockHideRecent,
                             accentColor: sidebarTintBinding.wrappedValue
                         )
                         .disabled(!biometricLockEnabled)
@@ -1097,40 +1133,18 @@ struct SettingsDetailView: View {
                         }
                     }
 
-                    // MARK: - Data
-                    CollapsibleSettingsCard(
-                        id: "data",
-                        icon: "clock.arrow.circlepath",
-                        iconColor: .white,
-                        iconBackgroundColor: sidebarTintBinding.wrappedValue,
-                        title: "Data",
-                        subtitle: "History and storage",
-                        isExpanded: expandedSections.contains("data"),
-                        onToggle: { toggleSection("data") }
-                    ) {
-                        HStack {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("Recently Watched")
-                                    .font(.system(size: 13, weight: .medium))
-                                    .foregroundStyle(.white)
-                                Text("Channels you've visited recently appear in the sidebar")
-                                    .font(.system(size: 11))
-                                    .foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                            Button("Clear History") {
-                                recentChannelsData = Data()
-                            }
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
-                        }
-                    }
                 }
                 .padding(.horizontal, 24)
                 .padding(.bottom, 24)
             }
         }
-        .background(Color(red: 0.05, green: 0.05, blue: 0.07))
+        .background(
+            LinearGradient(
+                colors: [SettingsChrome.canvasBackground, SettingsChrome.panelBackground],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        )
         .onAppear {
             loadSelectedChannelsIfNeeded()
             loadBlockedChannelsIfNeeded()
@@ -1570,16 +1584,16 @@ struct SettingsDetailView: View {
         HStack(spacing: 10) {
             Image(systemName: icon)
                 .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(.white.opacity(0.5))
+                .foregroundStyle(SettingsChrome.textMuted)
                 .frame(width: 16)
 
             VStack(alignment: .leading, spacing: 1) {
                 Text(title)
                     .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.9))
+                    .foregroundStyle(SettingsChrome.textPrimary)
                 Text(detail)
                     .font(.system(size: 10))
-                    .foregroundStyle(.white.opacity(0.45))
+                    .foregroundStyle(SettingsChrome.textSubtle)
             }
         }
     }
@@ -1588,10 +1602,10 @@ struct SettingsDetailView: View {
         VStack(alignment: .leading, spacing: 2) {
             Text(title)
                 .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(.white.opacity(0.9))
+                .foregroundStyle(SettingsChrome.textPrimary)
             Text(value)
                 .font(.system(size: 10))
-                .foregroundStyle(.white.opacity(0.5))
+                .foregroundStyle(SettingsChrome.textMuted)
                 .lineLimit(2)
         }
     }
@@ -1629,7 +1643,6 @@ struct SettingsView: View {
     @AppStorage(BiometricLockSettings.hideRecordingsStorageKey) private var biometricLockHideRecordings = true
     @AppStorage(BiometricLockSettings.recordingsRequireAuthOnOpenStorageKey) private var biometricLockRecordingsRequireAuthOnOpen = BiometricLockSettings.defaultRecordingsRequireAuthOnOpen
     @AppStorage(BiometricLockSettings.hidePinnedStorageKey) private var biometricLockHidePinned = true
-    @AppStorage(BiometricLockSettings.hideRecentStorageKey) private var biometricLockHideRecent = true
     @AppStorage(BiometricLockSettings.hidePrivacySettingsUntilAuthenticatedStorageKey) private var biometricLockHidePrivacySettingsUntilAuthenticated = BiometricLockSettings.defaultHidePrivacySettingsUntilAuthenticated
     @AppStorage(BiometricLockSettings.authenticateOnSettingsOpenStorageKey) private var biometricLockAuthenticateOnSettingsOpen = false
     @AppStorage(BiometricLockSettings.hotkeyKeyStorageKey) private var biometricLockHotkeyKey = BiometricLockSettings.defaultHotkeyKey
@@ -1671,7 +1684,6 @@ struct SettingsView: View {
             biometricLockHideRecordings: $biometricLockHideRecordings,
             biometricLockRecordingsRequireAuthOnOpen: $biometricLockRecordingsRequireAuthOnOpen,
             biometricLockHidePinned: $biometricLockHidePinned,
-            biometricLockHideRecent: $biometricLockHideRecent,
             biometricLockHidePrivacySettingsUntilAuthenticated: $biometricLockHidePrivacySettingsUntilAuthenticated,
             biometricLockAuthenticateOnSettingsOpen: $biometricLockAuthenticateOnSettingsOpen,
             biometricLockHotkeyKey: $biometricLockHotkeyKey,
@@ -1836,7 +1848,6 @@ struct SettingsViewContent: View {
     @Binding var biometricLockHideRecordings: Bool
     @Binding var biometricLockRecordingsRequireAuthOnOpen: Bool
     @Binding var biometricLockHidePinned: Bool
-    @Binding var biometricLockHideRecent: Bool
     @Binding var biometricLockHidePrivacySettingsUntilAuthenticated: Bool
     @Binding var biometricLockAuthenticateOnSettingsOpen: Bool
     @Binding var biometricLockHotkeyKey: String
@@ -1860,6 +1871,10 @@ struct SettingsViewContent: View {
         return isBiometricUnlocked
     }
 
+    private var themeAccent: Color {
+        sidebarTintBinding.wrappedValue
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             header
@@ -1868,7 +1883,7 @@ struct SettingsViewContent: View {
                 VStack(spacing: 14) {
                     SettingsCard(
                         icon: "paintpalette.fill",
-                        iconColor: Color(red: 0.53, green: 0.42, blue: 0.95),
+                        iconColor: themeAccent,
                         title: "Appearance",
                         subtitle: "Customize the sidebar tint"
                     ) {
@@ -1879,10 +1894,10 @@ struct SettingsViewContent: View {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text("Sidebar tint")
                                     .font(.system(size: 12, weight: .medium))
-                                    .foregroundStyle(.white)
+                                    .foregroundStyle(SettingsChrome.textPrimary)
                                 Text(sidebarTintHex.uppercased())
                                     .font(.system(size: 10, weight: .medium))
-                                    .foregroundStyle(.white.opacity(0.5))
+                                    .foregroundStyle(SettingsChrome.textMuted)
                             }
 
                             Spacer()
@@ -1900,7 +1915,7 @@ struct SettingsViewContent: View {
                     // Notifications Card
                     SettingsCard(
                         icon: "bell.badge.fill",
-                        iconColor: .purple,
+                        iconColor: themeAccent,
                         title: "Notifications",
                         subtitle: "Control how Glitcho alerts you"
                     ) {
@@ -1942,7 +1957,7 @@ struct SettingsViewContent: View {
                     // System Permissions Card
                     SettingsCard(
                         icon: "lock.shield.fill",
-                        iconColor: .blue,
+                        iconColor: themeAccent,
                         title: "System Permissions",
                         subtitle: "Allow notifications in macOS"
                     ) {
@@ -1974,7 +1989,7 @@ struct SettingsViewContent: View {
                     // Twitch Account Card
                     SettingsCard(
                         icon: "person.crop.circle.fill",
-                        iconColor: Color(red: 0.57, green: 0.27, blue: 1.0),
+                        iconColor: themeAccent,
                         title: "Twitch Account",
                         subtitle: "Manage your Twitch settings"
                     ) {
@@ -1982,10 +1997,10 @@ struct SettingsViewContent: View {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text("Account Settings")
                                     .font(.system(size: 12, weight: .medium))
-                                    .foregroundStyle(.white)
+                                    .foregroundStyle(SettingsChrome.textPrimary)
                                 Text("Privacy, security, and preferences")
                                     .font(.system(size: 10))
-                                    .foregroundStyle(.white.opacity(0.5))
+                                    .foregroundStyle(SettingsChrome.textMuted)
                             }
 
                             Spacer()
@@ -2002,7 +2017,7 @@ struct SettingsViewContent: View {
                     if shouldShowPrivacySettingsSection {
                         SettingsCard(
                             icon: "lock.fill",
-                            iconColor: .blue,
+                            iconColor: themeAccent,
                             title: "Privacy Lock",
                             subtitle: "Hide selected sections until authenticated"
                         ) {
@@ -2036,14 +2051,6 @@ struct SettingsViewContent: View {
                         .disabled(!biometricLockEnabled)
                         .opacity(biometricLockEnabled ? 1 : 0.5)
 
-                        SettingsToggleRow(
-                            title: "Recent",
-                            detail: "Hide the recent channels section in the sidebar.",
-                            isOn: $biometricLockHideRecent
-                        )
-                        .disabled(!biometricLockEnabled)
-                        .opacity(biometricLockEnabled ? 1 : 0.5)
-
                         ProtectedStreamersEditor(
                             isEnabled: biometricLockEnabled,
                             recordingManager: recordingManager
@@ -2069,19 +2076,17 @@ struct SettingsViewContent: View {
                             TextField("Hotkey key", text: $biometricLockHotkeyKey)
                                 .textFieldStyle(.plain)
                                 .font(.system(size: 11, weight: .medium))
-                                .foregroundStyle(.white)
+                                .foregroundStyle(SettingsChrome.textPrimary)
                                 .padding(.horizontal, 8)
                                 .padding(.vertical, 6)
-                                .background(Color.white.opacity(0.08))
-                                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                                .settingsSurface(fill: SettingsChrome.controlFill, stroke: SettingsChrome.controlBorder, cornerRadius: 6)
 
                             Text(biometricLockHotkeyDisplay)
                                 .font(.system(size: 11, weight: .semibold))
-                                .foregroundStyle(.white.opacity(0.8))
+                                .foregroundStyle(SettingsChrome.textSecondary)
                                 .padding(.horizontal, 10)
                                 .padding(.vertical, 6)
-                                .background(Color.white.opacity(0.08))
-                                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                                .settingsSurface(fill: SettingsChrome.controlFill, stroke: SettingsChrome.controlBorder, cornerRadius: 6)
                         }
                         .disabled(!biometricLockEnabled)
                         .opacity(biometricLockEnabled ? 1 : 0.5)
@@ -2097,7 +2102,7 @@ struct SettingsViewContent: View {
                                 .toggleStyle(.checkbox)
                         }
                         .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.8))
+                        .foregroundStyle(SettingsChrome.textSecondary)
                         .disabled(!biometricLockEnabled)
                         .opacity(biometricLockEnabled ? 1 : 0.5)
                         }
@@ -2131,7 +2136,7 @@ struct SettingsViewContent: View {
                                         .scaleEffect(0.7)
                                     Text(recordingManager.installStatus ?? "Installing Streamlink…")
                                         .font(.system(size: 10))
-                                        .foregroundStyle(.white.opacity(0.7))
+                                        .foregroundStyle(SettingsChrome.textSecondary)
                                     Spacer()
                                 }
                             }
@@ -2154,7 +2159,7 @@ struct SettingsViewContent: View {
                                 let isSuccess = lower.contains("installed") || lower.contains("available")
                                 Text(status)
                                     .font(.system(size: 10, weight: .medium))
-                                    .foregroundStyle(isSuccess ? Color.green.opacity(0.8) : Color.white.opacity(0.6))
+                                    .foregroundStyle(isSuccess ? Color.green.opacity(0.82) : SettingsChrome.textMuted)
                                     .lineLimit(2)
                             }
 
@@ -2186,7 +2191,7 @@ struct SettingsViewContent: View {
                                         .scaleEffect(0.7)
                                     Text(recordingManager.ffmpegInstallStatus ?? "Installing FFmpeg…")
                                         .font(.system(size: 10))
-                                        .foregroundStyle(.white.opacity(0.7))
+                                        .foregroundStyle(SettingsChrome.textSecondary)
                                     Spacer()
                                 }
                             }
@@ -2209,7 +2214,7 @@ struct SettingsViewContent: View {
                                 let isSuccess = lower.contains("installed") || lower.contains("available")
                                 Text(status)
                                     .font(.system(size: 10, weight: .medium))
-                                    .foregroundStyle(isSuccess ? Color.green.opacity(0.8) : Color.white.opacity(0.6))
+                                    .foregroundStyle(isSuccess ? Color.green.opacity(0.82) : SettingsChrome.textMuted)
                                     .lineLimit(2)
                             }
 
@@ -2267,12 +2272,23 @@ struct SettingsViewContent: View {
             }
         }
         .frame(width: 480, height: 520)
-        .background(VisualEffectView(material: .hudWindow, blendingMode: .behindWindow))
+        .background(
+            ZStack {
+                LinearGradient(
+                    colors: [Color.white.opacity(0.06), Color.clear],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+                VisualEffectView(material: .hudWindow, blendingMode: .behindWindow)
+                    .opacity(0.9)
+            }
+        )
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(Color.white.opacity(0.1), lineWidth: 1)
+                .stroke(SettingsChrome.cardBorder, lineWidth: 1)
         )
+        .shadow(color: Color.black.opacity(0.35), radius: 22, x: 0, y: 10)
     }
 
     private var header: some View {
@@ -2282,7 +2298,7 @@ struct SettingsViewContent: View {
                 Button(action: onClose) {
                     Image(systemName: "xmark.circle.fill")
                         .font(.system(size: 14))
-                        .foregroundStyle(.white.opacity(0.4))
+                        .foregroundStyle(SettingsChrome.textSubtle)
                 }
                 .buttonStyle(.plain)
                 .padding(12)
@@ -2291,11 +2307,11 @@ struct SettingsViewContent: View {
             VStack(spacing: 4) {
                 Image(systemName: "slider.horizontal.3")
                     .font(.system(size: 24, weight: .medium))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(SettingsChrome.textPrimary)
 
                 Text("Settings")
                     .font(.system(size: 16, weight: .semibold))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(SettingsChrome.textPrimary)
             }
             .padding(.top, 20)
             .padding(.bottom, 12)
@@ -2325,16 +2341,16 @@ struct SettingsViewContent: View {
         HStack(spacing: 10) {
             Image(systemName: icon)
                 .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(.white.opacity(0.5))
+                .foregroundStyle(SettingsChrome.textMuted)
                 .frame(width: 16)
 
             VStack(alignment: .leading, spacing: 1) {
                 Text(title)
                     .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.9))
+                    .foregroundStyle(SettingsChrome.textPrimary)
                 Text(detail)
                     .font(.system(size: 10))
-                    .foregroundStyle(.white.opacity(0.45))
+                    .foregroundStyle(SettingsChrome.textSubtle)
             }
         }
     }
@@ -2343,10 +2359,10 @@ struct SettingsViewContent: View {
         VStack(alignment: .leading, spacing: 2) {
             Text(title)
                 .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(.white.opacity(0.9))
+                .foregroundStyle(SettingsChrome.textPrimary)
             Text(value)
                 .font(.system(size: 10))
-                .foregroundStyle(.white.opacity(0.5))
+                .foregroundStyle(SettingsChrome.textMuted)
                 .lineLimit(2)
         }
     }
@@ -2382,27 +2398,22 @@ struct SettingsCard<Content: View>: View {
                 VStack(alignment: .leading, spacing: 1) {
                     Text(title)
                         .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(.white)
+                        .foregroundStyle(SettingsChrome.textPrimary)
                     Text(subtitle)
                         .font(.system(size: 10))
-                        .foregroundStyle(.white.opacity(0.5))
+                        .foregroundStyle(SettingsChrome.textMuted)
                 }
 
                 Spacer()
             }
 
             Divider()
-                .overlay(Color.white.opacity(0.06))
+                .overlay(SettingsChrome.divider)
 
             content
         }
         .padding(12)
-        .background(Color.white.opacity(0.04))
-        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(Color.white.opacity(0.06), lineWidth: 1)
-        )
+        .settingsSurface()
     }
 }
 
@@ -2445,17 +2456,17 @@ struct CollapsibleSettingsCard<Content: View>: View {
                     VStack(alignment: .leading, spacing: 1) {
                         Text(title)
                             .font(.system(size: 13, weight: .semibold))
-                            .foregroundStyle(.white)
+                            .foregroundStyle(SettingsChrome.textPrimary)
                         Text(subtitle)
                             .font(.system(size: 10))
-                            .foregroundStyle(.white.opacity(0.5))
+                            .foregroundStyle(SettingsChrome.textMuted)
                     }
 
                     Spacer()
                     
                     Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
                         .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(.white.opacity(0.4))
+                        .foregroundStyle(SettingsChrome.textSubtle)
                 }
                 .padding(12)
             }
@@ -2464,7 +2475,7 @@ struct CollapsibleSettingsCard<Content: View>: View {
             if isExpanded {
                 VStack(alignment: .leading, spacing: 12) {
                     Divider()
-                        .overlay(Color.white.opacity(0.06))
+                        .overlay(SettingsChrome.divider)
                         .padding(.horizontal, 12)
 
                     content
@@ -2473,12 +2484,7 @@ struct CollapsibleSettingsCard<Content: View>: View {
                 }
             }
         }
-        .background(Color.white.opacity(0.04))
-        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(Color.white.opacity(0.06), lineWidth: 1)
-        )
+        .settingsSurface()
     }
 }
 
@@ -2501,7 +2507,7 @@ struct SettingsButton: View {
                 Text(title)
                     .font(.system(size: 11, weight: .semibold))
             }
-            .foregroundStyle(.white)
+            .foregroundStyle(SettingsChrome.textPrimary)
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
             .background(background)
@@ -2514,9 +2520,9 @@ struct SettingsButton: View {
     private var background: some View {
         switch style {
         case .primary:
-            Color.white.opacity(0.15)
+            SettingsChrome.cardFillStrong
         case .secondary:
-            Color.white.opacity(0.1)
+            SettingsChrome.controlFill
         }
     }
 }
@@ -2532,10 +2538,10 @@ struct SettingsToggleRow: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
                     .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(SettingsChrome.textPrimary)
                 Text(detail)
                     .font(.system(size: 10))
-                    .foregroundStyle(.white.opacity(0.5))
+                    .foregroundStyle(SettingsChrome.textMuted)
             }
 
             Spacer()
@@ -2560,19 +2566,20 @@ private struct SettingsTextFieldRow: View {
         VStack(alignment: .leading, spacing: 6) {
             Text(title)
                 .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(.white)
+                .foregroundStyle(SettingsChrome.textPrimary)
             Text(detail)
                 .font(.system(size: 10))
-                .foregroundStyle(.white.opacity(0.5))
+                .foregroundStyle(SettingsChrome.textMuted)
             TextField(placeholder, text: $text)
                 .textFieldStyle(.plain)
                 .font(.system(size: 11))
+                .foregroundStyle(SettingsChrome.textPrimary)
                 .padding(8)
-                .background(Color.white.opacity(0.06))
+                .background(SettingsChrome.controlFill)
                 .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
                 .overlay(
                     RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                        .stroke(SettingsChrome.controlBorder, lineWidth: 1)
                 )
         }
         .padding(.vertical, 4)
@@ -2596,23 +2603,27 @@ private struct ProtectedStreamersEditor: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("PROTECTED STREAMERS")
                 .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.45))
+                .foregroundStyle(SettingsChrome.textSubtle)
                 .textCase(.uppercase)
                 .tracking(0.5)
 
             Text("These channels are hidden in Recent history and Recordings until authentication succeeds.")
                 .font(.system(size: 10))
-                .foregroundStyle(.white.opacity(0.6))
+                .foregroundStyle(SettingsChrome.textMuted)
 
             HStack(spacing: 8) {
                 TextField("Streamer login or Twitch URL", text: $input)
                     .textFieldStyle(.plain)
                     .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(SettingsChrome.textPrimary)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 6)
-                    .background(Color.white.opacity(0.08))
+                    .background(SettingsChrome.controlFill)
                     .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .stroke(SettingsChrome.controlBorder, lineWidth: 1)
+                    )
                     .onSubmit { addStreamer() }
 
                 SettingsButton(
@@ -2646,14 +2657,14 @@ private struct ProtectedStreamersEditor: View {
             if protectedStreamers.isEmpty {
                 Text("No protected streamers.")
                     .font(.system(size: 10))
-                    .foregroundStyle(.white.opacity(0.6))
+                    .foregroundStyle(SettingsChrome.textMuted)
             } else {
                 VStack(spacing: 4) {
                     ForEach(protectedStreamers.sorted(), id: \.self) { login in
                         HStack {
                             Text(login)
                                 .font(.system(size: 11, weight: .medium))
-                                .foregroundStyle(.white.opacity(0.9))
+                                .foregroundStyle(SettingsChrome.textPrimary)
                             Spacer()
                             Button {
                                 protectedStreamers.remove(login)
@@ -2661,14 +2672,13 @@ private struct ProtectedStreamersEditor: View {
                             } label: {
                                 Image(systemName: "xmark.circle.fill")
                                     .font(.system(size: 11))
-                                    .foregroundStyle(.white.opacity(0.45))
+                                    .foregroundStyle(SettingsChrome.textSubtle)
                             }
                             .buttonStyle(.plain)
                         }
                         .padding(.horizontal, 8)
                         .padding(.vertical, 4)
-                        .background(Color.white.opacity(0.04))
-                        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                        .settingsSurface(fill: Color.white.opacity(0.04), cornerRadius: 6)
                     }
                 }
             }
