@@ -72,6 +72,7 @@ struct SettingsDetailView: View {
     @AppStorage("recordingsDirectory") private var recordingsDirectory = ""
     @AppStorage("streamlinkPath") private var streamlinkPath = ""
     @AppStorage("ffmpegPath") private var ffmpegPath = ""
+    @AppStorage("iCloudSyncPaths") private var iCloudSyncPaths = false
     @AppStorage("autoRecordOnLive") private var autoRecordOnLive = false
     @AppStorage("autoRecordPinnedOnly") private var autoRecordPinnedOnly = false
     @AppStorage("autoRecordMode") private var autoRecordModeRaw = AutoRecordMode.pinnedAndFollowed.rawValue
@@ -131,6 +132,7 @@ struct SettingsDetailView: View {
     @State private var isRunningBackgroundAction = false
     @State private var backgroundActionStatus: String?
     var isBiometricUnlocked = true
+    var onUnlockRequest: (() -> Void)?
     var onOpenTwitchSettings: (() -> Void)?
     var onActionFeedback: ((String, String) -> Void)?
 
@@ -418,6 +420,42 @@ struct SettingsDetailView: View {
                         .disabled(!biometricLockEnabled)
                         .opacity(biometricLockEnabled ? 1 : 0.5)
                         }
+                    } else {
+                        HStack(spacing: 12) {
+                            ZStack {
+                                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                    .fill(sidebarTintBinding.wrappedValue.opacity(0.25))
+                                    .frame(width: 32, height: 32)
+                                Image(systemName: "lock.fill")
+                                    .font(.system(size: 14, weight: .semibold))
+                                    .foregroundStyle(sidebarTintBinding.wrappedValue)
+                            }
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Privacy Lock")
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .foregroundStyle(SettingsChrome.textPrimary)
+                                Text("Authenticate to access privacy settings")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(SettingsChrome.textMuted)
+                            }
+                            Spacer()
+                            Button(action: { onUnlockRequest?() }) {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "faceid")
+                                        .font(.system(size: 12, weight: .medium))
+                                    Text("Unlock")
+                                        .font(.system(size: 12, weight: .medium))
+                                }
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 6)
+                                .background(sidebarTintBinding.wrappedValue)
+                                .clipShape(Capsule())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        .padding(12)
+                        .settingsSurface()
                     }
 
                     // MARK: - Recording
@@ -550,6 +588,16 @@ struct SettingsDetailView: View {
                                     .foregroundStyle(Color.orange.opacity(0.85))
                                     .lineLimit(2)
                             }
+
+                            Divider()
+                                .padding(.vertical, 4)
+
+                            SettingsToggleRow(
+                                title: "Sync tool paths via iCloud",
+                                detail: "Include Streamlink, FFmpeg, and recordings folder paths in iCloud sync. Turn off if paths differ between machines.",
+                                isOn: $iCloudSyncPaths,
+                                accentColor: sidebarTintBinding.wrappedValue
+                            )
 
                             Divider()
                                 .padding(.vertical, 4)
@@ -1856,6 +1904,7 @@ struct SettingsViewContent: View {
     @Binding var biometricLockHotkeyOption: Bool
     @Binding var biometricLockHotkeyControl: Bool
     let isBiometricUnlocked: Bool
+    var onUnlockRequest: (() -> Void)?
     let selectRecordingsFolder: () -> Void
     let selectStreamlinkBinary: () -> Void
     let selectFFmpegBinary: () -> Void
@@ -2106,6 +2155,42 @@ struct SettingsViewContent: View {
                         .disabled(!biometricLockEnabled)
                         .opacity(biometricLockEnabled ? 1 : 0.5)
                         }
+                    } else {
+                        HStack(spacing: 12) {
+                            ZStack {
+                                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                    .fill(themeAccent.opacity(0.25))
+                                    .frame(width: 32, height: 32)
+                                Image(systemName: "lock.fill")
+                                    .font(.system(size: 14, weight: .semibold))
+                                    .foregroundStyle(themeAccent)
+                            }
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Privacy Lock")
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .foregroundStyle(SettingsChrome.textPrimary)
+                                Text("Authenticate to access privacy settings")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(SettingsChrome.textMuted)
+                            }
+                            Spacer()
+                            Button(action: { onUnlockRequest?() }) {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "faceid")
+                                        .font(.system(size: 12, weight: .medium))
+                                    Text("Unlock")
+                                        .font(.system(size: 12, weight: .medium))
+                                }
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 6)
+                                .background(themeAccent)
+                                .clipShape(Capsule())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        .padding(12)
+                        .settingsSurface()
                     }
 
                     if showRecordingSettings {

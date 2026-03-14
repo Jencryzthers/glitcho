@@ -541,6 +541,9 @@ struct ContentView: View {
                     backgroundAgentManager: backgroundAgentManager,
                     store: store,
                     isBiometricUnlocked: !biometricLockEnabled || recordingsUnlockManager.isUnlocked,
+                    onUnlockRequest: {
+                        recordingsUnlockManager.requestAuthentication()
+                    },
                     onOpenTwitchSettings: {
                         detailMode = .web
                         store.navigate(to: URL(string: "https://www.twitch.tv/settings")!)
@@ -663,6 +666,10 @@ struct ContentView: View {
         let pin = PinnedChannel(login: normalized, displayName: displayName, thumbnailURL: thumbnailURL, notifyEnabled: true)
         updated.insert(pin, at: 0)
         pinnedChannels = updated
+
+        if biometricLockAutoProtectAllowlisted {
+            addProtectedStreamers([normalized])
+        }
         return true
     }
 

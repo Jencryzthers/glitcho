@@ -6,6 +6,7 @@ import UserNotifications
 struct TwitchGlassApp: App {
     @StateObject private var updateChecker = UpdateChecker()
     @StateObject private var notificationManager = NotificationManager()
+    private let settingsSyncManager = SettingsSyncManager()
 
     var body: some Scene {
         WindowGroup {
@@ -15,6 +16,7 @@ struct TwitchGlassApp: App {
                 .environment(\.notificationManager, notificationManager)
                 .onAppear {
                     UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+                    settingsSyncManager.start()
                 }
         }
         .windowStyle(.hiddenTitleBar)
