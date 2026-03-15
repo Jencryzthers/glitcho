@@ -691,6 +691,15 @@ struct SettingsDetailView: View {
                                                 .foregroundStyle(.white.opacity(0.5))
                                         }
                                         Spacer()
+                                        if !protectedStreamerLogins.isEmpty {
+                                            Button("Import Protected") {
+                                                autoRecordSelectedChannels.formUnion(protectedStreamerLogins)
+                                                saveSelectedChannels()
+                                            }
+                                            .font(.system(size: 10, weight: .medium))
+                                            .foregroundStyle(.white.opacity(0.7))
+                                            .buttonStyle(.plain)
+                                        }
                                         Button(action: { showChannelSelector.toggle() }) {
                                             Image(systemName: showChannelSelector ? "chevron.up" : "chevron.down")
                                                 .font(.system(size: 11, weight: .medium))
@@ -746,16 +755,6 @@ struct SettingsDetailView: View {
                                                 .font(.system(size: 10, weight: .medium))
                                                 .foregroundStyle(.white.opacity(0.7))
                                                 .buttonStyle(.plain)
-
-                                                if !protectedStreamerLogins.isEmpty {
-                                                    Button("Import Protected") {
-                                                        autoRecordSelectedChannels.formUnion(protectedStreamerLogins)
-                                                        saveSelectedChannels()
-                                                    }
-                                                    .font(.system(size: 10, weight: .medium))
-                                                    .foregroundStyle(.white.opacity(0.7))
-                                                    .buttonStyle(.plain)
-                                                }
 
                                                 Spacer()
                                             }
