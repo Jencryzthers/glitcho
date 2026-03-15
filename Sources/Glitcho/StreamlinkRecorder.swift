@@ -44,13 +44,15 @@ final class StreamlinkRecorder: ObservableObject {
         let filename = "\(safeChannel)_\(timestamp).mp4"
         let outputURL = recordingsDirectory.appendingPathComponent(filename)
 
+        let quality = UserDefaults.standard.string(forKey: "streamQuality") ?? "best"
+
         let process = Process()
         let errorPipe = Pipe()
         let outputPipe = Pipe()
         process.executableURL = streamlinkURL
         process.arguments = [
             "twitch.tv/\(channel)",
-            "best",
+            quality,
             "--output",
             outputURL.path
         ]

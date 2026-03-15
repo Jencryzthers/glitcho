@@ -17,7 +17,7 @@ final class SettingsSyncManager {
         "recordingConcurrencyLimit", "recordingsRetentionMaxAgeDays",
         "recordingsRetentionKeepLastGlobal", "recordingsRetentionKeepLastPerChannel",
         "motionSmoothening120Enabled", "motionSmoothening.showFPSOverlay",
-        "video.show4KOverlay", "video.upscaler4kEnabled", "video.imageOptimizeEnabled",
+        "video.show4KOverlay", "video.upscaler4kEnabled", "video.imageOptimizeEnabled", "video.imageOptimizeAuto",
         "video.aspectCropMode", "video.imageOptimize.contrast", "video.imageOptimize.lighting",
         "video.imageOptimize.denoiser", "video.imageOptimize.neuralClarity",
         "biometricLock.enabled", "biometricLock.hideRecordings",
@@ -27,7 +27,7 @@ final class SettingsSyncManager {
         "biometricLock.authenticateOnSettingsOpen",
         "biometricLock.hotkey.key", "biometricLock.hotkey.command",
         "biometricLock.hotkey.shift", "biometricLock.hotkey.option", "biometricLock.hotkey.control",
-        "pinnedChannels", "glitcho.chatPreferencesByChannel",
+        "pinnedChannels", "glitcho.chatPreferencesByChannel", "globalChatVisible",
         "player.volume", "player.muted",
         "hybridPlayerHeightRatio", "hybridDetailsCollapsed",
         "motionSmoothening.autoPreset", "motionSmoothening.preset",
@@ -49,6 +49,38 @@ final class SettingsSyncManager {
     private static let pathKeys: Set<String> = [
         "recordingsDirectory", "streamlinkPath", "ffmpegPath"
     ]
+
+    // MARK: - Export / Import
+
+    /// Exports all synced keys (and path keys) from UserDefaults as a JSON-serialisable dictionary.
+    /// Keys whose current value cannot be represented in JSON are silently omitted.
+    static func exportAllSettings() -> [String: Any] {
+        let defaults = UserDefaults.standard
+        let allKeys = syncedKeys.union(pathKeys)
+        var dict: [String: Any] = [:]
+        for key in allKeys {
+            guard let value = defaults.object(forKey: key) else { continue }
+            if JSONSerialization.isValidJSONObject([key: value]) {
+                dict[key] = value
+            }
+        }
+        return dict
+    }
+
+    /// Writes every key/value pair from the supplied dictionary into UserDefaults,
+    /// ignoring keys that are not in the known synced or path key sets.
+    /// Returns `true` when at least one key was applied.
+    @discardableResult
+    static func importAllSettings(_ dict: [String: Any]) -> Bool {
+        let defaults = UserDefaults.standard
+        let allowedKeys = syncedKeys.union(pathKeys)
+        var applied = false
+        for (key, value) in dict where allowedKeys.contains(key) {
+            defaults.set(value, forKey: key)
+            applied = true
+        }
+        return applied
+    }
 
     // MARK: - Public
 

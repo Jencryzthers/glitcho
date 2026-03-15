@@ -1337,6 +1337,7 @@ struct HybridTwitchView: View {
     @State private var showError = false
     @State private var isStreamOffline = false
     @State private var playbackInlineError: String?
+    @AppStorage("globalChatVisible") private var globalChatVisible = true
     @State private var showChat = true
     @State private var isChatDetached = false
     @State private var detachedChannelName: String?
@@ -1358,6 +1359,7 @@ struct HybridTwitchView: View {
     @AppStorage("video.aspectCropMode") private var videoAspectModeRaw = VideoAspectCropMode.source.rawValue
     @AppStorage("video.upscaler4kEnabled") private var videoUpscaler4KEnabled = false
     @AppStorage("video.imageOptimizeEnabled") private var videoImageOptimizeEnabled = false
+    @AppStorage("video.imageOptimizeAuto") private var videoImageOptimizeAuto = true
     @AppStorage("video.imageOptimize.contrast") private var imageOptimizeContrast = ImageOptimizationConfiguration.productionDefault.contrast
     @AppStorage("video.imageOptimize.lighting") private var imageOptimizeLighting = ImageOptimizationConfiguration.productionDefault.lighting
     @AppStorage("video.imageOptimize.denoiser") private var imageOptimizeDenoiser = ImageOptimizationConfiguration.productionDefault.denoiser
@@ -1462,7 +1464,10 @@ struct HybridTwitchView: View {
     }
 
     private var imageOptimizationConfiguration: ImageOptimizationConfiguration {
-        ImageOptimizationConfiguration(
+        if videoImageOptimizeAuto {
+            return .productionDefault
+        }
+        return ImageOptimizationConfiguration(
             contrast: imageOptimizeContrast,
             lighting: imageOptimizeLighting,
             denoiser: imageOptimizeDenoiser,
@@ -2476,11 +2481,12 @@ struct HybridTwitchView: View {
         withAnimation(.easeOut(duration: 0.2)) {
             showChat.toggle()
         }
+        globalChatVisible = showChat
         setChatPreference(showChat ? .inline : .hidden, for: channel)
     }
 
     private func applyChatPreference(for channel: String) {
-        let mode = chatPreference(for: channel) ?? .inline
+        let mode = chatPreference(for: channel) ?? (globalChatVisible ? .inline : .hidden)
         switch mode {
         case .inline:
             if isChatDetached {

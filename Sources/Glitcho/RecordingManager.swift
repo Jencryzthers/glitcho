@@ -892,6 +892,18 @@ final class RecordingManager: ObservableObject {
                                 "user_initiated": didUserStop ? "true" : "false"
                             ]
                         )
+                        let displayLabel = session.channelName ?? login
+                        let elapsed = Date().timeIntervalSince(session.startedAt)
+                        let h = Int(elapsed) / 3600
+                        let m = (Int(elapsed) % 3600) / 60
+                        let s = Int(elapsed) % 60
+                        let durationString = h > 0
+                            ? String(format: "%d:%02d:%02d", h, m, s)
+                            : String(format: "%d:%02d", m, s)
+                        self.sendRecordingNotificationIfEnabled(
+                            title: "Recording complete",
+                            body: "@\(displayLabel) (\(durationString))"
+                        )
                     } else {
                         self.recorderOrchestrator.setError(for: login, errorMessage: failureMessage)
                         _ = self.recorderOrchestrator.scheduleRetry(for: login, errorMessage: failureMessage)
@@ -902,6 +914,12 @@ final class RecordingManager: ObservableObject {
                                 "status": "\(proc.terminationStatus)",
                                 "error": failureMessage ?? "unknown"
                             ]
+                        )
+                        let displayLabel = session.channelName ?? login
+                        let reason = failureMessage ?? "Recording stopped unexpectedly."
+                        self.sendRecordingNotificationIfEnabled(
+                            title: "Recording failed",
+                            body: "@\(displayLabel) — \(reason)"
                         )
                     }
                 }
@@ -1005,6 +1023,11 @@ final class RecordingManager: ObservableObject {
                     "recording_started",
                     metadata: ["login": resolvedChannelLogin, "quality": quality]
                 )
+                let displayLabel = displayName ?? resolvedChannelLogin
+                sendRecordingNotificationIfEnabled(
+                    title: "Recording started",
+                    body: "@\(displayLabel)"
+                )
             }
             return true
         } catch {
@@ -1030,6 +1053,13 @@ final class RecordingManager: ObservableObject {
                     "error": error.localizedDescription
                 ]
             )
+            if let login = resolvedChannelLogin {
+                let displayLabel = displayName ?? login
+                sendRecordingNotificationIfEnabled(
+                    title: "Recording failed",
+                    body: "@\(displayLabel) — \(message)"
+                )
+            }
             return false
         }
     }
@@ -1436,6 +1466,11 @@ final class RecordingManager: ObservableObject {
             return
         }
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
+    private func sendRecordingNotificationIfEnabled(title: String, body: String) {
+        guard UserDefaults.standard.object(forKey: "recordingNotificationsEnabled") as? Bool ?? true else { return }
+        sendNotification(title: title, body: body)
     }
 
     func sendNotification(title: String, body: String) {

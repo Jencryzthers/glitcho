@@ -7,15 +7,18 @@ struct PinnedChannel: Identifiable, Codable, Hashable {
     var thumbnailURLString: String?
     var pinnedAt: Date
     var notifyEnabled: Bool
+    /// The category folder this channel belongs to. `nil` means uncategorized (shown under "PINNED").
+    var category: String?
 
     var id: String { login }
 
-    init(login: String, displayName: String, thumbnailURL: URL?, pinnedAt: Date = Date(), notifyEnabled: Bool = true) {
+    init(login: String, displayName: String, thumbnailURL: URL?, pinnedAt: Date = Date(), notifyEnabled: Bool = true, category: String? = nil) {
         self.login = login
         self.displayName = displayName
         self.thumbnailURLString = thumbnailURL?.absoluteString
         self.pinnedAt = pinnedAt
         self.notifyEnabled = notifyEnabled
+        self.category = category
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -24,6 +27,7 @@ struct PinnedChannel: Identifiable, Codable, Hashable {
         case thumbnailURLString
         case pinnedAt
         case notifyEnabled
+        case category
     }
 
     init(from decoder: Decoder) throws {
@@ -33,6 +37,7 @@ struct PinnedChannel: Identifiable, Codable, Hashable {
         thumbnailURLString = try container.decodeIfPresent(String.self, forKey: .thumbnailURLString)
         pinnedAt = try container.decodeIfPresent(Date.self, forKey: .pinnedAt) ?? Date()
         notifyEnabled = try container.decodeIfPresent(Bool.self, forKey: .notifyEnabled) ?? true
+        category = try container.decodeIfPresent(String.self, forKey: .category)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -42,6 +47,7 @@ struct PinnedChannel: Identifiable, Codable, Hashable {
         try container.encodeIfPresent(thumbnailURLString, forKey: .thumbnailURLString)
         try container.encode(pinnedAt, forKey: .pinnedAt)
         try container.encode(notifyEnabled, forKey: .notifyEnabled)
+        try container.encodeIfPresent(category, forKey: .category)
     }
 
     var url: URL {

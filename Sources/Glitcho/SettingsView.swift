@@ -72,12 +72,19 @@ struct SettingsDetailView: View {
     @AppStorage("recordingsDirectory") private var recordingsDirectory = ""
     @AppStorage("streamlinkPath") private var streamlinkPath = ""
     @AppStorage("ffmpegPath") private var ffmpegPath = ""
+    @AppStorage("streamQuality") private var streamQuality = "best"
     @AppStorage("iCloudSyncPaths") private var iCloudSyncPaths = false
     @AppStorage("autoRecordOnLive") private var autoRecordOnLive = false
     @AppStorage("autoRecordPinnedOnly") private var autoRecordPinnedOnly = false
+    @AppStorage("recordingNotificationsEnabled") private var recordingNotificationsEnabled = true
     @AppStorage("autoRecordMode") private var autoRecordModeRaw = AutoRecordMode.pinnedAndFollowed.rawValue
     @AppStorage("autoRecordDebounceSeconds") private var autoRecordDebounceSeconds = 1
     @AppStorage("autoRecordCooldownSeconds") private var autoRecordCooldownSeconds = 30
+    @AppStorage("autoRecordScheduleEnabled") private var autoRecordScheduleEnabled = false
+    @AppStorage("autoRecordScheduleStartHour") private var autoRecordScheduleStartHour = 20
+    @AppStorage("autoRecordScheduleStartMinute") private var autoRecordScheduleStartMinute = 0
+    @AppStorage("autoRecordScheduleEndHour") private var autoRecordScheduleEndHour = 2
+    @AppStorage("autoRecordScheduleEndMinute") private var autoRecordScheduleEndMinute = 0
     @AppStorage("recordingConcurrencyLimit") private var recordingConcurrencyLimit = 2
     @AppStorage("recordingsRetentionMaxAgeDays") private var recordingsRetentionMaxAgeDays = 0
     @AppStorage("recordingsRetentionKeepLastGlobal") private var recordingsRetentionKeepLastGlobal = 0
@@ -87,6 +94,7 @@ struct SettingsDetailView: View {
     @AppStorage("video.show4KOverlay") private var show4KOverlay = true
     @AppStorage("video.upscaler4kEnabled") private var videoUpscaler4KEnabled = false
     @AppStorage("video.imageOptimizeEnabled") private var videoImageOptimizeEnabled = false
+    @AppStorage("video.imageOptimizeAuto") private var videoImageOptimizeAuto = true
     @AppStorage("video.aspectCropMode") private var videoAspectModeRaw = VideoAspectCropMode.source.rawValue
     @AppStorage("video.imageOptimize.contrast") private var imageOptimizeContrast = ImageOptimizationConfiguration.productionDefault.contrast
     @AppStorage("video.imageOptimize.lighting") private var imageOptimizeLighting = ImageOptimizationConfiguration.productionDefault.lighting
@@ -131,6 +139,8 @@ struct SettingsDetailView: View {
     @State private var retentionRunStatus: String?
     @State private var isRunningBackgroundAction = false
     @State private var backgroundActionStatus: String?
+    @State private var settingsTransferBanner: String?
+    @State private var settingsTransferBannerTask: Task<Void, Never>?
     var isBiometricUnlocked = true
     var onUnlockRequest: (() -> Void)?
     var onOpenTwitchSettings: (() -> Void)?
@@ -592,10 +602,40 @@ struct SettingsDetailView: View {
                             Divider()
                                 .padding(.vertical, 4)
 
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("Stream quality")
+                                    .font(.system(size: 11, weight: .medium))
+                                    .foregroundStyle(SettingsChrome.textPrimary)
+                                Text("Quality passed to Streamlink when starting a recording.")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(SettingsChrome.textMuted)
+                                Picker("Stream quality", selection: $streamQuality) {
+                                    Text("Best").tag("best")
+                                    Text("1080p60").tag("1080p60")
+                                    Text("1080p").tag("1080p")
+                                    Text("720p60").tag("720p60")
+                                    Text("720p").tag("720p")
+                                    Text("480p").tag("480p")
+                                    Text("Audio only").tag("audio_only")
+                                }
+                                .pickerStyle(.menu)
+                                .tint(.white)
+                            }
+
+                            Divider()
+                                .padding(.vertical, 4)
+
                             SettingsToggleRow(
                                 title: "Sync tool paths via iCloud",
                                 detail: "Include Streamlink, FFmpeg, and recordings folder paths in iCloud sync. Turn off if paths differ between machines.",
                                 isOn: $iCloudSyncPaths,
+                                accentColor: sidebarTintBinding.wrappedValue
+                            )
+
+                            SettingsToggleRow(
+                                title: "Recording notifications",
+                                detail: "Show a notification when a recording starts, completes, or fails.",
+                                isOn: $recordingNotificationsEnabled,
                                 accentColor: sidebarTintBinding.wrappedValue
                             )
 
@@ -706,6 +746,16 @@ struct SettingsDetailView: View {
                                                 .font(.system(size: 10, weight: .medium))
                                                 .foregroundStyle(.white.opacity(0.7))
                                                 .buttonStyle(.plain)
+
+                                                if !protectedStreamerLogins.isEmpty {
+                                                    Button("Import Protected") {
+                                                        autoRecordSelectedChannels.formUnion(protectedStreamerLogins)
+                                                        saveSelectedChannels()
+                                                    }
+                                                    .font(.system(size: 10, weight: .medium))
+                                                    .foregroundStyle(.white.opacity(0.7))
+                                                    .buttonStyle(.plain)
+                                                }
 
                                                 Spacer()
                                             }
@@ -895,6 +945,80 @@ struct SettingsDetailView: View {
                                             }
                                         }
                                     }
+                                }
+                                .padding(.vertical, 4)
+                            }
+
+                            Divider()
+                                .padding(.vertical, 4)
+
+                            SettingsToggleRow(
+                                title: "Recording schedule",
+                                detail: "Only auto-record within a set time window each day.",
+                                isOn: $autoRecordScheduleEnabled,
+                                accentColor: sidebarTintBinding.wrappedValue
+                            )
+                            .disabled(!autoRecordOnLive)
+                            .opacity(autoRecordOnLive ? 1 : 0.5)
+
+                            if autoRecordScheduleEnabled && autoRecordOnLive {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    HStack(spacing: 12) {
+                                        VStack(alignment: .leading, spacing: 4) {
+                                            Text("Start")
+                                                .font(.system(size: 10, weight: .medium))
+                                                .foregroundStyle(.white.opacity(0.55))
+                                            HStack(spacing: 4) {
+                                                Stepper(value: $autoRecordScheduleStartHour, in: 0...23) {
+                                                    Text(String(format: "%02d", autoRecordScheduleStartHour))
+                                                        .font(.system(size: 11, weight: .medium).monospacedDigit())
+                                                        .foregroundStyle(.white.opacity(0.9))
+                                                        .frame(minWidth: 22, alignment: .trailing)
+                                                }
+                                                Text(":")
+                                                    .font(.system(size: 11, weight: .medium))
+                                                    .foregroundStyle(.white.opacity(0.55))
+                                                Stepper(value: $autoRecordScheduleStartMinute, in: 0...59, step: 5) {
+                                                    Text(String(format: "%02d", autoRecordScheduleStartMinute))
+                                                        .font(.system(size: 11, weight: .medium).monospacedDigit())
+                                                        .foregroundStyle(.white.opacity(0.9))
+                                                        .frame(minWidth: 22, alignment: .trailing)
+                                                }
+                                            }
+                                        }
+
+                                        Spacer()
+
+                                        VStack(alignment: .leading, spacing: 4) {
+                                            Text("End")
+                                                .font(.system(size: 10, weight: .medium))
+                                                .foregroundStyle(.white.opacity(0.55))
+                                            HStack(spacing: 4) {
+                                                Stepper(value: $autoRecordScheduleEndHour, in: 0...23) {
+                                                    Text(String(format: "%02d", autoRecordScheduleEndHour))
+                                                        .font(.system(size: 11, weight: .medium).monospacedDigit())
+                                                        .foregroundStyle(.white.opacity(0.9))
+                                                        .frame(minWidth: 22, alignment: .trailing)
+                                                }
+                                                Text(":")
+                                                    .font(.system(size: 11, weight: .medium))
+                                                    .foregroundStyle(.white.opacity(0.55))
+                                                Stepper(value: $autoRecordScheduleEndMinute, in: 0...59, step: 5) {
+                                                    Text(String(format: "%02d", autoRecordScheduleEndMinute))
+                                                        .font(.system(size: 11, weight: .medium).monospacedDigit())
+                                                        .foregroundStyle(.white.opacity(0.9))
+                                                        .frame(minWidth: 22, alignment: .trailing)
+                                                }
+                                            }
+                                        }
+
+                                        Spacer()
+                                    }
+
+                                    let isOvernight = (autoRecordScheduleStartHour * 60 + autoRecordScheduleStartMinute) > (autoRecordScheduleEndHour * 60 + autoRecordScheduleEndMinute)
+                                    Text(isOvernight ? "Overnight window (crosses midnight)" : "Same-day window")
+                                        .font(.system(size: 10))
+                                        .foregroundStyle(.white.opacity(0.4))
                                 }
                                 .padding(.vertical, 4)
                             }
@@ -1101,61 +1225,69 @@ struct SettingsDetailView: View {
                                 isOn: $videoImageOptimizeEnabled
                             )
 
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text("Image optimize tuning")
-                                    .font(.system(size: 11, weight: .medium))
-                                    .foregroundStyle(.white.opacity(0.9))
+                            SettingsToggleRow(
+                                title: "Auto",
+                                detail: "Automatically detect the best image settings for each stream.",
+                                isOn: $videoImageOptimizeAuto
+                            )
 
-                                VStack(alignment: .leading, spacing: 4) {
-                                    HStack {
-                                        Text("Contrast")
-                                            .font(.system(size: 10, weight: .medium))
-                                            .foregroundStyle(.white.opacity(0.75))
-                                        Spacer()
-                                        Text(String(format: "%.2f", imageOptimizeContrast))
-                                            .font(.system(size: 10, weight: .medium))
-                                            .foregroundStyle(.white.opacity(0.65))
-                                    }
-                                    Slider(value: $imageOptimizeContrast, in: 0.8...1.5, step: 0.01)
-                                }
+                            if !videoImageOptimizeAuto {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Text("Image optimize tuning")
+                                        .font(.system(size: 11, weight: .medium))
+                                        .foregroundStyle(.white.opacity(0.9))
 
-                                VStack(alignment: .leading, spacing: 4) {
-                                    HStack {
-                                        Text("Lighting")
-                                            .font(.system(size: 10, weight: .medium))
-                                            .foregroundStyle(.white.opacity(0.75))
-                                        Spacer()
-                                        Text(String(format: "%.3f", imageOptimizeLighting))
-                                            .font(.system(size: 10, weight: .medium))
-                                            .foregroundStyle(.white.opacity(0.65))
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        HStack {
+                                            Text("Contrast")
+                                                .font(.system(size: 10, weight: .medium))
+                                                .foregroundStyle(.white.opacity(0.75))
+                                            Spacer()
+                                            Text(String(format: "%.2f", imageOptimizeContrast))
+                                                .font(.system(size: 10, weight: .medium))
+                                                .foregroundStyle(.white.opacity(0.65))
+                                        }
+                                        Slider(value: $imageOptimizeContrast, in: 0.8...1.5, step: 0.01)
                                     }
-                                    Slider(value: $imageOptimizeLighting, in: -0.15...0.15, step: 0.005)
-                                }
 
-                                VStack(alignment: .leading, spacing: 4) {
-                                    HStack {
-                                        Text("Denoiser")
-                                            .font(.system(size: 10, weight: .medium))
-                                            .foregroundStyle(.white.opacity(0.75))
-                                        Spacer()
-                                        Text(String(format: "%.2f", imageOptimizeDenoiser))
-                                            .font(.system(size: 10, weight: .medium))
-                                            .foregroundStyle(.white.opacity(0.65))
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        HStack {
+                                            Text("Lighting")
+                                                .font(.system(size: 10, weight: .medium))
+                                                .foregroundStyle(.white.opacity(0.75))
+                                            Spacer()
+                                            Text(String(format: "%.3f", imageOptimizeLighting))
+                                                .font(.system(size: 10, weight: .medium))
+                                                .foregroundStyle(.white.opacity(0.65))
+                                        }
+                                        Slider(value: $imageOptimizeLighting, in: -0.15...0.15, step: 0.005)
                                     }
-                                    Slider(value: $imageOptimizeDenoiser, in: 0...1, step: 0.01)
-                                }
 
-                                VStack(alignment: .leading, spacing: 4) {
-                                    HStack {
-                                        Text("Neural clarity")
-                                            .font(.system(size: 10, weight: .medium))
-                                            .foregroundStyle(.white.opacity(0.75))
-                                        Spacer()
-                                        Text(String(format: "%.2f", imageOptimizeNeuralClarity))
-                                            .font(.system(size: 10, weight: .medium))
-                                            .foregroundStyle(.white.opacity(0.65))
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        HStack {
+                                            Text("Denoiser")
+                                                .font(.system(size: 10, weight: .medium))
+                                                .foregroundStyle(.white.opacity(0.75))
+                                            Spacer()
+                                            Text(String(format: "%.2f", imageOptimizeDenoiser))
+                                                .font(.system(size: 10, weight: .medium))
+                                                .foregroundStyle(.white.opacity(0.65))
+                                        }
+                                        Slider(value: $imageOptimizeDenoiser, in: 0...1, step: 0.01)
                                     }
-                                    Slider(value: $imageOptimizeNeuralClarity, in: 0...1, step: 0.01)
+
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        HStack {
+                                            Text("Neural clarity")
+                                                .font(.system(size: 10, weight: .medium))
+                                                .foregroundStyle(.white.opacity(0.75))
+                                            Spacer()
+                                            Text(String(format: "%.2f", imageOptimizeNeuralClarity))
+                                                .font(.system(size: 10, weight: .medium))
+                                                .foregroundStyle(.white.opacity(0.65))
+                                        }
+                                        Slider(value: $imageOptimizeNeuralClarity, in: 0...1, step: 0.01)
+                                    }
                                 }
                             }
 
@@ -1180,6 +1312,9 @@ struct SettingsDetailView: View {
                             }
                         }
                     }
+
+                    // MARK: - Export / Import
+                    settingsTransferCard
 
                 }
                 .padding(.horizontal, 24)
@@ -1657,6 +1792,111 @@ struct SettingsDetailView: View {
                 .lineLimit(2)
         }
     }
+
+    // MARK: - Settings Transfer
+
+    @ViewBuilder
+    private var settingsTransferCard: some View {
+        CollapsibleSettingsCard(
+            id: "transfer",
+            icon: "arrow.up.arrow.down.circle.fill",
+            iconColor: .white,
+            iconBackgroundColor: sidebarTintBinding.wrappedValue,
+            title: "Backup & Restore",
+            subtitle: "Export or import all settings as a JSON file",
+            isExpanded: expandedSections.contains("transfer"),
+            onToggle: { toggleSection("transfer") }
+        ) {
+            VStack(alignment: .leading, spacing: 10) {
+                if let banner = settingsTransferBanner {
+                    Text(banner)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.85))
+                        .padding(.vertical, 6)
+                        .padding(.horizontal, 10)
+                        .background(.white.opacity(0.08))
+                        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                }
+
+                HStack(spacing: 10) {
+                    SettingsButton(
+                        title: "Export Settings",
+                        systemImage: "square.and.arrow.up",
+                        style: .primary,
+                        action: { exportSettingsToFile() }
+                    )
+
+                    SettingsButton(
+                        title: "Import Settings",
+                        systemImage: "square.and.arrow.down",
+                        style: .secondary,
+                        action: { importSettingsFromFile() }
+                    )
+                }
+
+                Text("Exports all preferences to a .json file you can restore later or share across machines.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.white.opacity(0.5))
+            }
+        }
+    }
+
+    private func exportSettingsToFile() {
+        let dict = SettingsSyncManager.exportAllSettings()
+        guard let data = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted, .sortedKeys]) else {
+            showTransferBanner("Export failed: could not serialise settings.")
+            return
+        }
+
+        let panel = NSSavePanel()
+        panel.title = "Export Glitcho Settings"
+        panel.nameFieldStringValue = "glitcho-settings.json"
+        panel.allowedContentTypes = [.json]
+        panel.canCreateDirectories = true
+
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        do {
+            try data.write(to: url, options: .atomic)
+            showTransferBanner("Settings exported successfully.")
+        } catch {
+            showTransferBanner("Export failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func importSettingsFromFile() {
+        let panel = NSOpenPanel()
+        panel.title = "Import Glitcho Settings"
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.json]
+        panel.prompt = "Import"
+
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        do {
+            let data = try Data(contentsOf: url)
+            guard let dict = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                showTransferBanner("Import failed: unexpected file format.")
+                return
+            }
+            let applied = SettingsSyncManager.importAllSettings(dict)
+            showTransferBanner(applied ? "Settings imported. Restart may be needed for some changes." : "No recognised keys found in file.")
+        } catch {
+            showTransferBanner("Import failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func showTransferBanner(_ message: String) {
+        settingsTransferBannerTask?.cancel()
+        settingsTransferBanner = message
+        let task = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            settingsTransferBanner = nil
+        }
+        settingsTransferBannerTask = task
+    }
 }
 
 struct SettingsModal: View {
@@ -1687,6 +1927,7 @@ struct SettingsView: View {
     @AppStorage("ffmpegPath") private var ffmpegPath = ""
     @AppStorage("autoRecordOnLive") private var autoRecordOnLive = false
     @AppStorage("autoRecordPinnedOnly") private var autoRecordPinnedOnly = false
+    @AppStorage("recordingNotificationsEnabled") private var recordingNotificationsEnabled = true
     @AppStorage(BiometricLockSettings.enabledStorageKey) private var biometricLockEnabled = false
     @AppStorage(BiometricLockSettings.hideRecordingsStorageKey) private var biometricLockHideRecordings = true
     @AppStorage(BiometricLockSettings.recordingsRequireAuthOnOpenStorageKey) private var biometricLockRecordingsRequireAuthOnOpen = BiometricLockSettings.defaultRecordingsRequireAuthOnOpen
@@ -1703,7 +1944,6 @@ struct SettingsView: View {
     @Environment(\.openURL) private var openURL
     @State private var testStatus: NotificationTestStatus?
     @State private var clearTask: Task<Void, Never>?
-
     @ObservedObject var recordingManager: RecordingManager = RecordingManager()
     var onClose: (() -> Void)?
     var onOpenTwitchSettings: (() -> Void)?
@@ -1728,6 +1968,7 @@ struct SettingsView: View {
             ffmpegPath: $ffmpegPath,
             autoRecordOnLive: $autoRecordOnLive,
             autoRecordPinnedOnly: $autoRecordPinnedOnly,
+            recordingNotificationsEnabled: $recordingNotificationsEnabled,
             biometricLockEnabled: $biometricLockEnabled,
             biometricLockHideRecordings: $biometricLockHideRecordings,
             biometricLockRecordingsRequireAuthOnOpen: $biometricLockRecordingsRequireAuthOnOpen,
@@ -1849,6 +2090,7 @@ struct SettingsView: View {
             biometricLockHotkeyKey = sanitized
         }
     }
+
 }
 
 enum NotificationTestStatus {
@@ -1892,6 +2134,7 @@ struct SettingsViewContent: View {
     @Binding var ffmpegPath: String
     @Binding var autoRecordOnLive: Bool
     @Binding var autoRecordPinnedOnly: Bool
+    @Binding var recordingNotificationsEnabled: Bool
     @Binding var biometricLockEnabled: Bool
     @Binding var biometricLockHideRecordings: Bool
     @Binding var biometricLockRecordingsRequireAuthOnOpen: Bool
@@ -2320,6 +2563,12 @@ struct SettingsViewContent: View {
                             subtitle: "Capture live streams with Streamlink"
                         ) {
                             VStack(alignment: .leading, spacing: 10) {
+                            SettingsToggleRow(
+                                title: "Recording notifications",
+                                detail: "Show a notification when a recording starts, completes, or fails.",
+                                isOn: $recordingNotificationsEnabled
+                            )
+
                             SettingsToggleRow(
                                 title: "Auto-record when live",
                                 detail: "Start recording followed channels as soon as they go live.",

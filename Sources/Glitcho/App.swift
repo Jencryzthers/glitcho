@@ -34,6 +34,8 @@ struct TwitchGlassApp: App {
                 }
                 .keyboardShortcut("u", modifiers: [.command, .shift])
             }
+            CommandGroup(replacing: .windowList) { }
+            CommandGroup(replacing: .singleWindowList) { }
         }
 
         Window("About Glitcho", id: "about") {
@@ -62,6 +64,14 @@ struct TwitchGlassApp: App {
         .windowResizability(.contentSize)
         .defaultSize(width: 360, height: 560)
         .defaultPosition(.trailing)
+
+        WindowGroup("Stream", id: "stream", for: StreamWindowContext.self) { context in
+            if let value = context.wrappedValue {
+                DetachedStreamView(channelLogin: value.channelLogin)
+            }
+        }
+        .windowStyle(.hiddenTitleBar)
+        .defaultSize(width: 854, height: 480)
     }
 }
 

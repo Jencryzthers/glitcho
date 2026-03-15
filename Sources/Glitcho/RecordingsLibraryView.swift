@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import AVKit
 import AVFoundation
+import UniformTypeIdentifiers
 
 struct RecordingEntry: Identifiable, Hashable {
     let url: URL
@@ -219,6 +220,7 @@ struct RecordingsLibraryView: View {
     @AppStorage("video.show4KOverlay") private var show4KOverlay = true
     @AppStorage("video.upscaler4kEnabled") private var videoUpscaler4KEnabled = false
     @AppStorage("video.imageOptimizeEnabled") private var videoImageOptimizeEnabled = false
+    @AppStorage("video.imageOptimizeAuto") private var videoImageOptimizeAuto = true
     @AppStorage("video.aspectCropMode") private var videoAspectModeRaw = VideoAspectCropMode.source.rawValue
     @AppStorage("video.imageOptimize.contrast") private var imageOptimizeContrast = ImageOptimizationConfiguration.productionDefault.contrast
     @AppStorage("video.imageOptimize.lighting") private var imageOptimizeLighting = ImageOptimizationConfiguration.productionDefault.lighting
@@ -256,6 +258,12 @@ struct RecordingsLibraryView: View {
     @State private var currentPlayerSeconds: Double = 0
     @State private var clipTotalDuration: Double = 300.0
     @State private var isPlaybackModalPresented = false
+
+    // Mark In / Mark Out clip extraction
+    @State private var markInSeconds: Double? = nil
+    @State private var markOutSeconds: Double? = nil
+    @State private var isExtractingClip = false
+    @State private var clipExtractionError: String? = nil
 
     // Feature 1: Speed controls
     @State private var playbackRate: Float = 1.0
@@ -314,7 +322,10 @@ struct RecordingsLibraryView: View {
     }
 
     private var imageOptimizationConfiguration: ImageOptimizationConfiguration {
-        ImageOptimizationConfiguration(
+        if videoImageOptimizeAuto {
+            return .productionDefault
+        }
+        return ImageOptimizationConfiguration(
             contrast: imageOptimizeContrast,
             lighting: imageOptimizeLighting,
             denoiser: imageOptimizeDenoiser,
@@ -1696,6 +1707,153 @@ struct RecordingsLibraryView: View {
         .help("\(label) speed")
     }
 
+    // MARK: - Mark In / Mark Out
+
+    /// Pill containing "Mark In", "Mark Out", and "Save Clip" buttons.
+    @ViewBuilder
+    private var markInOutControls: some View {
+        HStack(spacing: 2) {
+            // Mark In
+            Button {
+                markInSeconds = currentPlayerSeconds
+                // Auto-clear mark out if it is now before the new in point.
+                if let out = markOutSeconds, out <= currentPlayerSeconds {
+                    markOutSeconds = nil
+                }
+            } label: {
+                Text("In")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(markInSeconds != nil ? Color.accentColor : RecordingsChrome.textSecondary)
+                    .padding(.horizontal, 5)
+                    .frame(height: 22)
+            }
+            .buttonStyle(.plain)
+            .background(
+                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    .fill(markInSeconds != nil ? Color.white.opacity(0.15) : Color.clear)
+            )
+            .help(markInSeconds.map { "Mark In set at \(mmss($0)) — click to update" } ?? "Mark In: set clip start to current position")
+
+            // Mark Out
+            Button {
+                markOutSeconds = currentPlayerSeconds
+                // Auto-clear mark in if it is now after the new out point.
+                if let inPt = markInSeconds, inPt >= currentPlayerSeconds {
+                    markInSeconds = nil
+                }
+            } label: {
+                Text("Out")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(markOutSeconds != nil ? Color.accentColor : RecordingsChrome.textSecondary)
+                    .padding(.horizontal, 5)
+                    .frame(height: 22)
+            }
+            .buttonStyle(.plain)
+            .background(
+                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    .fill(markOutSeconds != nil ? Color.white.opacity(0.15) : Color.clear)
+            )
+            .help(markOutSeconds.map { "Mark Out set at \(mmss($0)) — click to update" } ?? "Mark Out: set clip end to current position")
+
+            // Save Clip — only shown when both marks are set
+            if let inPt = markInSeconds, let outPt = markOutSeconds, outPt > inPt {
+                if isExtractingClip {
+                    ProgressView()
+                        .scaleEffect(0.65)
+                        .frame(width: 32, height: 22)
+                        .help("Exporting clip…")
+                } else {
+                    Button {
+                        saveClipUsingAVExport(from: inPt, to: outPt)
+                    } label: {
+                        Label("Save", systemImage: "arrow.down.circle")
+                            .font(.system(size: 10, weight: .semibold))
+                            .labelStyle(.titleAndIcon)
+                            .foregroundStyle(RecordingsChrome.textPrimary)
+                            .padding(.horizontal, 5)
+                            .frame(height: 22)
+                    }
+                    .buttonStyle(.plain)
+                    .background(
+                        RoundedRectangle(cornerRadius: 5, style: .continuous)
+                            .fill(Color.accentColor.opacity(0.25))
+                    )
+                    .help("Save clip from \(mmss(inPt)) to \(mmss(outPt)) (\(mmss(outPt - inPt)) duration)")
+                }
+            }
+        }
+        .padding(.horizontal, 4)
+        .padding(.vertical, 2)
+        .background(
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .fill(RecordingsChrome.surface)
+        )
+    }
+
+    /// Presents an NSSavePanel then extracts the marked range using AVAssetExportSession.
+    private func saveClipUsingAVExport(from startSecs: Double, to endSecs: Double) {
+        guard let sourceURL = playbackURL else { return }
+
+        let panel = NSSavePanel()
+        panel.canCreateDirectories = true
+        panel.allowedContentTypes = [.mpeg4Movie, .quickTimeMovie]
+        panel.nameFieldStringValue = defaultClipFilename(sourceURL: sourceURL, start: startSecs, end: endSecs)
+        panel.prompt = "Save Clip"
+        panel.message = "Choose where to save the extracted clip."
+
+        guard panel.runModal() == .OK, let outputURL = panel.url else { return }
+
+        // Remove any pre-existing file so AVAssetExportSession does not fail.
+        try? FileManager.default.removeItem(at: outputURL)
+
+        let startTime = CMTime(seconds: startSecs, preferredTimescale: 600)
+        let endTime   = CMTime(seconds: endSecs,   preferredTimescale: 600)
+        let extractor = ClipExtractor()
+
+        isExtractingClip = true
+        clipExtractionError = nil
+
+        Task {
+            defer {
+                Task { @MainActor in
+                    isExtractingClip = false
+                }
+            }
+            do {
+                try await extractor.extractClip(
+                    from: sourceURL,
+                    startTime: startTime,
+                    endTime: endTime,
+                    outputURL: outputURL
+                )
+                await MainActor.run {
+                    exportStatus = "Clip saved to \(outputURL.lastPathComponent)."
+                    // Clear marks after a successful save.
+                    markInSeconds  = nil
+                    markOutSeconds = nil
+                }
+            } catch {
+                await MainActor.run {
+                    clipExtractionError = error.localizedDescription
+                    exportStatus = "Clip export failed: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    private func defaultClipFilename(sourceURL: URL, start: Double, end: Double) -> String {
+        let stem: String
+        if let selected = selectedRecording {
+            let display = recordingManager.displayFilename(for: selected.url)
+            stem = (display as NSString).deletingPathExtension
+        } else {
+            stem = sourceURL.deletingPathExtension().lastPathComponent
+        }
+        let startLabel = mmss(start).replacingOccurrences(of: ":", with: "m") + "s"
+        let endLabel   = mmss(end).replacingOccurrences(of: ":", with: "m") + "s"
+        return "\(stem)_\(startLabel)-\(endLabel).mp4"
+    }
+
     private var recordingPlayerControlsToolbar: some View {
         HStack(spacing: 10) {
             Spacer(minLength: 0)
@@ -1714,6 +1872,10 @@ struct RecordingsLibraryView: View {
                     RoundedRectangle(cornerRadius: 7, style: .continuous)
                         .fill(RecordingsChrome.surface)
                 )
+
+                // Mark In / Mark Out controls
+                markInOutControls
+
                 if pipController.isAvailable {
                     Button(action: { pipController.toggle() }) {
                         Image(systemName: "pip.enter")
@@ -2826,6 +2988,8 @@ struct RecordingsLibraryView: View {
             playbackError = nil
             isPreparingPlayback = false
             playbackDurationSeconds = nil
+            markInSeconds = nil
+            markOutSeconds = nil
         }
 
         if selectedRecording == nil, isPlaybackModalPresented {
@@ -2849,6 +3013,8 @@ struct RecordingsLibraryView: View {
             playbackError = nil
             isPreparingPlayback = false
             playbackDurationSeconds = nil
+            markInSeconds = nil
+            markOutSeconds = nil
         }
 
         if playbackURL == nil, !isPreparingPlayback {

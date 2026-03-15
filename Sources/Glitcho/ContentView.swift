@@ -27,6 +27,7 @@ struct ContentView: View {
     @StateObject private var backgroundAgentManager = BackgroundRecorderAgentManager()
     @StateObject private var companionAPIServer = CompanionAPIServer()
     @StateObject private var recordingsUnlockManager = RecordingsUnlockManager()
+    @StateObject private var watchHistoryManager = WatchHistoryManager()
     @EnvironmentObject private var updateChecker: UpdateChecker
     @Environment(\.notificationManager) private var notificationManager
     @Environment(\.openURL) private var openURL
@@ -41,6 +42,11 @@ struct ContentView: View {
     @AppStorage("autoRecordBlockedChannels") private var autoRecordBlockedChannelsJSON = "[]"
     @AppStorage("autoRecordDebounceSeconds") private var autoRecordDebounceSeconds = 1
     @AppStorage("autoRecordCooldownSeconds") private var autoRecordCooldownSeconds = 30
+    @AppStorage("autoRecordScheduleEnabled") private var autoRecordScheduleEnabled = false
+    @AppStorage("autoRecordScheduleStartHour") private var autoRecordScheduleStartHour = 20
+    @AppStorage("autoRecordScheduleStartMinute") private var autoRecordScheduleStartMinute = 0
+    @AppStorage("autoRecordScheduleEndHour") private var autoRecordScheduleEndHour = 2
+    @AppStorage("autoRecordScheduleEndMinute") private var autoRecordScheduleEndMinute = 0
     @AppStorage("companionAPIEnabled") private var companionAPIEnabled = true
     @AppStorage("companionAPIPort") private var companionAPIPort = 44555
     @AppStorage("companionAPIToken") private var companionAPIToken = ""
@@ -385,10 +391,25 @@ struct ContentView: View {
                 onNavigate: { url in
                     detailMode = .web
                     store.navigate(to: url)
+                    // Track web channel navigation (twitch.tv/<login> pattern).
+                    let pathComponents = url.pathComponents.filter { $0 != "/" }
+                    if url.host?.contains("twitch.tv") == true,
+                       pathComponents.count == 1,
+                       let login = pathComponents.first,
+                       !login.isEmpty {
+                        let resolved = pinnedChannels.first(where: { $0.login == login })?.displayName ?? login
+                        watchHistoryManager.recordWatch(login: login, displayName: resolved)
+                    } else {
+                        watchHistoryManager.stopWatch()
+                    }
                 },
                 onChannelSelected: { channelName in
                     playbackRequest = NativePlaybackRequest(kind: .liveChannel, streamlinkTarget: "twitch.tv/\(channelName)", channelName: channelName)
                     detailMode = .native
+                    let displayName = pinnedChannels.first(where: { $0.login == channelName })?.displayName
+                        ?? store.followedLive.first(where: { $0.login == channelName })?.name
+                        ?? channelName
+                    watchHistoryManager.recordWatch(login: channelName, displayName: displayName)
                 },
                 onShowRecordings: {
                     guard shouldShowRecordings else { return }
@@ -421,7 +442,10 @@ struct ContentView: View {
                 showRecordingsNavigation: shouldShowRecordings,
                 showPinnedSection: shouldShowPinned,
                 protectedStreamerLogins: protectedStreamerLogins,
-                isBiometricUnlocked: canViewProtectedStreamerContent
+                isBiometricUnlocked: canViewProtectedStreamerContent,
+                onMoveToCategory: { pin, category in
+                    movePinnedToCategory(pin, category: category)
+                }
             )
             .navigationSplitViewColumnWidth(295)
         } detail: {
@@ -442,11 +466,22 @@ struct ContentView: View {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                     store.shouldSwitchToNativePlayback = nil
                 }
+                // Record history for programmatic channel switches (e.g. from CompanionAPI).
+                if request.kind == .liveChannel, let login = request.channelName {
+                    let displayName = pinnedChannels.first(where: { $0.login == login })?.displayName
+                        ?? store.followedLive.first(where: { $0.login == login })?.name
+                        ?? login
+                    watchHistoryManager.recordWatch(login: login, displayName: displayName)
+                }
             }
         }
         .onChange(of: detailMode) { mode in
             if mode != .native {
                 store.restoreWebPlaybackAfterNativePlayer()
+                // Stop native playback session tracking whenever the user
+                // leaves the native player view.  Web channel tracking is
+                // managed separately inside the onNavigate closure.
+                watchHistoryManager.stopWatch()
             }
         }
         .navigationSplitViewColumnWidth(min: 300, ideal: 320, max: 340)
@@ -638,6 +673,13 @@ struct ContentView: View {
         pinnedChannels.removeAll { $0.login == pin.login }
     }
 
+    private func movePinnedToCategory(_ pin: PinnedChannel, category: String?) {
+        guard let index = pinnedChannels.firstIndex(where: { $0.login == pin.login }) else { return }
+        var updated = pinnedChannels
+        updated[index].category = category
+        pinnedChannels = updated
+    }
+
     private func togglePinnedNotifications(_ pin: PinnedChannel) {
         guard let index = pinnedChannels.firstIndex(where: { $0.login == pin.login }) else { return }
         var updated = pinnedChannels
@@ -669,6 +711,10 @@ struct ContentView: View {
 
         if biometricLockAutoProtectAllowlisted {
             addProtectedStreamers([normalized])
+        }
+
+        if thumbnailURL == nil {
+            fetchMissingPinnedAvatars()
         }
         return true
     }
@@ -886,6 +932,7 @@ struct ContentView: View {
         }
 
         guard autoRecordOnLive else { return }
+        guard isWithinRecordingSchedule() else { return }
 
         let baseAutoCandidates = hasSeenInitialLiveList ? newlyLive : currentLogins
         let retryCandidates = Set(
@@ -1004,6 +1051,29 @@ struct ContentView: View {
 
     private func normalizedAutoRecordCooldownInterval() -> TimeInterval {
         TimeInterval(max(0, min(autoRecordCooldownSeconds, 600)))
+    }
+
+    /// Returns `true` when the current local time falls inside the configured recording
+    /// schedule window.  Handles overnight ranges (e.g. 20:00–02:00) correctly.
+    private func isWithinRecordingSchedule() -> Bool {
+        guard autoRecordScheduleEnabled else { return true }
+        let calendar = Calendar.current
+        let now = Date()
+        let components = calendar.dateComponents([.hour, .minute], from: now)
+        let currentMinutes = (components.hour ?? 0) * 60 + (components.minute ?? 0)
+        let startMinutes = autoRecordScheduleStartHour * 60 + autoRecordScheduleStartMinute
+        let endMinutes = autoRecordScheduleEndHour * 60 + autoRecordScheduleEndMinute
+        if startMinutes == endMinutes {
+            // Window covers the full day when start equals end.
+            return true
+        }
+        if startMinutes < endMinutes {
+            // Same-day range e.g. 08:00–18:00.
+            return currentMinutes >= startMinutes && currentMinutes < endMinutes
+        } else {
+            // Overnight range e.g. 20:00–02:00.
+            return currentMinutes >= startMinutes || currentMinutes < endMinutes
+        }
     }
 
     private func syncCompanionAPIServer() {
@@ -1414,11 +1484,16 @@ struct Sidebar: View {
     var showPinnedSection: Bool = true
     var protectedStreamerLogins: Set<String> = []
     var isBiometricUnlocked: Bool = false
+    /// Called when the user selects a category for a pinned channel via the context menu.
+    /// `nil` category means "Uncategorized" (clears any existing category).
+    var onMoveToCategory: ((PinnedChannel, String?) -> Void)?
     @AppStorage("sidebar.pinnedCollapsed") private var pinnedCollapsed = false
     @AppStorage("sidebar.followingCollapsed") private var followingCollapsed = false
+    @Environment(\.openWindow) private var openWindow
     @State private var isAddingPin = false
     @State private var newPinText = ""
     @State private var pinError: String?
+    @StateObject private var categoryManager = ChannelCategoryManager()
 
     private let sections: [TwitchDestination] = [
         .home,
@@ -1676,13 +1751,17 @@ struct Sidebar: View {
                             .padding(.vertical, 8)
                         } else {
                             let liveByLogin = Dictionary(store.followedLive.map { ($0.login, $0) }, uniquingKeysWith: { first, _ in first })
-                            ForEach(visiblePinnedChannels) { pin in
+                            let categories = categoryManager.categories()
+
+                            // Helper that renders a single PinnedRow
+                            // (defined via a local closure so we avoid code duplication across groups)
+                            let makeRow = { (pin: PinnedChannel) -> PinnedRow in
                                 let liveChannel = liveByLogin[pin.login]
                                 let isRecording = liveChannel != nil && recordingManager.isRecordingAny(channelLogin: pin.login)
                                 let isAllowlisted = recordingAllowlist.contains(pin.login)
                                 let isBlocked = recordingBlocklist.contains(pin.login)
                                 let shouldShowAllowlistAction = activeAutoRecordMode == .customAllowlist || isAllowlisted
-                                PinnedRow(
+                                return PinnedRow(
                                     channel: pin,
                                     liveChannel: liveChannel,
                                     isRecording: isRecording,
@@ -1703,8 +1782,31 @@ struct Sidebar: View {
                                     onCopyURL: {
                                         NSPasteboard.general.clearContents()
                                         NSPasteboard.general.setString("https://twitch.tv/\(pin.login)", forType: .string)
-                                    }
+                                    },
+                                    onOpenInWindow: liveChannel != nil ? {
+                                        openWindow(id: "stream", value: StreamWindowContext(channelLogin: pin.login))
+                                    } : nil,
+                                    onMoveToCategory: onMoveToCategory.map { handler in
+                                        { newCategory in handler(pin, newCategory) }
+                                    },
+                                    availableCategories: categories
                                 )
+                            }
+
+                            // Uncategorized channels render under the existing "PINNED" header
+                            let uncategorized = visiblePinnedChannels.filter { $0.category == nil }
+                            ForEach(uncategorized) { pin in makeRow(pin) }
+
+                            // Named categories each get their own collapsible sub-header
+                            ForEach(categories, id: \.self) { category in
+                                let channelsInCategory = visiblePinnedChannels.filter { $0.category == category }
+                                if !channelsInCategory.isEmpty {
+                                    CategorySection(
+                                        name: category,
+                                        channels: channelsInCategory,
+                                        makeRow: makeRow
+                                    )
+                                }
                             }
                         }
                         } // end if !pinnedCollapsed
@@ -1771,6 +1873,9 @@ struct Sidebar: View {
                                 Button("Copy Stream URL") {
                                     NSPasteboard.general.clearContents()
                                     NSPasteboard.general.setString(channel.url.absoluteString, forType: .string)
+                                }
+                                Button("Open Stream in Window") {
+                                    openWindow(id: "stream", value: StreamWindowContext(channelLogin: channel.login))
                                 }
                                 Button(pinnedLogins.contains(channel.login) ? "Unpin from Favorites" : "Pin to Favorites") {
                                     onTogglePin?(channel)
@@ -2181,6 +2286,54 @@ struct OfflineFollowingRow: View {
     }
 }
 
+// MARK: - CategorySection
+
+/// A collapsible sidebar section that groups pinned channels under a named category.
+private struct CategorySection: View {
+    let name: String
+    let channels: [PinnedChannel]
+    /// Factory that produces a ready-to-render `PinnedRow` for a given channel.
+    let makeRow: (PinnedChannel) -> PinnedRow
+
+    @AppStorage private var isCollapsed: Bool
+
+    init(name: String, channels: [PinnedChannel], makeRow: @escaping (PinnedChannel) -> PinnedRow) {
+        self.name = name
+        self.channels = channels
+        self.makeRow = makeRow
+        // Each category gets its own independent collapse state keyed by name.
+        _isCollapsed = AppStorage(wrappedValue: false, "sidebar.category.\(name).collapsed")
+    }
+
+    var body: some View {
+        // Sub-header
+        Button(action: {
+            withAnimation(.easeOut(duration: 0.15)) { isCollapsed.toggle() }
+        }) {
+            HStack(spacing: 4) {
+                Image(systemName: isCollapsed ? "chevron.right" : "chevron.down")
+                    .font(.system(size: 7, weight: .bold))
+                    .foregroundStyle(.white.opacity(0.2))
+                Text(name.uppercased())
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(.white.opacity(0.28))
+                    .tracking(0.8)
+                Spacer()
+            }
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, 12)
+        .padding(.top, 8)
+        .padding(.bottom, 4)
+
+        if !isCollapsed {
+            ForEach(channels) { pin in makeRow(pin) }
+        }
+    }
+}
+
+// MARK: - PinnedRow
+
 struct PinnedRow: View {
     let channel: PinnedChannel
     let liveChannel: TwitchChannel?
@@ -2193,6 +2346,12 @@ struct PinnedRow: View {
     var onToggleRecordingAllowlist: (() -> Void)?
     var onToggleRecordingBlocklist: (() -> Void)?
     var onCopyURL: (() -> Void)?
+    var onOpenInWindow: (() -> Void)?
+    /// Called when the user picks a category from the context menu.
+    /// Pass `nil` to move the channel back to "Uncategorized".
+    var onMoveToCategory: ((String?) -> Void)?
+    /// The full list of available category names to display in the submenu.
+    var availableCategories: [String] = []
     @State private var isHovered = false
 
     private var displayName: String {
@@ -2302,6 +2461,24 @@ struct PinnedRow: View {
                         : "Never Auto-Record This Streamer",
                     action: onToggleRecordingBlocklist
                 )
+            }
+            if let onMoveToCategory, !availableCategories.isEmpty || channel.category != nil {
+                Divider()
+                Menu("Move to Category") {
+                    if channel.category != nil {
+                        Button("Uncategorized") { onMoveToCategory(nil) }
+                        Divider()
+                    }
+                    ForEach(availableCategories, id: \.self) { name in
+                        if name != channel.category {
+                            Button(name) { onMoveToCategory(name) }
+                        }
+                    }
+                }
+            }
+            if let onOpenInWindow {
+                Divider()
+                Button("Open Stream in Window", action: onOpenInWindow)
             }
             Divider()
             Button("Remove from Favorites", action: onRemove)
